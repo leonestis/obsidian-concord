@@ -51,3 +51,43 @@
 .cm-ySelectionCaretDot {
   display: none; /* the always-visible label is enough of a marker */
 }
+
+/* Trash modal: list of soft-deleted files with restore buttons. */
+.collab-trash-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.collab-trash-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  border-radius: 6px;
+}
+
+.collab-trash-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.collab-trash-path {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collab-trash-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}

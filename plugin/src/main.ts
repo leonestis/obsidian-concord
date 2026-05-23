@@ -1,6 +1,7 @@
 import {
   App,
   MarkdownView,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -65,6 +66,22 @@ interface FileSession {
   persistence: IndexeddbPersistence;
 }
 
+// A "text" session is like FileSession but with no editor binding: we
+// just keep a Y.Text mirroring the file contents on disk and sync it
+// across peers. Used for .canvas / .base files which open in custom
+// Obsidian views we can't bind a CodeMirror collab extension to.
+interface TextFileSession {
+  filePath: string;
+  ydoc: Y.Doc;
+  provider: HocuspocusProvider;
+  ytext: Y.Text;
+  persistence: IndexeddbPersistence;
+  // The last serialized text we synced — used to dedupe local modify
+  // events when nothing actually changed (file rewrites with same bytes).
+  lastSynced: string;
+  observer: (event: Y.YTextEvent) => void;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // vault-structure sync (manifest)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,11 +96,29 @@ const MANIFEST_ROOM = "vault:manifest";
 // for huge blobs, and a runaway 500 MB PDF would brick the manifest sync.
 const MAX_BINARY_BYTES = 25 * 1024 * 1024; // 25 MB
 
-type EntryKind = "file" | "folder" | "binary";
+// "file"   = markdown (.md), per-file Y.Text with editor binding
+// "text"   = non-markdown but text-shaped (.canvas, .base) — per-file Y.Text,
+//            synced as file content without an editor binding
+// "binary" = everything else (images, PDFs, audio …) — bytes in manifestBinaries
+// "folder" = empty folder marker
+type EntryKind = "file" | "folder" | "binary" | "text";
+
+const TEXT_EXTENSIONS = new Set(["canvas", "base"]);
 
 interface ManifestEntry {
   kind: EntryKind;
   createdAt: number;
+}
+
+// Soft-deleted entries live in manifestTrash for this long before any client
+// permanently purges them on connect. 30 days mirrors most cloud trash bins.
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface TrashEntry {
+  uuid: string;
+  originalPath: string;
+  kind: EntryKind;
+  deletedAt: number;
 }
 
 // Obsidian's vault.create / createBinary / createFolder return a TFile|TFolder
@@ -128,13 +163,20 @@ export default class CollabPlugin extends Plugin {
   private connected = false;
 
   // Vault manifest — single shared Y.Doc tracking which paths exist in the vault.
-  // Holds two maps: `files` (path → {kind, createdAt}) for every file/folder,
-  // and `binaryData` (path → Uint8Array) for the bytes of non-markdown files.
+  // Holds three maps:
+  //   files       — path → {kind, createdAt}     for every file / folder
+  //   binaryData  — path → Uint8Array            bytes for binary files
+  //   trash       — uuid → {originalPath, …}     soft-deleted entries (30d retention)
+  // Per-file content for markdown and text files lives in their own Y.Docs.
   private manifestYDoc: Y.Doc | null = null;
   private manifestMap: Y.Map<ManifestEntry> | null = null;
   private manifestBinaries: Y.Map<Uint8Array> | null = null;
+  private manifestTrash: Y.Map<TrashEntry> | null = null;
   private manifestProvider: HocuspocusProvider | null = null;
   private manifestPersistence: IndexeddbPersistence | null = null;
+  // Sessions for .canvas / .base — files whose content syncs at the
+  // file-content level (Y.Text holding the JSON/YAML) without an editor binding.
+  private textSessions = new Map<string, TextFileSession>();
   // Paths currently being applied from a remote manifest change. The local
   // vault event handlers skip these so we don't echo the change back into the
   // manifest (which would loop forever).
@@ -158,6 +200,12 @@ export default class CollabPlugin extends Plugin {
       id: "collab-show-status",
       name: "Show connection status (diagnostics)",
       callback: () => this.showDiagnostics(),
+    });
+
+    this.addCommand({
+      id: "collab-show-trash",
+      name: "Show deleted files (trash)",
+      callback: () => this.openTrashModal(),
     });
 
     // React to the user opening a file in any pane.
@@ -426,6 +474,7 @@ export default class CollabPlugin extends Plugin {
     this.manifestYDoc = new Y.Doc();
     this.manifestMap = this.manifestYDoc.getMap<ManifestEntry>("files");
     this.manifestBinaries = this.manifestYDoc.getMap<Uint8Array>("binaryData");
+    this.manifestTrash = this.manifestYDoc.getMap<TrashEntry>("trash");
 
     this.manifestProvider = new HocuspocusProvider({
       websocketProvider: this.socket,
@@ -451,6 +500,7 @@ export default class CollabPlugin extends Plugin {
   }
 
   private stopVaultSync() {
+    for (const path of Array.from(this.textSessions.keys())) this.closeTextSession(path);
     this.manifestProvider?.destroy();
     this.manifestProvider = null;
     void this.manifestPersistence?.destroy();
@@ -459,6 +509,7 @@ export default class CollabPlugin extends Plugin {
     this.manifestYDoc = null;
     this.manifestMap = null;
     this.manifestBinaries = null;
+    this.manifestTrash = null;
     this.remoteApplyPaths.clear();
   }
 
@@ -482,18 +533,85 @@ export default class CollabPlugin extends Plugin {
     }
 
     // Local → manifest (for anything not yet registered)
+    const newBinaries: TFile[] = [];
+    const newTextFiles: TFile[] = [];
     this.manifestYDoc.transact(() => {
       for (const file of allLocal) {
         if (this.manifestMap!.has(file.path)) continue;
         const kind = this.classify(file);
         if (!kind) continue;
         this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
-        if (kind === "binary" && file instanceof TFile) {
-          // Schedule binary upload outside the transact (async read).
-          void this.uploadBinary(file);
-        }
+        if (kind === "binary" && file instanceof TFile) newBinaries.push(file);
+        if (kind === "text" && file instanceof TFile) newTextFiles.push(file);
       }
     });
+    for (const f of newBinaries) void this.uploadBinary(f);
+    for (const f of newTextFiles) this.openTextSession(f.path);
+
+    // Also open text sessions for entries already in the manifest that map
+    // to a local text file — they need a live Y.Doc to keep in sync.
+    for (const [path, entry] of this.manifestMap.entries()) {
+      if (entry.kind !== "text") continue;
+      const local = this.app.vault.getAbstractFileByPath(path);
+      if (local instanceof TFile && !this.textSessions.has(path)) {
+        this.openTextSession(path);
+      }
+    }
+
+    // Purge trash entries older than the retention window.
+    this.purgeOldTrash();
+  }
+
+  private purgeOldTrash() {
+    if (!this.manifestTrash || !this.manifestBinaries || !this.manifestYDoc) return;
+    const now = Date.now();
+    const toDrop: string[] = [];
+    for (const [uuid, entry] of this.manifestTrash.entries()) {
+      if (now - entry.deletedAt > TRASH_RETENTION_MS) toDrop.push(uuid);
+    }
+    if (toDrop.length === 0) return;
+    this.manifestYDoc.transact(() => {
+      for (const uuid of toDrop) {
+        this.manifestTrash!.delete(uuid);
+        this.manifestBinaries!.delete(`trash:${uuid}`);
+      }
+    });
+    console.log(`[collab] purged ${toDrop.length} expired trash entries`);
+  }
+
+  // Restore: move a trash entry back into the live manifest.
+  private async restoreFromTrash(uuid: string) {
+    if (!this.manifestTrash || !this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
+    const entry = this.manifestTrash.get(uuid);
+    if (!entry) return;
+    let destPath = entry.originalPath;
+    // If a file already lives at the original path, append " (restored)" to
+    // the basename so we don't clobber it.
+    if (this.manifestMap.has(destPath)) {
+      const dot = destPath.lastIndexOf(".");
+      const base = dot > 0 ? destPath.slice(0, dot) : destPath;
+      const ext = dot > 0 ? destPath.slice(dot) : "";
+      destPath = `${base} (restored)${ext}`;
+    }
+    this.manifestYDoc.transact(() => {
+      this.manifestTrash!.delete(uuid);
+      this.manifestMap!.set(destPath, { kind: entry.kind, createdAt: Date.now() });
+      const bytes = this.manifestBinaries!.get(`trash:${uuid}`);
+      if (bytes) {
+        this.manifestBinaries!.delete(`trash:${uuid}`);
+        this.manifestBinaries!.set(destPath, bytes);
+      }
+    });
+    new Notice(`Restored ${destPath}`);
+    console.log(`[collab] restored ${entry.originalPath} → ${destPath}`);
+  }
+
+  private openTrashModal() {
+    if (!this.manifestTrash) {
+      new Notice("Collab: not connected — open trash after socket connects");
+      return;
+    }
+    new TrashModal(this.app, this.manifestTrash, (uuid) => this.restoreFromTrash(uuid)).open();
   }
 
   // Recursively collect every file and folder in the vault.
@@ -509,7 +627,11 @@ export default class CollabPlugin extends Plugin {
   private classify(file: TAbstractFile): EntryKind | null {
     if (!file.path || file.path.startsWith(".obsidian/") || file.path === ".obsidian") return null;
     if (file instanceof TFolder) return "folder";
-    if (file instanceof TFile) return file.extension === "md" ? "file" : "binary";
+    if (file instanceof TFile) {
+      if (file.extension === "md") return "file";
+      if (TEXT_EXTENSIONS.has(file.extension)) return "text";
+      return "binary";
+    }
     return null;
   }
 
@@ -532,6 +654,18 @@ export default class CollabPlugin extends Plugin {
         }
         return;
       }
+      if (entry.kind === "text") {
+        // For text-kind we open a per-file Y.Text session; its `synced`
+        // handler writes the file to disk with the current shared content.
+        if (!this.app.vault.getAbstractFileByPath(path)) {
+          // Create an empty file so the path exists; the session will
+          // overwrite it with the synced content shortly.
+          await this.app.vault.create(path, "");
+          console.log(`[collab] reconcile: created text file ${path}`);
+        }
+        this.openTextSession(path);
+        return;
+      }
       // binary
       const bytes = this.manifestBinaries?.get(path);
       if (!bytes) {
@@ -546,6 +680,106 @@ export default class CollabPlugin extends Plugin {
       }
     } catch (err) {
       console.warn("[collab] materialise failed", path, err);
+    } finally {
+      setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+    }
+  }
+
+  // ── text-kind sessions (.canvas / .base etc.) ──────────────────────────────
+
+  private openTextSession(path: string) {
+    if (!this.socket) return;
+    if (this.textSessions.has(path)) return;
+    const room = pathToRoom(path);
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("content");
+
+    const provider = new HocuspocusProvider({
+      websocketProvider: this.socket,
+      name: room,
+      document: ydoc,
+      token: this.settings.authToken || undefined,
+    });
+    provider.attach();
+
+    const persistence = new IndexeddbPersistence(
+      `obsidian-collab::${this.settings.serverUrl}::${room}`,
+      ydoc,
+    );
+
+    const session: TextFileSession = {
+      filePath: path,
+      ydoc,
+      provider,
+      ytext,
+      persistence,
+      lastSynced: "",
+      observer: () => {},
+    };
+
+    // Y.Text → disk
+    session.observer = () => {
+      const next = ytext.toString();
+      if (next === session.lastSynced) return;
+      session.lastSynced = next;
+      void this.writeTextFile(path, next);
+    };
+    ytext.observe(session.observer);
+
+    provider.on("synced", async () => {
+      const remoteContent = ytext.toString();
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (remoteContent.length === 0 && file instanceof TFile) {
+        // First client into the room — seed with current disk content.
+        try {
+          const localContent = await this.app.vault.read(file);
+          if (localContent.length > 0) ytext.insert(0, localContent);
+          session.lastSynced = ytext.toString();
+        } catch (err) {
+          console.warn("[collab] text seed failed", path, err);
+        }
+      } else if (remoteContent.length > 0 && file instanceof TFile) {
+        // Server already has content — write to disk if it differs.
+        session.lastSynced = remoteContent;
+        try {
+          const localContent = await this.app.vault.read(file);
+          if (localContent !== remoteContent) {
+            this.remoteApplyPaths.add(path);
+            await this.app.vault.modify(file, remoteContent);
+            setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+          }
+        } catch (err) {
+          console.warn("[collab] text initial write failed", path, err);
+        }
+      }
+      console.log(`[collab] text session "${path}" synced (${remoteContent.length} chars)`);
+    });
+
+    this.textSessions.set(path, session);
+    console.log(`[collab] opened text session for ${path}`);
+  }
+
+  private closeTextSession(path: string) {
+    const session = this.textSessions.get(path);
+    if (!session) return;
+    session.ytext.unobserve(session.observer);
+    void session.persistence.destroy();
+    session.provider.destroy();
+    session.ydoc.destroy();
+    this.textSessions.delete(path);
+  }
+
+  private async writeTextFile(path: string, content: string) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+    try {
+      const current = await this.app.vault.read(file);
+      if (current === content) return;
+      this.remoteApplyPaths.add(path);
+      await this.app.vault.modify(file, content);
+      console.log(`[collab] text → disk: ${path} (${content.length} chars)`);
+    } catch (err) {
+      console.warn("[collab] text write failed", path, err);
     } finally {
       setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
     }
@@ -590,16 +824,34 @@ export default class CollabPlugin extends Plugin {
     if (this.manifestMap.has(file.path)) return;
     this.manifestMap.set(file.path, { kind, createdAt: Date.now() });
     if (kind === "binary" && file instanceof TFile) void this.uploadBinary(file);
+    if (kind === "text" && file instanceof TFile) this.openTextSession(file.path);
   }
 
   private onLocalVaultDelete(file: TAbstractFile) {
-    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestBinaries || !this.manifestTrash || !this.manifestYDoc) return;
     if (this.remoteApplyPaths.has(file.path)) return;
-    if (!this.manifestMap.has(file.path)) return;
+    const entry = this.manifestMap.get(file.path);
+    if (!entry) return;
+    // Tear down any per-text session before forgetting the path.
+    if (entry.kind === "text") this.closeTextSession(file.path);
+    // Move into trash with a UUID so the original path can later be reused
+    // for a new file without clobbering the soft-deleted copy.
+    const uuid = (globalThis.crypto?.randomUUID?.()) ?? `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.manifestYDoc.transact(() => {
       this.manifestMap!.delete(file.path);
-      if (this.manifestBinaries!.has(file.path)) this.manifestBinaries!.delete(file.path);
+      this.manifestTrash!.set(uuid, {
+        uuid,
+        originalPath: file.path,
+        kind: entry.kind,
+        deletedAt: Date.now(),
+      });
+      const bytes = this.manifestBinaries!.get(file.path);
+      if (bytes) {
+        this.manifestBinaries!.delete(file.path);
+        this.manifestBinaries!.set(`trash:${uuid}`, bytes);
+      }
     });
+    console.log(`[collab] soft-deleted ${file.path} → trash:${uuid}`);
   }
 
   private onLocalVaultRename(file: TAbstractFile, oldPath: string) {
@@ -607,6 +859,11 @@ export default class CollabPlugin extends Plugin {
     if (this.remoteApplyPaths.has(file.path) || this.remoteApplyPaths.has(oldPath)) return;
     const kind = this.classify(file);
     if (!kind) return;
+    // If a text session was watching the old path, move it.
+    if (kind === "text") {
+      this.closeTextSession(oldPath);
+      this.openTextSession(file.path);
+    }
     // Group delete + set in one transaction so peers can recognise this as
     // a rename (1 delete + 1 add in the same change event) instead of a
     // delete-then-create, which would lose content.
@@ -623,14 +880,43 @@ export default class CollabPlugin extends Plugin {
 
   private onLocalVaultModify(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
-    if (file.extension === "md") return; // markdown content syncs via per-file Y.Doc
+    if (file.extension === "md") return; // markdown content syncs via editor binding
     if (!this.manifestMap || !this.manifestBinaries) return;
     if (this.remoteApplyPaths.has(file.path)) return;
+    const kind = this.classify(file);
+    if (kind === "text") {
+      // Read new content and push into the text session's Y.Text. Replace
+      // the entire content — Y.Text CRDT will diff for us at the byte level.
+      void this.updateTextSessionFromDisk(file);
+      return;
+    }
     if (!this.manifestMap.has(file.path)) {
       // First time we see it. Register and upload.
       this.manifestMap.set(file.path, { kind: "binary", createdAt: Date.now() });
     }
     void this.uploadBinary(file);
+  }
+
+  private async updateTextSessionFromDisk(file: TFile) {
+    let session = this.textSessions.get(file.path);
+    if (!session) {
+      this.openTextSession(file.path);
+      session = this.textSessions.get(file.path);
+      if (!session) return;
+    }
+    try {
+      const content = await this.app.vault.read(file);
+      if (content === session.lastSynced) return;
+      // Replace the full Y.Text in one transaction. The CRDT will record a
+      // delete + insert pair; peers see the merged result.
+      session.ydoc.transact(() => {
+        session!.ytext.delete(0, session!.ytext.length);
+        session!.ytext.insert(0, content);
+      });
+      session.lastSynced = content;
+    } catch (err) {
+      console.warn("[collab] failed to read text file for sync", file.path, err);
+    }
   }
 
   // ── manifest → local ───────────────────────────────────────────────────────
@@ -741,6 +1027,56 @@ export default class CollabPlugin extends Plugin {
 // ─────────────────────────────────────────────────────────────────────────────
 // settings tab
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// trash modal — lists soft-deleted entries with a restore action each
+// ─────────────────────────────────────────────────────────────────────────────
+
+class TrashModal extends Modal {
+  constructor(
+    app: App,
+    private readonly trash: Y.Map<TrashEntry>,
+    private readonly onRestore: (uuid: string) => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Deleted files" });
+
+    const entries = Array.from(this.trash.values()).sort((a, b) => b.deletedAt - a.deletedAt);
+    if (entries.length === 0) {
+      contentEl.createEl("p", { text: "Trash is empty." });
+      return;
+    }
+
+    const list = contentEl.createDiv({ cls: "collab-trash-list" });
+    for (const entry of entries) {
+      const row = list.createDiv({ cls: "collab-trash-row" });
+      const ageMs = Date.now() - entry.deletedAt;
+      const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+      const remainingDays = Math.max(0, 30 - days);
+      const info = row.createDiv({ cls: "collab-trash-info" });
+      info.createEl("div", { text: entry.originalPath, cls: "collab-trash-path" });
+      info.createEl("div", {
+        text: `${entry.kind} · deleted ${days}d ago · auto-purge in ${remainingDays}d`,
+        cls: "collab-trash-meta",
+      });
+      const restoreBtn = row.createEl("button", { text: "Restore" });
+      restoreBtn.addEventListener("click", async () => {
+        restoreBtn.disabled = true;
+        await this.onRestore(entry.uuid);
+        this.close();
+      });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
 
 class CollabSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: CollabPlugin) {
