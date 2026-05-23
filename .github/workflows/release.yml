@@ -46,9 +46,16 @@ jobs:
           fi
 
       - name: Stage release artifacts
+        # Three loose files for BRAT and manual drag-and-drop installs, and
+        # a single zip for anyone who prefers one download. The folder
+        # inside the zip is named `obsidian-collab`, so unzipping straight
+        # into `<vault>/.obsidian/plugins/` Just Works.
         run: |
           mkdir -p dist
           cp plugin/main.js plugin/manifest.json plugin/styles.css dist/
+          mkdir -p "stage/obsidian-collab"
+          cp plugin/main.js plugin/manifest.json plugin/styles.css "stage/obsidian-collab/"
+          (cd stage && zip -r "../dist/obsidian-collab-${GITHUB_REF_NAME}.zip" obsidian-collab)
           ls -la dist/
 
       - name: Publish GitHub Release
@@ -58,5 +65,6 @@ jobs:
             dist/main.js
             dist/manifest.json
             dist/styles.css
+            dist/obsidian-collab-*.zip
           fail_on_unmatched_files: true
           generate_release_notes: true
