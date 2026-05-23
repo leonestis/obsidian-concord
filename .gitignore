@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+plugin/main.js
+plugin/*.js.map
+server/dist/
+
+# Local config & secrets
+.env
+.env.local
+*.local.json
+server/data/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
