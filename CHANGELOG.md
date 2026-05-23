@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.0 — 2026-05-24
+
+### Changed
+- **Canvas sync is now structural.** Every `.canvas` file gets a `Y.Map<id, Y.Map<field, value>>` per node and per edge plus a `meta` map for any top-level extras. Local saves are diffed against the Y.Doc so the CRDT history records only what changed; remote updates are serialised back to JSON with sorted ids for deterministic output. **Concurrent edits to different nodes merge cleanly and the file on disk is guaranteed to parse** — no more "broken JSON" failure mode. Same-node concurrent edits still resolve last-writer-wins at the field level (no garbage), which matches how Figma-style multiplayer behaves on conflicting drags.
+- **`.base` sync is atomic.** Each save replaces the entire file content as a single string in a `Y.Map`. There is no character-level merge, so simultaneous edits to a base resolve to whoever saved last — but the resulting file is always valid YAML because we never write a partial document. Reasonable for base files which are typically maintained by one person at a time.
+- New `EntryKind` values: `"canvas"` (structural) and `"text"` (atomic). Old `"text"` entries created by 0.4.0 still load — they're just upgraded to the new code paths once the file is touched.
+
+### Added
+- Invited `mikedizhur` as a write-access collaborator on the GitHub repository.
+
 ## 0.4.0 — 2026-05-24
 
 ### Added

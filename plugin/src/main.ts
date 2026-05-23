@@ -66,20 +66,48 @@ interface FileSession {
   persistence: IndexeddbPersistence;
 }
 
-// A "text" session is like FileSession but with no editor binding: we
-// just keep a Y.Text mirroring the file contents on disk and sync it
-// across peers. Used for .canvas / .base files which open in custom
-// Obsidian views we can't bind a CodeMirror collab extension to.
-interface TextFileSession {
+// Sessions for non-markdown files that we want fully collaborative. Two
+// shapes: structural (Canvas — Y.Map per node) and atomic (single Y.Map
+// holding the whole file as a string). Both guarantee that whatever we
+// write to disk parses cleanly — a structural canvas merges concurrent
+// edits to different nodes; an atomic file resolves to whoever saved last.
+interface CanvasSession {
+  kind: "canvas";
   filePath: string;
   ydoc: Y.Doc;
   provider: HocuspocusProvider;
-  ytext: Y.Text;
   persistence: IndexeddbPersistence;
-  // The last serialized text we synced — used to dedupe local modify
-  // events when nothing actually changed (file rewrites with same bytes).
+  nodes: Y.Map<Y.Map<unknown>>;
+  edges: Y.Map<Y.Map<unknown>>;
+  meta: Y.Map<unknown>;
+  lastSerialized: string;
+  // Reference so we can stop observing on destroy.
+  deepObserver: () => void;
+}
+
+interface AtomicTextSession {
+  kind: "atomic";
+  filePath: string;
+  ydoc: Y.Doc;
+  provider: HocuspocusProvider;
+  persistence: IndexeddbPersistence;
+  // Single-cell Y.Map: { content: string }. Updates replace the whole
+  // string, so the file on disk is never half-parsed.
+  doc: Y.Map<string>;
   lastSynced: string;
-  observer: (event: Y.YTextEvent) => void;
+  observer: () => void;
+}
+
+type StructuralSession = CanvasSession | AtomicTextSession;
+
+// Obsidian Canvas 1.0 JSON shape. We only care about nodes, edges, and any
+// other top-level keys we mirror through `meta`. Field shapes inside nodes
+// and edges are kept loose because the spec is extended frequently and we
+// only round-trip without interpreting them.
+interface CanvasJson {
+  nodes: Array<Record<string, unknown> & { id?: string }>;
+  edges: Array<Record<string, unknown> & { id?: string }>;
+  [key: string]: unknown;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,14 +124,18 @@ const MANIFEST_ROOM = "vault:manifest";
 // for huge blobs, and a runaway 500 MB PDF would brick the manifest sync.
 const MAX_BINARY_BYTES = 25 * 1024 * 1024; // 25 MB
 
-// "file"   = markdown (.md), per-file Y.Text with editor binding
-// "text"   = non-markdown but text-shaped (.canvas, .base) — per-file Y.Text,
-//            synced as file content without an editor binding
-// "binary" = everything else (images, PDFs, audio …) — bytes in manifestBinaries
-// "folder" = empty folder marker
-type EntryKind = "file" | "folder" | "binary" | "text";
+// "file"    = markdown (.md), per-file Y.Text with editor binding
+// "canvas"  = Obsidian Canvas (.canvas). JSON synced structurally via Y.Map<id,Y.Map>
+//             over nodes / edges / meta — concurrent edits never produce broken JSON.
+// "text"    = atomic-replace text file (.base today, more later if useful).
+//             Single Y.Map "doc"."content" string. Last writer wins per save,
+//             never produces broken state because each write is one full file.
+// "binary"  = everything else (images, PDFs, audio …) — bytes in manifestBinaries
+// "folder"  = empty folder marker
+type EntryKind = "file" | "folder" | "binary" | "canvas" | "text";
 
-const TEXT_EXTENSIONS = new Set(["canvas", "base"]);
+const CANVAS_EXTENSIONS = new Set(["canvas"]);
+const ATOMIC_TEXT_EXTENSIONS = new Set(["base"]);
 
 interface ManifestEntry {
   kind: EntryKind;
@@ -174,9 +206,10 @@ export default class CollabPlugin extends Plugin {
   private manifestTrash: Y.Map<TrashEntry> | null = null;
   private manifestProvider: HocuspocusProvider | null = null;
   private manifestPersistence: IndexeddbPersistence | null = null;
-  // Sessions for .canvas / .base — files whose content syncs at the
-  // file-content level (Y.Text holding the JSON/YAML) without an editor binding.
-  private textSessions = new Map<string, TextFileSession>();
+  // Per-file structural sessions for non-markdown content we want fully
+  // synced. Canvas uses the structural variant; .base uses the atomic
+  // whole-file variant. Both keyed by vault-relative file path.
+  private structuralSessions = new Map<string, StructuralSession>();
   // Paths currently being applied from a remote manifest change. The local
   // vault event handlers skip these so we don't echo the change back into the
   // manifest (which would loop forever).
@@ -500,7 +533,7 @@ export default class CollabPlugin extends Plugin {
   }
 
   private stopVaultSync() {
-    for (const path of Array.from(this.textSessions.keys())) this.closeTextSession(path);
+    for (const path of Array.from(this.structuralSessions.keys())) this.closeStructuralSession(path);
     this.manifestProvider?.destroy();
     this.manifestProvider = null;
     void this.manifestPersistence?.destroy();
@@ -534,7 +567,7 @@ export default class CollabPlugin extends Plugin {
 
     // Local → manifest (for anything not yet registered)
     const newBinaries: TFile[] = [];
-    const newTextFiles: TFile[] = [];
+    const newStructural: Array<{ file: TFile; kind: "canvas" | "text" }> = [];
     this.manifestYDoc.transact(() => {
       for (const file of allLocal) {
         if (this.manifestMap!.has(file.path)) continue;
@@ -542,19 +575,21 @@ export default class CollabPlugin extends Plugin {
         if (!kind) continue;
         this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
         if (kind === "binary" && file instanceof TFile) newBinaries.push(file);
-        if (kind === "text" && file instanceof TFile) newTextFiles.push(file);
+        if ((kind === "canvas" || kind === "text") && file instanceof TFile) {
+          newStructural.push({ file, kind });
+        }
       }
     });
     for (const f of newBinaries) void this.uploadBinary(f);
-    for (const f of newTextFiles) this.openTextSession(f.path);
+    for (const s of newStructural) this.openStructuralSession(s.file.path, s.kind);
 
-    // Also open text sessions for entries already in the manifest that map
-    // to a local text file — they need a live Y.Doc to keep in sync.
+    // Also open structural sessions for canvas/atomic entries already in
+    // the manifest that map to a local file — they need a live Y.Doc.
     for (const [path, entry] of this.manifestMap.entries()) {
-      if (entry.kind !== "text") continue;
+      if (entry.kind !== "canvas" && entry.kind !== "text") continue;
       const local = this.app.vault.getAbstractFileByPath(path);
-      if (local instanceof TFile && !this.textSessions.has(path)) {
-        this.openTextSession(path);
+      if (local instanceof TFile && !this.structuralSessions.has(path)) {
+        this.openStructuralSession(path, entry.kind);
       }
     }
 
@@ -629,7 +664,8 @@ export default class CollabPlugin extends Plugin {
     if (file instanceof TFolder) return "folder";
     if (file instanceof TFile) {
       if (file.extension === "md") return "file";
-      if (TEXT_EXTENSIONS.has(file.extension)) return "text";
+      if (CANVAS_EXTENSIONS.has(file.extension)) return "canvas";
+      if (ATOMIC_TEXT_EXTENSIONS.has(file.extension)) return "text";
       return "binary";
     }
     return null;
@@ -654,16 +690,14 @@ export default class CollabPlugin extends Plugin {
         }
         return;
       }
-      if (entry.kind === "text") {
-        // For text-kind we open a per-file Y.Text session; its `synced`
-        // handler writes the file to disk with the current shared content.
+      if (entry.kind === "canvas" || entry.kind === "text") {
+        // For canvas + atomic-text we open a per-file structural session;
+        // its `synced` handler writes the merged content to disk.
         if (!this.app.vault.getAbstractFileByPath(path)) {
-          // Create an empty file so the path exists; the session will
-          // overwrite it with the synced content shortly.
-          await this.app.vault.create(path, "");
-          console.log(`[collab] reconcile: created text file ${path}`);
+          await this.app.vault.create(path, entry.kind === "canvas" ? "{}" : "");
+          console.log(`[collab] reconcile: created ${entry.kind} file ${path}`);
         }
-        this.openTextSession(path);
+        this.openStructuralSession(path, entry.kind);
         return;
       }
       // binary
@@ -685,17 +719,28 @@ export default class CollabPlugin extends Plugin {
     }
   }
 
-  // ── text-kind sessions (.canvas / .base etc.) ──────────────────────────────
+  // ── structural sessions (canvas / atomic-text) ─────────────────────────────
 
-  private openTextSession(path: string) {
+  private openStructuralSession(path: string, kind: "canvas" | "text") {
     if (!this.socket) return;
-    if (this.textSessions.has(path)) return;
+    if (this.structuralSessions.has(path)) return;
+
+    if (kind === "canvas") this.openCanvasSession(path);
+    else this.openAtomicTextSession(path);
+  }
+
+  // Canvas: structural CRDT. Each node and edge is a Y.Map keyed by its id,
+  // so concurrent edits to different nodes merge cleanly. The JSON we write
+  // to disk is composed from the Y.Maps — it is always well-formed.
+  private openCanvasSession(path: string) {
     const room = pathToRoom(path);
     const ydoc = new Y.Doc();
-    const ytext = ydoc.getText("content");
+    const nodes = ydoc.getMap<Y.Map<unknown>>("canvas.nodes");
+    const edges = ydoc.getMap<Y.Map<unknown>>("canvas.edges");
+    const meta = ydoc.getMap<unknown>("canvas.meta");
 
     const provider = new HocuspocusProvider({
-      websocketProvider: this.socket,
+      websocketProvider: this.socket!,
       name: room,
       document: ydoc,
       token: this.settings.authToken || undefined,
@@ -707,39 +752,127 @@ export default class CollabPlugin extends Plugin {
       ydoc,
     );
 
-    const session: TextFileSession = {
+    const session: CanvasSession = {
+      kind: "canvas",
       filePath: path,
       ydoc,
       provider,
-      ytext,
       persistence,
+      nodes,
+      edges,
+      meta,
+      lastSerialized: "",
+      deepObserver: () => {},
+    };
+
+    // Y.Doc → disk: any change to nodes/edges/meta serialises the canvas
+    // and (if different) writes it to disk.
+    const onDeepChange = () => {
+      const json = this.buildCanvasJsonFromY(session);
+      const serialized = JSON.stringify(json, null, "\t");
+      if (serialized === session.lastSerialized) return;
+      session.lastSerialized = serialized;
+      void this.writeStructuralFile(path, serialized);
+    };
+    nodes.observeDeep(onDeepChange);
+    edges.observeDeep(onDeepChange);
+    meta.observeDeep(onDeepChange);
+    session.deepObserver = () => {
+      nodes.unobserveDeep(onDeepChange);
+      edges.unobserveDeep(onDeepChange);
+      meta.unobserveDeep(onDeepChange);
+    };
+
+    provider.on("synced", async () => {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      const hasYState = nodes.size > 0 || edges.size > 0 || meta.size > 0;
+      if (!hasYState && file instanceof TFile) {
+        // First client — seed Y from disk.
+        try {
+          const raw = await this.app.vault.read(file);
+          if (raw.trim().length > 0) {
+            const parsed = this.safeParseCanvas(raw, path);
+            if (parsed) this.applyCanvasJsonToY(parsed, session);
+            session.lastSerialized = JSON.stringify(this.buildCanvasJsonFromY(session), null, "\t");
+          }
+        } catch (err) {
+          console.warn("[collab] canvas seed failed", path, err);
+        }
+      } else if (hasYState && file instanceof TFile) {
+        // Server has state — write the merged canvas to disk.
+        const json = this.buildCanvasJsonFromY(session);
+        const serialized = JSON.stringify(json, null, "\t");
+        session.lastSerialized = serialized;
+        try {
+          const current = await this.app.vault.read(file);
+          if (current !== serialized) {
+            this.remoteApplyPaths.add(path);
+            await this.app.vault.modify(file, serialized);
+            setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+          }
+        } catch (err) {
+          console.warn("[collab] canvas initial write failed", path, err);
+        }
+      }
+      console.log(`[collab] canvas session "${path}" synced (nodes=${nodes.size}, edges=${edges.size})`);
+    });
+
+    this.structuralSessions.set(path, session);
+    console.log(`[collab] opened canvas session for ${path}`);
+  }
+
+  // Atomic text: one Y.Map cell holds the whole file content. Saves replace
+  // the entire string, so the resulting file never has half-written state.
+  private openAtomicTextSession(path: string) {
+    const room = pathToRoom(path);
+    const ydoc = new Y.Doc();
+    const doc = ydoc.getMap<string>("atomic");
+
+    const provider = new HocuspocusProvider({
+      websocketProvider: this.socket!,
+      name: room,
+      document: ydoc,
+      token: this.settings.authToken || undefined,
+    });
+    provider.attach();
+
+    const persistence = new IndexeddbPersistence(
+      `obsidian-collab::${this.settings.serverUrl}::${room}`,
+      ydoc,
+    );
+
+    const session: AtomicTextSession = {
+      kind: "atomic",
+      filePath: path,
+      ydoc,
+      provider,
+      persistence,
+      doc,
       lastSynced: "",
       observer: () => {},
     };
 
-    // Y.Text → disk
-    session.observer = () => {
-      const next = ytext.toString();
+    const onChange = () => {
+      const next = doc.get("content") ?? "";
       if (next === session.lastSynced) return;
       session.lastSynced = next;
-      void this.writeTextFile(path, next);
+      void this.writeStructuralFile(path, next);
     };
-    ytext.observe(session.observer);
+    doc.observe(onChange);
+    session.observer = onChange;
 
     provider.on("synced", async () => {
-      const remoteContent = ytext.toString();
+      const remoteContent = doc.get("content") ?? "";
       const file = this.app.vault.getAbstractFileByPath(path);
       if (remoteContent.length === 0 && file instanceof TFile) {
-        // First client into the room — seed with current disk content.
         try {
           const localContent = await this.app.vault.read(file);
-          if (localContent.length > 0) ytext.insert(0, localContent);
-          session.lastSynced = ytext.toString();
+          if (localContent.length > 0) doc.set("content", localContent);
+          session.lastSynced = doc.get("content") ?? "";
         } catch (err) {
-          console.warn("[collab] text seed failed", path, err);
+          console.warn("[collab] atomic seed failed", path, err);
         }
-      } else if (remoteContent.length > 0 && file instanceof TFile) {
-        // Server already has content — write to disk if it differs.
+      } else if (file instanceof TFile) {
         session.lastSynced = remoteContent;
         try {
           const localContent = await this.app.vault.read(file);
@@ -749,27 +882,31 @@ export default class CollabPlugin extends Plugin {
             setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
           }
         } catch (err) {
-          console.warn("[collab] text initial write failed", path, err);
+          console.warn("[collab] atomic initial write failed", path, err);
         }
       }
-      console.log(`[collab] text session "${path}" synced (${remoteContent.length} chars)`);
+      console.log(`[collab] atomic session "${path}" synced (${remoteContent.length} chars)`);
     });
 
-    this.textSessions.set(path, session);
-    console.log(`[collab] opened text session for ${path}`);
+    this.structuralSessions.set(path, session);
+    console.log(`[collab] opened atomic session for ${path}`);
   }
 
-  private closeTextSession(path: string) {
-    const session = this.textSessions.get(path);
+  private closeStructuralSession(path: string) {
+    const session = this.structuralSessions.get(path);
     if (!session) return;
-    session.ytext.unobserve(session.observer);
+    if (session.kind === "canvas") {
+      session.deepObserver();
+    } else {
+      session.doc.unobserve(session.observer);
+    }
     void session.persistence.destroy();
     session.provider.destroy();
     session.ydoc.destroy();
-    this.textSessions.delete(path);
+    this.structuralSessions.delete(path);
   }
 
-  private async writeTextFile(path: string, content: string) {
+  private async writeStructuralFile(path: string, content: string) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
     try {
@@ -777,11 +914,155 @@ export default class CollabPlugin extends Plugin {
       if (current === content) return;
       this.remoteApplyPaths.add(path);
       await this.app.vault.modify(file, content);
-      console.log(`[collab] text → disk: ${path} (${content.length} chars)`);
+      console.log(`[collab] structural → disk: ${path} (${content.length} chars)`);
     } catch (err) {
-      console.warn("[collab] text write failed", path, err);
+      console.warn("[collab] structural write failed", path, err);
     } finally {
       setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+    }
+  }
+
+  // ── canvas (de)serialisation ──────────────────────────────────────────────
+
+  private safeParseCanvas(raw: string, path: string): CanvasJson | null {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null) return null;
+      return parsed as CanvasJson;
+    } catch (err) {
+      console.warn(`[collab] cannot parse canvas ${path} — skipping until next save`, err);
+      return null;
+    }
+  }
+
+  // Apply a parsed canvas JSON onto our Y.Doc, diffing per-node so the CRDT
+  // history records only what actually changed.
+  private applyCanvasJsonToY(json: CanvasJson, session: CanvasSession) {
+    session.ydoc.transact(() => {
+      // Nodes
+      const incomingNodeIds = new Set<string>();
+      for (const n of json.nodes ?? []) {
+        if (!n || typeof n.id !== "string") continue;
+        incomingNodeIds.add(n.id);
+        let map = session.nodes.get(n.id);
+        if (!map) {
+          map = new Y.Map();
+          session.nodes.set(n.id, map);
+        }
+        const { id: _id, ...rest } = n;
+        void _id;
+        this.diffApplyMap(map, rest);
+      }
+      for (const id of Array.from(session.nodes.keys())) {
+        if (!incomingNodeIds.has(id)) session.nodes.delete(id);
+      }
+      // Edges
+      const incomingEdgeIds = new Set<string>();
+      for (const e of json.edges ?? []) {
+        if (!e || typeof e.id !== "string") continue;
+        incomingEdgeIds.add(e.id);
+        let map = session.edges.get(e.id);
+        if (!map) {
+          map = new Y.Map();
+          session.edges.set(e.id, map);
+        }
+        const { id: _id, ...rest } = e;
+        void _id;
+        this.diffApplyMap(map, rest);
+      }
+      for (const id of Array.from(session.edges.keys())) {
+        if (!incomingEdgeIds.has(id)) session.edges.delete(id);
+      }
+      // Top-level meta (anything else)
+      const metaIncoming: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(json)) {
+        if (key === "nodes" || key === "edges") continue;
+        metaIncoming[key] = value;
+      }
+      this.diffApplyMap(session.meta, metaIncoming);
+    });
+  }
+
+  // Set every (key,value) from `src` into `target` if changed; delete keys
+  // in `target` that are absent from `src`. Equality is JSON-based — Canvas
+  // values are primitives + plain objects, so this is fine and stable.
+  private diffApplyMap(target: Y.Map<unknown>, src: Record<string, unknown>) {
+    for (const [key, value] of Object.entries(src)) {
+      const cur = target.get(key);
+      if (JSON.stringify(cur) !== JSON.stringify(value)) target.set(key, value);
+    }
+    for (const key of Array.from(target.keys())) {
+      if (!(key in src)) target.delete(key);
+    }
+  }
+
+  // Serialise the Y.Doc state into Canvas JSON.
+  private buildCanvasJsonFromY(session: CanvasSession): CanvasJson {
+    const out: CanvasJson = { nodes: [], edges: [] };
+    for (const [key, value] of session.meta.entries()) {
+      if (key === "nodes" || key === "edges") continue;
+      (out as Record<string, unknown>)[key] = value;
+    }
+    // Stable order: sort by id so the serialised string is deterministic.
+    const nodeIds = Array.from(session.nodes.keys()).sort();
+    for (const id of nodeIds) {
+      const map = session.nodes.get(id);
+      if (!map) continue;
+      const obj: Record<string, unknown> = { id };
+      for (const [k, v] of map.entries()) obj[k] = v;
+      out.nodes.push(obj);
+    }
+    const edgeIds = Array.from(session.edges.keys()).sort();
+    for (const id of edgeIds) {
+      const map = session.edges.get(id);
+      if (!map) continue;
+      const obj: Record<string, unknown> = { id };
+      for (const [k, v] of map.entries()) obj[k] = v;
+      out.edges.push(obj);
+    }
+    return out;
+  }
+
+  // Local modify of a canvas: re-parse the file, diff it onto Y.Doc.
+  private async updateCanvasFromDisk(file: TFile) {
+    let session = this.structuralSessions.get(file.path);
+    if (!session) {
+      this.openCanvasSession(file.path);
+      session = this.structuralSessions.get(file.path);
+      if (!session || session.kind !== "canvas") return;
+    } else if (session.kind !== "canvas") {
+      return; // shouldn't happen — classify guards this
+    }
+    try {
+      const raw = await this.app.vault.read(file);
+      const next = JSON.stringify(this.safeParseCanvas(raw, file.path), null, "\t");
+      if (next === session.lastSerialized) return;
+      const parsed = this.safeParseCanvas(raw, file.path);
+      if (!parsed) return;
+      this.applyCanvasJsonToY(parsed, session);
+      session.lastSerialized = JSON.stringify(this.buildCanvasJsonFromY(session), null, "\t");
+    } catch (err) {
+      console.warn("[collab] canvas read-from-disk failed", file.path, err);
+    }
+  }
+
+  // Local modify of an atomic file: drop the whole new content into the map.
+  private async updateAtomicFromDisk(file: TFile) {
+    let session = this.structuralSessions.get(file.path);
+    if (!session) {
+      this.openAtomicTextSession(file.path);
+      session = this.structuralSessions.get(file.path);
+      if (!session || session.kind !== "atomic") return;
+    } else if (session.kind !== "atomic") {
+      return;
+    }
+    try {
+      const content = await this.app.vault.read(file);
+      if (content === session.lastSynced) return;
+      session.doc.set("content", content);
+      session.lastSynced = content;
+    } catch (err) {
+      console.warn("[collab] atomic read-from-disk failed", file.path, err);
     }
   }
 
@@ -824,7 +1105,9 @@ export default class CollabPlugin extends Plugin {
     if (this.manifestMap.has(file.path)) return;
     this.manifestMap.set(file.path, { kind, createdAt: Date.now() });
     if (kind === "binary" && file instanceof TFile) void this.uploadBinary(file);
-    if (kind === "text" && file instanceof TFile) this.openTextSession(file.path);
+    if ((kind === "canvas" || kind === "text") && file instanceof TFile) {
+      this.openStructuralSession(file.path, kind);
+    }
   }
 
   private onLocalVaultDelete(file: TAbstractFile) {
@@ -832,8 +1115,8 @@ export default class CollabPlugin extends Plugin {
     if (this.remoteApplyPaths.has(file.path)) return;
     const entry = this.manifestMap.get(file.path);
     if (!entry) return;
-    // Tear down any per-text session before forgetting the path.
-    if (entry.kind === "text") this.closeTextSession(file.path);
+    // Tear down any structural session before forgetting the path.
+    if (entry.kind === "canvas" || entry.kind === "text") this.closeStructuralSession(file.path);
     // Move into trash with a UUID so the original path can later be reused
     // for a new file without clobbering the soft-deleted copy.
     const uuid = (globalThis.crypto?.randomUUID?.()) ?? `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -859,10 +1142,10 @@ export default class CollabPlugin extends Plugin {
     if (this.remoteApplyPaths.has(file.path) || this.remoteApplyPaths.has(oldPath)) return;
     const kind = this.classify(file);
     if (!kind) return;
-    // If a text session was watching the old path, move it.
-    if (kind === "text") {
-      this.closeTextSession(oldPath);
-      this.openTextSession(file.path);
+    // If a structural session was watching the old path, move it.
+    if (kind === "canvas" || kind === "text") {
+      this.closeStructuralSession(oldPath);
+      this.openStructuralSession(file.path, kind);
     }
     // Group delete + set in one transaction so peers can recognise this as
     // a rename (1 delete + 1 add in the same change event) instead of a
@@ -884,10 +1167,12 @@ export default class CollabPlugin extends Plugin {
     if (!this.manifestMap || !this.manifestBinaries) return;
     if (this.remoteApplyPaths.has(file.path)) return;
     const kind = this.classify(file);
+    if (kind === "canvas") {
+      void this.updateCanvasFromDisk(file);
+      return;
+    }
     if (kind === "text") {
-      // Read new content and push into the text session's Y.Text. Replace
-      // the entire content — Y.Text CRDT will diff for us at the byte level.
-      void this.updateTextSessionFromDisk(file);
+      void this.updateAtomicFromDisk(file);
       return;
     }
     if (!this.manifestMap.has(file.path)) {
@@ -897,27 +1182,6 @@ export default class CollabPlugin extends Plugin {
     void this.uploadBinary(file);
   }
 
-  private async updateTextSessionFromDisk(file: TFile) {
-    let session = this.textSessions.get(file.path);
-    if (!session) {
-      this.openTextSession(file.path);
-      session = this.textSessions.get(file.path);
-      if (!session) return;
-    }
-    try {
-      const content = await this.app.vault.read(file);
-      if (content === session.lastSynced) return;
-      // Replace the full Y.Text in one transaction. The CRDT will record a
-      // delete + insert pair; peers see the merged result.
-      session.ydoc.transact(() => {
-        session!.ytext.delete(0, session!.ytext.length);
-        session!.ytext.insert(0, content);
-      });
-      session.lastSynced = content;
-    } catch (err) {
-      console.warn("[collab] failed to read text file for sync", file.path, err);
-    }
-  }
 
   // ── manifest → local ───────────────────────────────────────────────────────
 
