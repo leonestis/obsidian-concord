@@ -208,7 +208,15 @@ function pathToRoom(path: string): string {
 // library's CSS only un-hides on hover. We patch the visibility via our own
 // styles.css so the name is shown all the time.
 const COLLAB_COMPARTMENT_KEY = "__collabCompartment__";
-type CompartmentHolder = { compartment: Compartment; activeRoom: string | null };
+// `owner` is the CollabPlugin instance that installed the compartment. We
+// use object identity to spot a holder that survived an earlier plugin
+// reload — its inner extension still references a now-destroyed Y.Doc and
+// must be replaced before the editor will see new updates again.
+type CompartmentHolder = {
+  compartment: Compartment;
+  activeRoom: string | null;
+  owner: object;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // plugin
@@ -303,6 +311,27 @@ export default class CollabPlugin extends Plugin {
 
   async onunload() {
     console.log("[collab] unloading…");
+    // Detach yCollab from any markdown editors we'd bound: the per-file
+    // Y.Docs are about to be destroyed and a leftover binding to a dead
+    // Y.Doc on the EditorView would make the next plugin instance see a
+    // "compartment already installed" stub pointing at nothing.
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const editorView = (view.editor as unknown as { cm?: EditorView } | undefined)?.cm;
+      if (!editorView) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const viewAny = editorView as any;
+      const holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
+      if (!holder || holder.owner !== this) return;
+      try {
+        editorView.dispatch({ effects: holder.compartment.reconfigure([]) });
+        holder.activeRoom = null;
+      } catch (err) {
+        console.warn("[collab] compartment cleanup failed", err);
+      }
+    });
     this.stopVaultSync();
     for (const session of this.sessions.values()) this.destroySession(session);
     this.sessions.clear();
@@ -449,20 +478,33 @@ export default class CollabPlugin extends Plugin {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const viewAny = editorView as any;
-    let holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
+    const holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
 
     if (!holder) {
-      // First-time setup for this editor: install the compartment with the
-      // collab extension already inside, in a single dispatch. Doing init and
-      // reconfigure as two separate transactions left a window where the new
-      // compartment existed but didn't hold yCollab yet, which scrambled the
-      // sync state on plugin reload.
+      // Brand-new editor view, no compartment yet. Install one with the
+      // collab extension already inside, in a single dispatch.
       const compartment = new Compartment();
-      holder = { compartment, activeRoom: targetRoom };
-      viewAny[COLLAB_COMPARTMENT_KEY] = holder;
+      const fresh: CompartmentHolder = { compartment, activeRoom: targetRoom, owner: this };
+      viewAny[COLLAB_COMPARTMENT_KEY] = fresh;
       editorView.dispatch({
         effects: StateEffect.appendConfig.of(compartment.of(collabExtension)),
       });
+      return;
+    }
+
+    // If the holder was installed by a previous instance of this plugin
+    // (Obsidian disable/enable, or "Reload app"), its compartment is still
+    // wired to a Y.Doc we already destroyed — the editor sees no updates
+    // even though the new providers are syncing in the background. Treat
+    // this case as "rebind everything" rather than the no-op we'd hit if
+    // we only checked activeRoom.
+    if (holder.owner !== this) {
+      holder.owner = this;
+      holder.activeRoom = targetRoom;
+      editorView.dispatch({
+        effects: holder.compartment.reconfigure(collabExtension),
+      });
+      console.log(`[collab] rebound stale compartment for ${file.path}`);
       return;
     }
 

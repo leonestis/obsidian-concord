@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.2 — 2026-05-24
+
+### Fixed
+- **Edits don't propagate after a plugin reload.** The yCollab `Compartment` we installed on each editor was stashed on the `EditorView` object itself. On plugin unload we destroyed the per-file Y.Docs but never reset that compartment — so when the next plugin instance ran `attachFile`, it saw `holder.activeRoom === targetRoom`, returned early, and the editor stayed bound to the dead Y.Doc from the previous instance. Background providers reported `synced` but the user saw nothing change and remote cursors never appeared. Now each `CompartmentHolder` records which plugin instance installed it via an `owner` identity; a holder owned by a previous instance is detected on next `attachFile` and reconfigured to the live extension. We also detach yCollab on `onunload` for every open markdown view to leave the editor in a clean state.
+
 ## 0.5.1 — 2026-05-24
 
 ### Fixed
