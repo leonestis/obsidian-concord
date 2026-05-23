@@ -2,6 +2,15 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.1.1 — 2026-05-24
+
+### Fixed
+- Display name / color changes in settings now propagate to all active sessions immediately; previously the new value only applied to sessions opened after the change.
+
+### Added
+- Verbose connection logging: socket status (`[collab] socket status: ...`), per-room status, per-room sync, and authentication failures are all printed to the dev console.
+- New command **"Collab: Show connection status (diagnostics)"** — prints a snapshot of the socket state, every active session, its room name, peer count, and document length. Useful when "nothing is syncing" and we need to see what's actually attached.
+
 ## 0.1.0 — 2026-05-24
 
 First usable release. Covers the full Phase 0–6 roadmap.

@@ -104,6 +104,12 @@ export default class CollabPlugin extends Plugin {
       callback: () => this.reconnect(),
     });
 
+    this.addCommand({
+      id: "collab-show-status",
+      name: "Show connection status (diagnostics)",
+      callback: () => this.showDiagnostics(),
+    });
+
     // React to the user opening a file in any pane.
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => this.onFileOpen(file)),
@@ -142,6 +148,31 @@ export default class CollabPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+    // Push the latest display name / color into every active session so
+    // remote peers see the change immediately — without this, the new name
+    // only landed when a session was first created.
+    for (const session of this.sessions.values()) {
+      session.provider.awareness?.setLocalStateField("user", {
+        name: this.settings.userName,
+        color: this.settings.userColor,
+      });
+    }
+    this.renderStatus();
+  }
+
+  private showDiagnostics() {
+    const lines: string[] = [];
+    lines.push(`Server URL: ${this.settings.serverUrl}`);
+    lines.push(`Socket: ${this.socket ? (this.connected ? "🟢 connected" : "🟡 not connected") : "🔴 no socket"}`);
+    lines.push(`Active sessions: ${this.sessions.size}`);
+    for (const s of this.sessions.values()) {
+      const wsStatus = (s.provider as unknown as { status: string }).status ?? "?";
+      const peers = s.provider.awareness ? s.provider.awareness.getStates().size : 0;
+      lines.push(`  • ${s.filePath}  →  status=${wsStatus}, peers=${peers}, length=${s.ytext.length}`);
+    }
+    const msg = lines.join("\n");
+    console.log("[collab] diagnostics:\n" + msg);
+    new Notice(msg, 12_000);
   }
 
   // ── connection ─────────────────────────────────────────────────────────────
@@ -159,9 +190,13 @@ export default class CollabPlugin extends Plugin {
       // for "connect"/"disconnect" — those don't exist and silently no-op,
       // which is why the status bar appeared stuck on "offline" earlier.
       this.socket.on("status", (event: { status: string }) => {
+        console.log(`[collab] socket status: ${event.status}`);
         const wasConnected = this.connected;
         this.connected = event.status === "connected";
         if (this.connected !== wasConnected) this.renderStatus();
+      });
+      this.socket.on("close", (event: unknown) => {
+        console.log("[collab] socket close", event);
       });
       // Bind any already-open markdown file.
       const activeFile = this.app.workspace.getActiveFile();
@@ -246,6 +281,17 @@ export default class CollabPlugin extends Plugin {
     // i.e. no sync, and remote cursors look "Anonymous" because their user
     // field never reaches us.
     provider.attach();
+
+    provider.on("status", (event: { status: string }) => {
+      console.log(`[collab] room "${room}" status: ${event.status}`);
+    });
+    provider.on("synced", () => {
+      console.log(`[collab] room "${room}" synced`);
+    });
+    provider.on("authenticationFailed", (data: { reason: string }) => {
+      console.error(`[collab] room "${room}" auth failed: ${data.reason}`);
+      new Notice(`Collab: authentication rejected for ${file.path}`);
+    });
 
     provider.awareness?.setLocalStateField("user", {
       name: this.settings.userName,
