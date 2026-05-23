@@ -64,6 +64,20 @@ interface FileSession {
   persistence: IndexeddbPersistence;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// vault-structure sync (manifest)
+// ─────────────────────────────────────────────────────────────────────────────
+// Holds the full set of file paths in the vault. Every client observes it and
+// mirrors local create/delete/rename into the manifest, and applies remote
+// manifest changes back to its local vault. Per-file content sync (per-file
+// Y.Doc) continues unchanged.
+
+const MANIFEST_ROOM = "vault:manifest";
+
+interface ManifestEntry {
+  createdAt: number;
+}
+
 // Convert a vault-relative file path into a stable, safe Hocuspocus room name.
 // We avoid raw slashes because some routing layers treat them specially.
 function pathToRoom(path: string): string {
@@ -90,6 +104,16 @@ export default class CollabPlugin extends Plugin {
   private statusEl: HTMLElement | null = null;
   private connected = false;
 
+  // Vault manifest — single shared Y.Doc tracking which files exist in the vault.
+  private manifestYDoc: Y.Doc | null = null;
+  private manifestMap: Y.Map<ManifestEntry> | null = null;
+  private manifestProvider: HocuspocusProvider | null = null;
+  private manifestPersistence: IndexeddbPersistence | null = null;
+  // Paths currently being applied from a remote manifest change. The local
+  // vault event handlers skip these so we don't echo the change back into the
+  // manifest (which would loop forever).
+  private remoteApplyPaths = new Set<string>();
+
   async onload() {
     await this.loadSettings();
     console.log("[collab] plugin loaded");
@@ -115,14 +139,23 @@ export default class CollabPlugin extends Plugin {
       this.app.workspace.on("file-open", (file) => this.onFileOpen(file)),
     );
 
-    // Rename: shift the room name for any open session.
+    // Vault structural events. Each fires both the per-file session handler
+    // and the manifest handler — they're independent concerns: sessions
+    // manage per-file Y.Docs, manifest broadcasts existence to all clients.
     this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => this.onRename(file, oldPath)),
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.onRename(file, oldPath);
+        this.onLocalVaultRename(file, oldPath);
+      }),
     );
-
-    // Delete: tear down the session so the bar doesn't show a stale entry.
     this.registerEvent(
-      this.app.vault.on("delete", (file) => this.onDelete(file)),
+      this.app.vault.on("delete", (file) => {
+        this.onDelete(file);
+        this.onLocalVaultDelete(file);
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("create", (file) => this.onLocalVaultCreate(file)),
     );
 
     this.app.workspace.onLayoutReady(() => {
@@ -132,6 +165,7 @@ export default class CollabPlugin extends Plugin {
 
   async onunload() {
     console.log("[collab] unloading…");
+    this.stopVaultSync();
     for (const session of this.sessions.values()) this.destroySession(session);
     this.sessions.clear();
     this.socket?.destroy();
@@ -198,6 +232,8 @@ export default class CollabPlugin extends Plugin {
       this.socket.on("close", (event: unknown) => {
         console.log("[collab] socket close", event);
       });
+      // Spin up the vault-structure sync (single shared manifest Y.Doc).
+      this.startVaultSync();
       // Bind any already-open markdown file.
       const activeFile = this.app.workspace.getActiveFile();
       if (activeFile && activeFile.extension === "md") this.attachFile(activeFile);
@@ -208,6 +244,7 @@ export default class CollabPlugin extends Plugin {
   }
 
   private reconnect() {
+    this.stopVaultSync();
     for (const session of this.sessions.values()) this.destroySession(session);
     this.sessions.clear();
     this.socket?.destroy();
@@ -349,6 +386,195 @@ export default class CollabPlugin extends Plugin {
     this.destroySession(session);
     this.sessions.delete(oldPath);
     if (file instanceof TFile && file.extension === "md") void this.attachFile(file);
+  }
+
+  // ── vault structure sync (manifest) ────────────────────────────────────────
+
+  private startVaultSync() {
+    if (!this.socket || this.manifestProvider) return;
+
+    this.manifestYDoc = new Y.Doc();
+    this.manifestMap = this.manifestYDoc.getMap<ManifestEntry>("files");
+
+    this.manifestProvider = new HocuspocusProvider({
+      websocketProvider: this.socket,
+      name: MANIFEST_ROOM,
+      document: this.manifestYDoc,
+      token: this.settings.authToken || undefined,
+    });
+    this.manifestProvider.attach();
+
+    this.manifestPersistence = new IndexeddbPersistence(
+      `obsidian-collab::${this.settings.serverUrl}::${MANIFEST_ROOM}`,
+      this.manifestYDoc,
+    );
+
+    this.manifestProvider.on("synced", () => {
+      console.log(`[collab] manifest synced (${this.manifestMap?.size ?? 0} entries)`);
+      void this.reconcileManifest();
+    });
+
+    this.manifestMap.observe((event) => this.onManifestChange(event));
+  }
+
+  private stopVaultSync() {
+    this.manifestProvider?.destroy();
+    this.manifestProvider = null;
+    void this.manifestPersistence?.destroy();
+    this.manifestPersistence = null;
+    this.manifestYDoc?.destroy();
+    this.manifestYDoc = null;
+    this.manifestMap = null;
+    this.remoteApplyPaths.clear();
+  }
+
+  // First sync after connect: union the manifest with the local vault.
+  // - Files in manifest but missing locally → create empty (content arrives
+  //   via the per-file Y.Doc once anyone opens the file).
+  // - Files locally but missing from manifest → register them.
+  private async reconcileManifest() {
+    if (!this.manifestMap || !this.manifestYDoc) return;
+
+    const localFiles = this.app.vault.getMarkdownFiles().map((f) => f.path);
+    const manifestPaths = Array.from(this.manifestMap.keys());
+
+    for (const path of manifestPaths) {
+      if (this.app.vault.getAbstractFileByPath(path)) continue;
+      try {
+        this.remoteApplyPaths.add(path);
+        await this.ensureFolderExists(path);
+        await this.app.vault.create(path, "");
+        console.log(`[collab] reconcile: created missing local file ${path}`);
+      } catch (err) {
+        console.warn("[collab] reconcile create failed", path, err);
+      } finally {
+        // Hold the suppression a beat so the create event we just provoked
+        // doesn't race back into the manifest.
+        setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
+      }
+    }
+
+    this.manifestYDoc.transact(() => {
+      for (const path of localFiles) {
+        if (!this.manifestMap!.has(path)) {
+          this.manifestMap!.set(path, { createdAt: Date.now() });
+        }
+      }
+    });
+  }
+
+  private async ensureFolderExists(filePath: string) {
+    const slash = filePath.lastIndexOf("/");
+    if (slash <= 0) return;
+    const folder = filePath.substring(0, slash);
+    if (this.app.vault.getAbstractFileByPath(folder)) return;
+    try {
+      await this.app.vault.createFolder(folder);
+    } catch (err) {
+      // createFolder throws if already exists — race with another sibling create.
+      if (!/already exists/i.test(String(err))) throw err;
+    }
+  }
+
+  // ── local → manifest ───────────────────────────────────────────────────────
+
+  private onLocalVaultCreate(file: TAbstractFile) {
+    if (!this.manifestMap) return;
+    if (this.remoteApplyPaths.has(file.path)) return;
+    if (!(file instanceof TFile) || file.extension !== "md") return;
+    if (this.manifestMap.has(file.path)) return;
+    this.manifestMap.set(file.path, { createdAt: Date.now() });
+  }
+
+  private onLocalVaultDelete(file: TAbstractFile) {
+    if (!this.manifestMap) return;
+    if (this.remoteApplyPaths.has(file.path)) return;
+    if (!this.manifestMap.has(file.path)) return;
+    this.manifestMap.delete(file.path);
+  }
+
+  private onLocalVaultRename(file: TAbstractFile, oldPath: string) {
+    if (!this.manifestMap || !this.manifestYDoc) return;
+    if (this.remoteApplyPaths.has(file.path) || this.remoteApplyPaths.has(oldPath)) return;
+    if (!(file instanceof TFile) || file.extension !== "md") return;
+    // Group delete + set in one transaction so peers can recognise this as
+    // a rename (1 delete + 1 add in the same change event) instead of a
+    // delete-then-create, which would lose content.
+    this.manifestYDoc.transact(() => {
+      this.manifestMap!.delete(oldPath);
+      this.manifestMap!.set(file.path, { createdAt: Date.now() });
+    });
+  }
+
+  // ── manifest → local ───────────────────────────────────────────────────────
+
+  private async onManifestChange(event: Y.YMapEvent<ManifestEntry>) {
+    const deletes: string[] = [];
+    const adds: string[] = [];
+    event.changes.keys.forEach((change, key) => {
+      if (change.action === "delete") deletes.push(key);
+      else if (change.action === "add") adds.push(key);
+    });
+
+    // Single delete + single add in one transaction is treated as a rename:
+    // we move the local file, preserving its contents.
+    if (deletes.length === 1 && adds.length === 1) {
+      await this.applyRemoteRename(deletes[0], adds[0]);
+      return;
+    }
+
+    for (const path of deletes) await this.applyRemoteDelete(path);
+    for (const path of adds) await this.applyRemoteCreate(path);
+  }
+
+  private async applyRemoteRename(oldPath: string, newPath: string) {
+    const localFile = this.app.vault.getAbstractFileByPath(oldPath);
+    if (!localFile) {
+      await this.applyRemoteCreate(newPath);
+      return;
+    }
+    this.remoteApplyPaths.add(oldPath);
+    this.remoteApplyPaths.add(newPath);
+    try {
+      await this.ensureFolderExists(newPath);
+      await this.app.fileManager.renameFile(localFile, newPath);
+      console.log(`[collab] remote rename: ${oldPath} → ${newPath}`);
+    } catch (err) {
+      console.warn("[collab] remote rename failed", oldPath, newPath, err);
+    } finally {
+      setTimeout(() => {
+        this.remoteApplyPaths.delete(oldPath);
+        this.remoteApplyPaths.delete(newPath);
+      }, 1000);
+    }
+  }
+
+  private async applyRemoteCreate(path: string) {
+    if (this.app.vault.getAbstractFileByPath(path)) return;
+    this.remoteApplyPaths.add(path);
+    try {
+      await this.ensureFolderExists(path);
+      await this.app.vault.create(path, "");
+      console.log(`[collab] remote create: ${path}`);
+    } catch (err) {
+      console.warn("[collab] remote create failed", path, err);
+    } finally {
+      setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
+    }
+  }
+
+  private async applyRemoteDelete(path: string) {
+    const localFile = this.app.vault.getAbstractFileByPath(path);
+    if (!localFile) return;
+    this.remoteApplyPaths.add(path);
+    try {
+      await this.app.vault.delete(localFile);
+      console.log(`[collab] remote delete: ${path}`);
+    } catch (err) {
+      console.warn("[collab] remote delete failed", path, err);
+    } finally {
+      setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
+    }
   }
 
   private onDelete(file: TAbstractFile) {
