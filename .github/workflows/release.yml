@@ -1,0 +1,62 @@
+name: Release plugin
+
+# Builds the plugin and publishes main.js / manifest.json / styles.css to a
+# GitHub Release whenever a version tag is pushed (e.g. `v0.5.0`).
+#
+# BRAT (the Obsidian beta-installer plugin) reads the latest release on the
+# repo and pulls these three files into the target vault. Re-tagging a new
+# version is therefore the entire "ship to users" workflow.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install plugin dependencies
+        working-directory: plugin
+        # Obsidian pins @codemirror/state at exactly 6.5.0 while newer
+        # @codemirror/view requires ^6.6.0 — the standard Obsidian
+        # workaround is to install with --legacy-peer-deps.
+        run: npm ci --legacy-peer-deps
+
+      - name: Build plugin
+        working-directory: plugin
+        run: npm run build
+
+      - name: Verify manifest version matches the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION=$(node -p "require('./plugin/manifest.json').version")
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest version $MANIFEST_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp plugin/main.js plugin/manifest.json plugin/styles.css dist/
+          ls -la dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/main.js
+            dist/manifest.json
+            dist/styles.css
+          fail_on_unmatched_files: true
+          generate_release_notes: true

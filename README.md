@@ -35,6 +35,16 @@ obsidian-collab/
 └── LICENSE    # AGPL-3.0
 ```
 
+## Installing in your vault
+
+The friendliest route is via [BRAT](https://github.com/TfTHacker/obsidian42-brat):
+
+1. Install the **BRAT** community plugin in Obsidian.
+2. *Add Beta plugin* → paste `https://github.com/leonestis/obsidian-collab`.
+3. Set **Server URL** in Collab's settings.
+
+Auto-updates whenever a new tag ships. Full step-by-step + the manual fallback: [docs/install-for-users.md](docs/install-for-users.md).
+
 ## Self-hosting
 
 Documentation will live in [docs/](docs/) once the first usable version ships.
