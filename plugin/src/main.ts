@@ -202,13 +202,14 @@ export default class CollabPlugin extends Plugin {
         // y-websocket-style auto-reconnect with exponential backoff is on by default;
         // we just don't have to disable it.
       });
-      this.socket.on("connect", () => {
-        this.connected = true;
-        this.renderStatus();
-      });
-      this.socket.on("disconnect", () => {
-        this.connected = false;
-        this.renderStatus();
+      // HocuspocusProviderWebsocket emits a single `status` event with payload
+      // `{ status: 'connecting' | 'connected' | 'disconnected' }`. Don't listen
+      // for "connect"/"disconnect" — those don't exist and silently no-op,
+      // which is why the status bar appeared stuck on "offline" earlier.
+      this.socket.on("status", (event: { status: string }) => {
+        const wasConnected = this.connected;
+        this.connected = event.status === "connected";
+        if (this.connected !== wasConnected) this.renderStatus();
       });
       // Bind any already-open markdown file.
       const activeFile = this.app.workspace.getActiveFile();
