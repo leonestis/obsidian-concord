@@ -1,0 +1,37 @@
+/* Remote cursor: a thin vertical bar in the user's color. */
+.collab-cursor {
+  position: relative;
+  display: inline-block;
+  width: 0;
+  height: 1em;
+  margin-left: -1px;
+  margin-right: -1px;
+  border-left: 2px solid var(--collab-color, #888);
+  pointer-events: none;
+  vertical-align: text-bottom;
+}
+
+/* Always-visible name tag sitting above the bar. */
+.collab-cursor-label {
+  position: absolute;
+  bottom: 100%;
+  left: -2px;
+  margin-bottom: 1px;
+  padding: 1px 5px;
+  background-color: var(--collab-color, #888);
+  color: #ffffff;
+  font-family: var(--font-interface, sans-serif);
+  font-size: 11px;
+  line-height: 1.2;
+  border-radius: 3px;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  z-index: 20;
+}
+
+/* Remote selection highlight (translucent fill in the user's color). */
+.collab-selection {
+  /* color is set inline by selectionBuilder */
+}

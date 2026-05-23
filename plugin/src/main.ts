@@ -1,119 +1,340 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
-import { StateEffect } from "@codemirror/state";
+import {
+  App,
+  MarkdownView,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  TAbstractFile,
+  TFile,
+} from "obsidian";
+import { Compartment, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
-import { HocuspocusProvider } from "@hocuspocus/provider";
+import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
+import { removeAwarenessStates } from "y-protocols/awareness";
 import * as Y from "yjs";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// settings
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface CollabSettings {
   serverUrl: string;
-  testFile: string;
-  roomName: string;
+  userName: string;
+  userColor: string;
+  autoConnect: boolean;
 }
 
 const DEFAULT_SETTINGS: CollabSettings = {
-  serverUrl: "ws://localhost:1234",
-  testFile: "shared.md",
-  roomName: "shared",
+  serverUrl: "ws://158.255.5.243:1234",
+  userName: "",
+  userColor: "",
+  autoConnect: true,
 };
 
-interface Session {
+// Pleasant palette for auto-assigning a color when the user hasn't picked one.
+const PALETTE = [
+  "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6",
+  "#3b82f6", "#6366f1", "#a855f7", "#ec4899",
+];
+
+function colorFromName(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  return PALETTE[Math.abs(hash) % PALETTE.length];
+}
+
+function randomName(): string {
+  return `user-${Math.floor(Math.random() * 9000 + 1000)}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// per-file session
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface FileSession {
+  filePath: string;
   ydoc: Y.Doc;
   provider: HocuspocusProvider;
-  destroy: () => void;
+  ytext: Y.Text;
 }
+
+// Convert a vault-relative file path into a stable, safe Hocuspocus room name.
+// We avoid raw slashes because some routing layers treat them specially.
+function pathToRoom(path: string): string {
+  return "file:" + path.replace(/\//g, "__");
+}
+
+// Per-editor compartment so we can swap the collab extension when the open file changes.
+const COLLAB_COMPARTMENT_KEY = "__collabCompartment__";
+type CompartmentHolder = { compartment: Compartment; activeRoom: string | null };
+
+function getCompartmentHolder(view: EditorView): CompartmentHolder {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const any = view as any;
+  if (!any[COLLAB_COMPARTMENT_KEY]) {
+    const compartment = new Compartment();
+    any[COLLAB_COMPARTMENT_KEY] = { compartment, activeRoom: null } as CompartmentHolder;
+    // Install the compartment into the running editor with an empty extension —
+    // we'll reconfigure it later when we know which room this view should join.
+    view.dispatch({ effects: StateEffect.appendConfig.of(compartment.of([])) });
+  }
+  return any[COLLAB_COMPARTMENT_KEY];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// custom cursor renderer — always-visible name label above the bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AwarenessUser {
+  name?: string;
+  color?: string;
+}
+
+function buildCursor(user: AwarenessUser | undefined): HTMLElement {
+  const name = user?.name || "anonymous";
+  const color = user?.color || "#888";
+
+  const cursor = document.createElement("span");
+  cursor.classList.add("collab-cursor");
+  cursor.style.setProperty("--collab-color", color);
+
+  const label = document.createElement("span");
+  label.classList.add("collab-cursor-label");
+  label.textContent = name;
+  cursor.appendChild(label);
+
+  return cursor;
+}
+
+function buildSelection(user: AwarenessUser | undefined): { class: string; style: string } {
+  const color = user?.color || "#888";
+  return {
+    class: "collab-selection",
+    style: `background-color: ${hexToRgba(color, 0.25)};`,
+  };
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return `rgba(136,136,136,${alpha})`;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// plugin
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default class CollabPlugin extends Plugin {
   settings!: CollabSettings;
-  private session: Session | null = null;
+  private socket: HocuspocusProviderWebsocket | null = null;
+  private sessions = new Map<string, FileSession>();
+  private statusEl: HTMLElement | null = null;
+  private connected = false;
 
   async onload() {
     await this.loadSettings();
     console.log("[collab] plugin loaded");
 
     this.addSettingTab(new CollabSettingTab(this.app, this));
+    this.statusEl = this.addStatusBarItem();
+    this.renderStatus();
 
     this.addCommand({
-      id: "collab-connect",
-      name: "Connect to server (test file)",
-      callback: () => this.connect(),
+      id: "collab-reconnect",
+      name: "Reconnect to server",
+      callback: () => this.reconnect(),
     });
 
-    this.addCommand({
-      id: "collab-disconnect",
-      name: "Disconnect",
-      callback: () => this.disconnect(),
+    // React to the user opening a file in any pane.
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => this.onFileOpen(file)),
+    );
+
+    // Rename: shift the room name for any open session.
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => this.onRename(file, oldPath)),
+    );
+
+    // Delete: tear down the session so the bar doesn't show a stale entry.
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => this.onDelete(file)),
+    );
+
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.autoConnect) this.connect();
     });
   }
 
   async onunload() {
-    this.disconnect();
-    console.log("[collab] plugin unloaded");
+    console.log("[collab] unloading…");
+    for (const session of this.sessions.values()) this.destroySession(session);
+    this.sessions.clear();
+    this.socket?.destroy();
+    this.socket = null;
+    console.log("[collab] unloaded");
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!this.settings.userName) this.settings.userName = randomName();
+    if (!this.settings.userColor) this.settings.userColor = colorFromName(this.settings.userName);
+    await this.saveSettings();
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
 
+  // ── connection ─────────────────────────────────────────────────────────────
+
   private connect() {
+    if (this.socket) return;
+    try {
+      this.socket = new HocuspocusProviderWebsocket({ url: this.settings.serverUrl });
+      this.socket.on("connect", () => {
+        this.connected = true;
+        this.renderStatus();
+      });
+      this.socket.on("disconnect", () => {
+        this.connected = false;
+        this.renderStatus();
+      });
+      // Bind any already-open markdown file.
+      const activeFile = this.app.workspace.getActiveFile();
+      if (activeFile && activeFile.extension === "md") this.attachFile(activeFile);
+    } catch (err) {
+      console.error("[collab] failed to open socket", err);
+      new Notice("Collab: failed to connect — see console");
+    }
+  }
+
+  private reconnect() {
+    for (const session of this.sessions.values()) this.destroySession(session);
+    this.sessions.clear();
+    this.socket?.destroy();
+    this.socket = null;
+    this.connect();
+    new Notice("Collab: reconnected");
+  }
+
+  // ── file lifecycle ─────────────────────────────────────────────────────────
+
+  private onFileOpen(file: TFile | null) {
+    if (!file || file.extension !== "md") return;
+    if (!this.socket) return;
+    this.attachFile(file);
+  }
+
+  private async attachFile(file: TFile) {
+    if (!this.socket) return;
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) {
-      new Notice("Open a markdown file first");
-      return;
-    }
-    if (view.file?.path !== this.settings.testFile) {
-      new Notice(`MVP only syncs "${this.settings.testFile}". Create/open that file first.`);
-      return;
-    }
-    if (this.session) {
-      new Notice("Already connected — disconnect first");
-      return;
-    }
+    if (!view || view.file?.path !== file.path) return;
 
-    const ydoc = new Y.Doc();
-    const provider = new HocuspocusProvider({
-      url: this.settings.serverUrl,
-      name: this.settings.roomName,
-      document: ydoc,
-    });
-    const ytext = ydoc.getText("content");
-
-    provider.on("status", (event: { status: string }) => {
-      console.log(`[collab] ws status: ${event.status}`);
-    });
+    let session = this.sessions.get(file.path);
+    if (!session) session = await this.createSession(file);
 
     const editorView = (view.editor as unknown as { cm: EditorView }).cm;
+    const holder = getCompartmentHolder(editorView);
+    const targetRoom = pathToRoom(file.path);
+
+    if (holder.activeRoom === targetRoom) return; // already bound to this room
+
+    // y-codemirror.next accepts cursorBuilder/selectionBuilder at runtime but
+    // its TS types don't declare them on the public options interface, so cast.
+    const collabExtension = yCollab(session.ytext, session.provider.awareness, {
+      cursorBuilder: buildCursor,
+      selectionBuilder: buildSelection,
+    } as unknown as Parameters<typeof yCollab>[2]);
 
     editorView.dispatch({
-      effects: StateEffect.appendConfig.of(yCollab(ytext, provider.awareness)),
+      effects: holder.compartment.reconfigure(collabExtension),
+    });
+    holder.activeRoom = targetRoom;
+  }
+
+  private async createSession(file: TFile): Promise<FileSession> {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("content");
+    const room = pathToRoom(file.path);
+
+    const provider = new HocuspocusProvider({
+      websocketProvider: this.socket!,
+      name: room,
+      document: ydoc,
     });
 
-    this.session = {
-      ydoc,
-      provider,
-      destroy: () => {
-        provider.destroy();
-        ydoc.destroy();
-      },
-    };
+    provider.awareness?.setLocalStateField("user", {
+      name: this.settings.userName,
+      color: this.settings.userColor,
+    });
 
-    new Notice(`Connected → ${this.settings.serverUrl} (room: ${this.settings.roomName})`);
+    provider.on("synced", async () => {
+      // First client into the room seeds the document with disk content.
+      if (ytext.length === 0) {
+        try {
+          const content = await this.app.vault.read(file);
+          if (content.length > 0) ytext.insert(0, content);
+        } catch (err) {
+          console.warn("[collab] seed read failed for", file.path, err);
+        }
+      }
+    });
+
+    const session: FileSession = { filePath: file.path, ydoc, provider, ytext };
+    this.sessions.set(file.path, session);
+    return session;
   }
 
-  private disconnect() {
-    if (!this.session) {
-      new Notice("Not connected");
-      return;
+  private destroySession(session: FileSession) {
+    try {
+      // Tell peers we're gone — prevents lingering ghost cursors.
+      if (session.provider.awareness) {
+        session.provider.awareness.setLocalState(null);
+        removeAwarenessStates(
+          session.provider.awareness,
+          [session.provider.awareness.clientID],
+          "destroy",
+        );
+      }
+    } catch (err) {
+      console.warn("[collab] awareness clear failed", err);
     }
-    this.session.destroy();
-    this.session = null;
-    new Notice("Disconnected");
+    session.provider.destroy();
+    session.ydoc.destroy();
+  }
+
+  private onRename(file: TAbstractFile, oldPath: string) {
+    const session = this.sessions.get(oldPath);
+    if (!session) return;
+    this.destroySession(session);
+    this.sessions.delete(oldPath);
+    if (file instanceof TFile && file.extension === "md") void this.attachFile(file);
+  }
+
+  private onDelete(file: TAbstractFile) {
+    const session = this.sessions.get(file.path);
+    if (!session) return;
+    this.destroySession(session);
+    this.sessions.delete(file.path);
+  }
+
+  // ── status bar ─────────────────────────────────────────────────────────────
+
+  private renderStatus() {
+    if (!this.statusEl) return;
+    const dot = this.connected ? "🟢" : "🔴";
+    const label = this.connected ? "collab live" : "collab offline";
+    this.statusEl.setText(`${dot} ${label}`);
+    this.statusEl.setAttr("title", `Server: ${this.settings.serverUrl}`);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// settings tab
+// ─────────────────────────────────────────────────────────────────────────────
 
 class CollabSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: CollabPlugin) {
@@ -127,7 +348,7 @@ class CollabSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server URL")
-      .setDesc("WebSocket URL of the Hocuspocus server. Use ws:// for plain or wss:// for TLS.")
+      .setDesc("WebSocket URL of the Hocuspocus server (ws:// or wss://).")
       .addText((text) =>
         text
           .setPlaceholder("ws://158.255.5.243:1234")
@@ -139,34 +360,44 @@ class CollabSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Test file")
-      .setDesc("Relative path inside the vault. Only this file is synced in MVP.")
+      .setName("Display name")
+      .setDesc("Shown above your cursor to other editors.")
       .addText((text) =>
         text
-          .setPlaceholder("shared.md")
-          .setValue(this.plugin.settings.testFile)
+          .setPlaceholder("alex")
+          .setValue(this.plugin.settings.userName)
           .onChange(async (value) => {
-            this.plugin.settings.testFile = value.trim();
+            this.plugin.settings.userName = value.trim() || randomName();
             await this.plugin.saveSettings();
           }),
       );
 
     new Setting(containerEl)
-      .setName("Room name")
-      .setDesc("Yjs room identifier. All clients with the same room name share the same document.")
+      .setName("Cursor color")
+      .setDesc("Hex like #3b82f6. Empty = auto-pick from name.")
       .addText((text) =>
         text
-          .setPlaceholder("shared")
-          .setValue(this.plugin.settings.roomName)
+          .setPlaceholder("#3b82f6")
+          .setValue(this.plugin.settings.userColor)
           .onChange(async (value) => {
-            this.plugin.settings.roomName = value.trim();
+            const v = value.trim();
+            this.plugin.settings.userColor = v || colorFromName(this.plugin.settings.userName);
             await this.plugin.saveSettings();
           }),
       );
 
+    new Setting(containerEl)
+      .setName("Auto-connect on startup")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoConnect).onChange(async (value) => {
+          this.plugin.settings.autoConnect = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
     containerEl.createEl("p", {
-      text: "Restart any active connection (Disconnect → Connect) for changes to take effect.",
       cls: "setting-item-description",
+      text: "Use the command palette → \"Collab: Reconnect to server\" to apply changes.",
     });
   }
 }
