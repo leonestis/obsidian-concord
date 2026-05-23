@@ -378,15 +378,21 @@ class CollabSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Cursor color")
-      .setDesc("Hex like #3b82f6. Empty = auto-pick from name.")
-      .addText((text) =>
-        text
-          .setPlaceholder("#3b82f6")
-          .setValue(this.plugin.settings.userColor)
-          .onChange(async (value) => {
-            const v = value.trim();
-            this.plugin.settings.userColor = v || colorFromName(this.plugin.settings.userName);
+      .setDesc("Picked color for your caret + name label.")
+      .addColorPicker((picker) =>
+        picker.setValue(this.plugin.settings.userColor).onChange(async (value) => {
+          this.plugin.settings.userColor = value;
+          await this.plugin.saveSettings();
+        }),
+      )
+      .addExtraButton((btn) =>
+        btn
+          .setIcon("reset")
+          .setTooltip("Reset color to auto-pick from display name")
+          .onClick(async () => {
+            this.plugin.settings.userColor = colorFromName(this.plugin.settings.userName);
             await this.plugin.saveSettings();
+            this.display(); // re-render so the picker shows the new value
           }),
       );
 
