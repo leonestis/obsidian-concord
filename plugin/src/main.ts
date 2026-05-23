@@ -2,7 +2,7 @@ import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from "ob
 import { StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
-import { WebsocketProvider } from "y-websocket";
+import { HocuspocusProvider } from "@hocuspocus/provider";
 import * as Y from "yjs";
 
 interface CollabSettings {
@@ -19,7 +19,7 @@ const DEFAULT_SETTINGS: CollabSettings = {
 
 interface Session {
   ydoc: Y.Doc;
-  provider: WebsocketProvider;
+  provider: HocuspocusProvider;
   destroy: () => void;
 }
 
@@ -75,7 +75,11 @@ export default class CollabPlugin extends Plugin {
     }
 
     const ydoc = new Y.Doc();
-    const provider = new WebsocketProvider(this.settings.serverUrl, this.settings.roomName, ydoc);
+    const provider = new HocuspocusProvider({
+      url: this.settings.serverUrl,
+      name: this.settings.roomName,
+      document: ydoc,
+    });
     const ytext = ydoc.getText("content");
 
     provider.on("status", (event: { status: string }) => {

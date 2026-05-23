@@ -1,0 +1,5 @@
+{
+  "serverUrl": "ws://158.255.5.243:1234",
+  "testFile": "shared.md",
+  "roomName": "shared"
+}
