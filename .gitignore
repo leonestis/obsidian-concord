@@ -6,6 +6,9 @@ plugin/main.js
 plugin/*.js.map
 server/dist/
 
+# Per-installation plugin settings (created at runtime by Obsidian)
+plugin/data.json
+
 # Local config & secrets
 .env
 .env.local
