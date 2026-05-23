@@ -71,61 +71,13 @@ function pathToRoom(path: string): string {
 }
 
 // Per-editor compartment so we can swap the collab extension when the open file changes.
+// y-codemirror.next's yCollab() does NOT accept cursorBuilder/selectionBuilder
+// options — only `undoManager`. The default cursor widget renders a <span>
+// containing a hidden `.cm-ySelectionInfo` div with the user's name, which the
+// library's CSS only un-hides on hover. We patch the visibility via our own
+// styles.css so the name is shown all the time.
 const COLLAB_COMPARTMENT_KEY = "__collabCompartment__";
 type CompartmentHolder = { compartment: Compartment; activeRoom: string | null };
-
-function getCompartmentHolder(view: EditorView): CompartmentHolder {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const any = view as any;
-  if (!any[COLLAB_COMPARTMENT_KEY]) {
-    const compartment = new Compartment();
-    any[COLLAB_COMPARTMENT_KEY] = { compartment, activeRoom: null } as CompartmentHolder;
-    // Install the compartment into the running editor with an empty extension —
-    // we'll reconfigure it later when we know which room this view should join.
-    view.dispatch({ effects: StateEffect.appendConfig.of(compartment.of([])) });
-  }
-  return any[COLLAB_COMPARTMENT_KEY];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// custom cursor renderer — always-visible name label above the bar
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface AwarenessUser {
-  name?: string;
-  color?: string;
-}
-
-function buildCursor(user: AwarenessUser | undefined): HTMLElement {
-  const name = user?.name || "anonymous";
-  const color = user?.color || "#888";
-
-  const cursor = document.createElement("span");
-  cursor.classList.add("collab-cursor");
-  cursor.style.setProperty("--collab-color", color);
-
-  const label = document.createElement("span");
-  label.classList.add("collab-cursor-label");
-  label.textContent = name;
-  cursor.appendChild(label);
-
-  return cursor;
-}
-
-function buildSelection(user: AwarenessUser | undefined): { class: string; style: string } {
-  const color = user?.color || "#888";
-  return {
-    class: "collab-selection",
-    style: `background-color: ${hexToRgba(color, 0.25)};`,
-  };
-}
-
-function hexToRgba(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
-  if (!m) return `rgba(136,136,136,${alpha})`;
-  const n = parseInt(m[1], 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // plugin
@@ -246,22 +198,33 @@ export default class CollabPlugin extends Plugin {
     if (!session) session = await this.createSession(file);
 
     const editorView = (view.editor as unknown as { cm: EditorView }).cm;
-    const holder = getCompartmentHolder(editorView);
     const targetRoom = pathToRoom(file.path);
+    const collabExtension = yCollab(session.ytext, session.provider.awareness);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const viewAny = editorView as any;
+    let holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
+
+    if (!holder) {
+      // First-time setup for this editor: install the compartment with the
+      // collab extension already inside, in a single dispatch. Doing init and
+      // reconfigure as two separate transactions left a window where the new
+      // compartment existed but didn't hold yCollab yet, which scrambled the
+      // sync state on plugin reload.
+      const compartment = new Compartment();
+      holder = { compartment, activeRoom: targetRoom };
+      viewAny[COLLAB_COMPARTMENT_KEY] = holder;
+      editorView.dispatch({
+        effects: StateEffect.appendConfig.of(compartment.of(collabExtension)),
+      });
+      return;
+    }
 
     if (holder.activeRoom === targetRoom) return; // already bound to this room
-
-    // y-codemirror.next accepts cursorBuilder/selectionBuilder at runtime but
-    // its TS types don't declare them on the public options interface, so cast.
-    const collabExtension = yCollab(session.ytext, session.provider.awareness, {
-      cursorBuilder: buildCursor,
-      selectionBuilder: buildSelection,
-    } as unknown as Parameters<typeof yCollab>[2]);
-
+    holder.activeRoom = targetRoom;
     editorView.dispatch({
       effects: holder.compartment.reconfigure(collabExtension),
     });
-    holder.activeRoom = targetRoom;
   }
 
   private async createSession(file: TFile): Promise<FileSession> {
@@ -276,6 +239,19 @@ export default class CollabPlugin extends Plugin {
       token: this.settings.authToken || undefined,
     });
 
+    // CRITICAL: when a HocuspocusProvider is constructed with a shared
+    // websocketProvider, it does NOT register itself with that socket
+    // automatically (manageSocket is false). Without calling attach() the
+    // provider gets created but never receives sync or awareness messages —
+    // i.e. no sync, and remote cursors look "Anonymous" because their user
+    // field never reaches us.
+    provider.attach();
+
+    provider.awareness?.setLocalStateField("user", {
+      name: this.settings.userName,
+      color: this.settings.userColor,
+    });
+
     // Local persistence: edits made offline are queued in the browser's
     // IndexedDB and replayed to the server on reconnect. Key includes the
     // server URL so switching servers doesn't muddle different vaults.
@@ -283,11 +259,6 @@ export default class CollabPlugin extends Plugin {
     const persistence = new IndexeddbPersistence(persistenceKey, ydoc);
     persistence.on("synced", () => {
       console.log(`[collab] local cache loaded for ${room}`);
-    });
-
-    provider.awareness?.setLocalStateField("user", {
-      name: this.settings.userName,
-      color: this.settings.userColor,
     });
 
     provider.on("synced", async () => {

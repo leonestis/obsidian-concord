@@ -1,37 +1,53 @@
-/* Remote cursor: a thin vertical bar in the user's color. */
-.collab-cursor {
-  position: relative;
-  display: inline-block;
-  width: 0;
-  height: 1em;
-  margin-left: -1px;
-  margin-right: -1px;
-  border-left: 2px solid var(--collab-color, #888);
-  pointer-events: none;
-  vertical-align: text-bottom;
-}
+/* y-codemirror.next ships its remote cursor + name label with the name hidden
+ * by default (only shown on hover via the lib's base theme). We override that
+ * styling so the name is always visible above the caret — matching the UX of
+ * Figma / Google Docs. The lib's class names are:
+ *
+ *   .cm-ySelectionCaret      → the caret bar element
+ *   .cm-ySelectionCaretDot   → the dot at the top of the caret
+ *   .cm-ySelectionInfo       → the name label
+ *
+ * Color is inlined onto the caret element by the widget, so we use
+ * `background-color: inherit` on the label to match.
+ */
 
-/* Always-visible name tag sitting above the bar. */
-.collab-cursor-label {
+.cm-ySelectionInfo {
   position: absolute;
-  bottom: 100%;
-  left: -2px;
-  margin-bottom: 1px;
+  top: -1.05em;
+  left: -1px;
   padding: 1px 5px;
-  background-color: var(--collab-color, #888);
-  color: #ffffff;
-  font-family: var(--font-interface, sans-serif);
   font-size: 11px;
   line-height: 1.2;
-  border-radius: 3px;
+  font-family: var(--font-interface, sans-serif);
+  font-weight: 500;
+  color: #ffffff;
+  background-color: inherit; /* inherits the caret's bg, which is the user's color */
+  border-radius: 3px 3px 3px 0;
   white-space: nowrap;
   user-select: none;
   pointer-events: none;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-  z-index: 20;
+  /* Override the library's hover-only opacity behaviour. */
+  opacity: 1 !important;
+  transition: none !important;
+  z-index: 50;
 }
 
-/* Remote selection highlight (translucent fill in the user's color). */
-.collab-selection {
-  /* color is set inline by selectionBuilder */
+/* The caret bar itself: a thin 2px vertical line in the user's color.
+ * The lib gives it a background-color on inline style; we shape it. */
+.cm-ySelectionCaret {
+  position: relative;
+  display: inline-block;
+  border-left: 2px solid;
+  border-color: inherit;
+  width: 0 !important;
+  height: 1em;
+  margin-right: -1px;
+  margin-left: -1px;
+  pointer-events: none;
+  /* Force the inlined background-color into the border via inherit hack. */
+}
+
+/* Small dot at the top of the caret — keep but make subtle. */
+.cm-ySelectionCaretDot {
+  display: none; /* the always-visible label is enough of a marker */
 }
