@@ -2,6 +2,13 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.1 — 2026-05-24
+
+### Fixed
+- **Opening a populated file no longer empties it.** `attachFile` used to bind `yCollab` to the editor immediately after creating a fresh session — when the Y.Text was still empty, yCollab cleared the editor with that empty state, Obsidian auto-saved the cleared buffer, and the file's content was destroyed on disk. The fix waits for either the IndexedDB local cache or the first server sync (with a 4-second safety timeout) before binding; if Y.Text is still empty after that, seed it from disk in a single insert, *then* attach yCollab.
+- Removed the redundant `provider.on("synced", ...)` disk-seed inside `createSession` so we don't risk double-seeding (which would have concatenated two copies of the file).
+- `reconcileManifest` now logs the final manifest and trash counts after it finishes, so `[collab] manifest synced (N entries)` no longer looks misleading when reconcile adds more.
+
 ## 0.5.0 — 2026-05-24
 
 ### Changed

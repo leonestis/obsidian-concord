@@ -168,6 +168,33 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return ab;
 }
 
+// Wait until a HocuspocusProvider has completed its first sync with the
+// server (or until `timeoutMs` elapses). Resolves immediately if the
+// provider already reports synced. Used so we never bind yCollab to an
+// editor while the Y.Text is still empty pending its first server reply —
+// that would clear the editor and Obsidian would auto-save the empty
+// buffer, wiping the file on disk.
+function waitForProviderSync(provider: HocuspocusProvider, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ((provider as any).synced === true) {
+      resolve();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (provider as any).off?.("synced", finish);
+      resolve();
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (provider as any).on("synced", finish);
+    setTimeout(finish, timeoutMs);
+  });
+}
+
 // Convert a vault-relative file path into a stable, safe Hocuspocus room name.
 // We avoid raw slashes because some routing layers treat them specially.
 function pathToRoom(path: string): string {
@@ -378,7 +405,43 @@ export default class CollabPlugin extends Plugin {
     if (!view || view.file?.path !== file.path) return;
 
     let session = this.sessions.get(file.path);
+    const isNewSession = !session;
     if (!session) session = await this.createSession(file);
+
+    // CRITICAL: do NOT bind yCollab to the editor while Y.Text is still
+    // empty — yCollab would replace the editor's content with the empty
+    // Y.Text and Obsidian would auto-save the cleared buffer to disk,
+    // wiping the file. So for a fresh session: first await the local
+    // IndexedDB cache OR the first server sync, then seed Y.Text from
+    // disk if neither produced any content. Only after that bind yCollab.
+    if (isNewSession) {
+      try {
+        await Promise.race([
+          Promise.all([
+            session.persistence.whenSynced,
+            waitForProviderSync(session.provider, 4000),
+          ]),
+          new Promise<void>((resolve) => setTimeout(resolve, 4000)),
+        ]);
+      } catch (err) {
+        console.warn("[collab] sync-before-bind raced an error", file.path, err);
+      }
+      if (session.ytext.length === 0) {
+        try {
+          const diskContent = await this.app.vault.read(file);
+          if (diskContent.length > 0) {
+            session.ytext.insert(0, diskContent);
+            console.log(`[collab] seeded "${file.path}" from disk (${diskContent.length} chars)`);
+          }
+        } catch (err) {
+          console.warn("[collab] disk-seed failed", file.path, err);
+        }
+      }
+      // The active view may have moved on while we were awaiting — re-check
+      // and bail rather than yank the user's editor.
+      const stillActive = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (!stillActive || stillActive.file?.path !== file.path) return;
+    }
 
     const editorView = (view.editor as unknown as { cm: EditorView }).cm;
     const targetRoom = pathToRoom(file.path);
@@ -455,17 +518,9 @@ export default class CollabPlugin extends Plugin {
       console.log(`[collab] local cache loaded for ${room}`);
     });
 
-    provider.on("synced", async () => {
-      // First client into the room seeds the document with disk content.
-      if (ytext.length === 0) {
-        try {
-          const content = await this.app.vault.read(file);
-          if (content.length > 0) ytext.insert(0, content);
-        } catch (err) {
-          console.warn("[collab] seed read failed for", file.path, err);
-        }
-      }
-    });
+    // (Seeding from disk now lives in attachFile, which awaits cache + server
+    // sync before deciding whether the Y.Text is genuinely empty — so we
+    // don't accidentally double-seed and concatenate two copies of the file.)
 
     const session: FileSession = { filePath: file.path, ydoc, provider, ytext, persistence };
     this.sessions.set(file.path, session);
@@ -595,6 +650,10 @@ export default class CollabPlugin extends Plugin {
 
     // Purge trash entries older than the retention window.
     this.purgeOldTrash();
+
+    console.log(
+      `[collab] reconcile complete: manifest has ${this.manifestMap.size} entries, trash ${this.manifestTrash?.size ?? 0}`,
+    );
   }
 
   private purgeOldTrash() {
