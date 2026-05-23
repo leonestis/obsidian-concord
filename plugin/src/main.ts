@@ -13,6 +13,7 @@ import { EditorView } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { removeAwarenessStates } from "y-protocols/awareness";
+import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -21,6 +22,7 @@ import * as Y from "yjs";
 
 interface CollabSettings {
   serverUrl: string;
+  authToken: string;
   userName: string;
   userColor: string;
   autoConnect: boolean;
@@ -28,6 +30,7 @@ interface CollabSettings {
 
 const DEFAULT_SETTINGS: CollabSettings = {
   serverUrl: "ws://158.255.5.243:1234",
+  authToken: "",
   userName: "",
   userColor: "",
   autoConnect: true,
@@ -58,6 +61,7 @@ interface FileSession {
   ydoc: Y.Doc;
   provider: HocuspocusProvider;
   ytext: Y.Text;
+  persistence: IndexeddbPersistence;
 }
 
 // Convert a vault-relative file path into a stable, safe Hocuspocus room name.
@@ -193,7 +197,11 @@ export default class CollabPlugin extends Plugin {
   private connect() {
     if (this.socket) return;
     try {
-      this.socket = new HocuspocusProviderWebsocket({ url: this.settings.serverUrl });
+      this.socket = new HocuspocusProviderWebsocket({
+        url: this.settings.serverUrl,
+        // y-websocket-style auto-reconnect with exponential backoff is on by default;
+        // we just don't have to disable it.
+      });
       this.socket.on("connect", () => {
         this.connected = true;
         this.renderStatus();
@@ -264,6 +272,16 @@ export default class CollabPlugin extends Plugin {
       websocketProvider: this.socket!,
       name: room,
       document: ydoc,
+      token: this.settings.authToken || undefined,
+    });
+
+    // Local persistence: edits made offline are queued in the browser's
+    // IndexedDB and replayed to the server on reconnect. Key includes the
+    // server URL so switching servers doesn't muddle different vaults.
+    const persistenceKey = `obsidian-collab::${this.settings.serverUrl}::${room}`;
+    const persistence = new IndexeddbPersistence(persistenceKey, ydoc);
+    persistence.on("synced", () => {
+      console.log(`[collab] local cache loaded for ${room}`);
     });
 
     provider.awareness?.setLocalStateField("user", {
@@ -283,12 +301,13 @@ export default class CollabPlugin extends Plugin {
       }
     });
 
-    const session: FileSession = { filePath: file.path, ydoc, provider, ytext };
+    const session: FileSession = { filePath: file.path, ydoc, provider, ytext, persistence };
     this.sessions.set(file.path, session);
     return session;
   }
 
   private destroySession(session: FileSession) {
+    void session.persistence.destroy();
     try {
       // Tell peers we're gone — prevents lingering ghost cursors.
       if (session.provider.awareness) {
@@ -355,6 +374,19 @@ class CollabSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Auth token")
+      .setDesc("JWT token issued by the server admin. Leave empty if the server does not require auth.")
+      .addText((text) =>
+        text
+          .setPlaceholder("eyJhbGciOi...")
+          .setValue(this.plugin.settings.authToken)
+          .onChange(async (value) => {
+            this.plugin.settings.authToken = value.trim();
             await this.plugin.saveSettings();
           }),
       );
