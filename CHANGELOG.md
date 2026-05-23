@@ -2,6 +2,18 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.3.0 — 2026-05-24
+
+### Added
+- **Empty folders sync.** Creating a folder with no files inside now propagates to every connected vault. Manifest entries carry a `kind` of `"file" | "folder" | "binary"`.
+- **Binary attachments sync (images, PDFs, etc.).** Non-markdown files are tracked in the manifest with their bytes stored in a parallel `binaryData` Y.Map (`path → Uint8Array`). On local create the bytes are uploaded; on remote create or modify, peers write the bytes to their local vault via `vault.createBinary` / `modifyBinary`. Rename moves both the manifest entry and the bytes in a single transaction so embeds keep resolving.
+- Files larger than 25 MB are skipped with a notice — Yjs is a poor transport for huge blobs and we don't want a runaway PDF to choke the manifest.
+- `.obsidian/` configuration directory and the vault root are explicitly excluded from the manifest.
+
+### Changed
+- Reconcile now walks the full vault tree (files + folders), not just markdown files, and registers every entry it finds.
+- Delete also removes any associated binary data from the manifest.
+
 ## 0.2.0 — 2026-05-24
 
 ### Added

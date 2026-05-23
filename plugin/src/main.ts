@@ -7,6 +7,7 @@ import {
   Setting,
   TAbstractFile,
   TFile,
+  TFolder,
 } from "obsidian";
 import { Compartment, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -74,8 +75,30 @@ interface FileSession {
 
 const MANIFEST_ROOM = "vault:manifest";
 
+// Binary attachments above this size are skipped — Yjs is a poor transport
+// for huge blobs, and a runaway 500 MB PDF would brick the manifest sync.
+const MAX_BINARY_BYTES = 25 * 1024 * 1024; // 25 MB
+
+type EntryKind = "file" | "folder" | "binary";
+
 interface ManifestEntry {
+  kind: EntryKind;
   createdAt: number;
+}
+
+// Obsidian's vault.create / createBinary / createFolder return a TFile|TFolder
+// the moment the file appears. The accompanying 'create' event fires
+// asynchronously — we use a Set of in-flight remote paths to suppress those
+// echo events, then drop entries from the Set after a short delay.
+const SUPPRESS_HOLD_MS = 1000;
+
+// Yjs's Uint8Array values are sometimes backed by SharedArrayBuffer (depending
+// on the runtime). Obsidian's binary file APIs need a plain ArrayBuffer, so we
+// copy the bytes into a fresh buffer when crossing that boundary.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const ab = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(ab).set(bytes);
+  return ab;
 }
 
 // Convert a vault-relative file path into a stable, safe Hocuspocus room name.
@@ -104,9 +127,12 @@ export default class CollabPlugin extends Plugin {
   private statusEl: HTMLElement | null = null;
   private connected = false;
 
-  // Vault manifest — single shared Y.Doc tracking which files exist in the vault.
+  // Vault manifest — single shared Y.Doc tracking which paths exist in the vault.
+  // Holds two maps: `files` (path → {kind, createdAt}) for every file/folder,
+  // and `binaryData` (path → Uint8Array) for the bytes of non-markdown files.
   private manifestYDoc: Y.Doc | null = null;
   private manifestMap: Y.Map<ManifestEntry> | null = null;
+  private manifestBinaries: Y.Map<Uint8Array> | null = null;
   private manifestProvider: HocuspocusProvider | null = null;
   private manifestPersistence: IndexeddbPersistence | null = null;
   // Paths currently being applied from a remote manifest change. The local
@@ -156,6 +182,10 @@ export default class CollabPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => this.onLocalVaultCreate(file)),
+    );
+    // Binary modify: re-upload bytes so peers get the new version.
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => this.onLocalVaultModify(file)),
     );
 
     this.app.workspace.onLayoutReady(() => {
@@ -395,6 +425,7 @@ export default class CollabPlugin extends Plugin {
 
     this.manifestYDoc = new Y.Doc();
     this.manifestMap = this.manifestYDoc.getMap<ManifestEntry>("files");
+    this.manifestBinaries = this.manifestYDoc.getMap<Uint8Array>("binaryData");
 
     this.manifestProvider = new HocuspocusProvider({
       websocketProvider: this.socket,
@@ -415,6 +446,8 @@ export default class CollabPlugin extends Plugin {
     });
 
     this.manifestMap.observe((event) => this.onManifestChange(event));
+    // When the bytes of an existing binary are updated, write to local disk.
+    this.manifestBinaries.observe((event) => this.onBinaryDataChange(event));
   }
 
   private stopVaultSync() {
@@ -425,42 +458,113 @@ export default class CollabPlugin extends Plugin {
     this.manifestYDoc?.destroy();
     this.manifestYDoc = null;
     this.manifestMap = null;
+    this.manifestBinaries = null;
     this.remoteApplyPaths.clear();
   }
 
   // First sync after connect: union the manifest with the local vault.
-  // - Files in manifest but missing locally → create empty (content arrives
-  //   via the per-file Y.Doc once anyone opens the file).
-  // - Files locally but missing from manifest → register them.
+  // - Entries in manifest but missing locally → create them (markdown empty
+  //   so per-file Y.Doc fills it; folders made on the spot; binaries written
+  //   from the bytes stored in the manifest).
+  // - Local files/folders missing from manifest → register them.
   private async reconcileManifest() {
-    if (!this.manifestMap || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
 
-    const localFiles = this.app.vault.getMarkdownFiles().map((f) => f.path);
-    const manifestPaths = Array.from(this.manifestMap.keys());
+    const localPaths = new Set<string>();
+    const allLocal: TAbstractFile[] = [];
+    this.walkVault(this.app.vault.getRoot(), allLocal);
+    for (const f of allLocal) localPaths.add(f.path);
 
-    for (const path of manifestPaths) {
-      if (this.app.vault.getAbstractFileByPath(path)) continue;
-      try {
-        this.remoteApplyPaths.add(path);
-        await this.ensureFolderExists(path);
-        await this.app.vault.create(path, "");
-        console.log(`[collab] reconcile: created missing local file ${path}`);
-      } catch (err) {
-        console.warn("[collab] reconcile create failed", path, err);
-      } finally {
-        // Hold the suppression a beat so the create event we just provoked
-        // doesn't race back into the manifest.
-        setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
-      }
+    // Manifest → local
+    for (const [path, entry] of this.manifestMap.entries()) {
+      if (localPaths.has(path)) continue;
+      await this.materialise(path, entry);
     }
 
+    // Local → manifest (for anything not yet registered)
     this.manifestYDoc.transact(() => {
-      for (const path of localFiles) {
-        if (!this.manifestMap!.has(path)) {
-          this.manifestMap!.set(path, { createdAt: Date.now() });
+      for (const file of allLocal) {
+        if (this.manifestMap!.has(file.path)) continue;
+        const kind = this.classify(file);
+        if (!kind) continue;
+        this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
+        if (kind === "binary" && file instanceof TFile) {
+          // Schedule binary upload outside the transact (async read).
+          void this.uploadBinary(file);
         }
       }
     });
+  }
+
+  // Recursively collect every file and folder in the vault.
+  private walkVault(folder: TFolder, out: TAbstractFile[]) {
+    for (const child of folder.children) {
+      out.push(child);
+      if (child instanceof TFolder) this.walkVault(child, out);
+    }
+  }
+
+  // Decide which manifest kind a vault entry maps to. Root folder is skipped
+  // (no path), and we ignore Obsidian's `.obsidian/` config directory.
+  private classify(file: TAbstractFile): EntryKind | null {
+    if (!file.path || file.path.startsWith(".obsidian/") || file.path === ".obsidian") return null;
+    if (file instanceof TFolder) return "folder";
+    if (file instanceof TFile) return file.extension === "md" ? "file" : "binary";
+    return null;
+  }
+
+  // Create a local entry from a manifest record.
+  private async materialise(path: string, entry: ManifestEntry) {
+    this.remoteApplyPaths.add(path);
+    try {
+      if (entry.kind === "folder") {
+        if (!this.app.vault.getAbstractFileByPath(path)) {
+          await this.app.vault.createFolder(path);
+          console.log(`[collab] reconcile: created folder ${path}`);
+        }
+        return;
+      }
+      await this.ensureFolderExists(path);
+      if (entry.kind === "file") {
+        if (!this.app.vault.getAbstractFileByPath(path)) {
+          await this.app.vault.create(path, "");
+          console.log(`[collab] reconcile: created file ${path}`);
+        }
+        return;
+      }
+      // binary
+      const bytes = this.manifestBinaries?.get(path);
+      if (!bytes) {
+        // Either not uploaded yet or peer is offline. Skip — we'll catch the
+        // bytes via the binaryData observer once they arrive.
+        console.log(`[collab] reconcile: binary ${path} has no data yet — waiting`);
+        return;
+      }
+      if (!this.app.vault.getAbstractFileByPath(path)) {
+        await this.app.vault.createBinary(path, toArrayBuffer(bytes));
+        console.log(`[collab] reconcile: created binary ${path} (${bytes.byteLength} bytes)`);
+      }
+    } catch (err) {
+      console.warn("[collab] materialise failed", path, err);
+    } finally {
+      setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+    }
+  }
+
+  private async uploadBinary(file: TFile) {
+    if (!this.manifestBinaries) return;
+    try {
+      const buf = await this.app.vault.readBinary(file);
+      if (buf.byteLength > MAX_BINARY_BYTES) {
+        console.warn(`[collab] skipping ${file.path}: ${buf.byteLength} bytes exceeds ${MAX_BINARY_BYTES}`);
+        new Notice(`Collab: ${file.path} is too large to sync (>${Math.floor(MAX_BINARY_BYTES / 1024 / 1024)} MB)`);
+        return;
+      }
+      this.manifestBinaries.set(file.path, new Uint8Array(buf));
+      console.log(`[collab] uploaded binary ${file.path} (${buf.byteLength} bytes)`);
+    } catch (err) {
+      console.warn("[collab] uploadBinary failed", file.path, err);
+    }
   }
 
   private async ensureFolderExists(filePath: string) {
@@ -481,56 +585,109 @@ export default class CollabPlugin extends Plugin {
   private onLocalVaultCreate(file: TAbstractFile) {
     if (!this.manifestMap) return;
     if (this.remoteApplyPaths.has(file.path)) return;
-    if (!(file instanceof TFile) || file.extension !== "md") return;
+    const kind = this.classify(file);
+    if (!kind) return;
     if (this.manifestMap.has(file.path)) return;
-    this.manifestMap.set(file.path, { createdAt: Date.now() });
+    this.manifestMap.set(file.path, { kind, createdAt: Date.now() });
+    if (kind === "binary" && file instanceof TFile) void this.uploadBinary(file);
   }
 
   private onLocalVaultDelete(file: TAbstractFile) {
-    if (!this.manifestMap) return;
+    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
     if (this.remoteApplyPaths.has(file.path)) return;
     if (!this.manifestMap.has(file.path)) return;
-    this.manifestMap.delete(file.path);
+    this.manifestYDoc.transact(() => {
+      this.manifestMap!.delete(file.path);
+      if (this.manifestBinaries!.has(file.path)) this.manifestBinaries!.delete(file.path);
+    });
   }
 
   private onLocalVaultRename(file: TAbstractFile, oldPath: string) {
-    if (!this.manifestMap || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
     if (this.remoteApplyPaths.has(file.path) || this.remoteApplyPaths.has(oldPath)) return;
-    if (!(file instanceof TFile) || file.extension !== "md") return;
+    const kind = this.classify(file);
+    if (!kind) return;
     // Group delete + set in one transaction so peers can recognise this as
     // a rename (1 delete + 1 add in the same change event) instead of a
     // delete-then-create, which would lose content.
     this.manifestYDoc.transact(() => {
       this.manifestMap!.delete(oldPath);
-      this.manifestMap!.set(file.path, { createdAt: Date.now() });
+      this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
+      const data = this.manifestBinaries!.get(oldPath);
+      if (data) {
+        this.manifestBinaries!.delete(oldPath);
+        this.manifestBinaries!.set(file.path, data);
+      }
     });
+  }
+
+  private onLocalVaultModify(file: TAbstractFile) {
+    if (!(file instanceof TFile)) return;
+    if (file.extension === "md") return; // markdown content syncs via per-file Y.Doc
+    if (!this.manifestMap || !this.manifestBinaries) return;
+    if (this.remoteApplyPaths.has(file.path)) return;
+    if (!this.manifestMap.has(file.path)) {
+      // First time we see it. Register and upload.
+      this.manifestMap.set(file.path, { kind: "binary", createdAt: Date.now() });
+    }
+    void this.uploadBinary(file);
   }
 
   // ── manifest → local ───────────────────────────────────────────────────────
 
   private async onManifestChange(event: Y.YMapEvent<ManifestEntry>) {
     const deletes: string[] = [];
-    const adds: string[] = [];
+    const adds: Array<{ path: string; entry: ManifestEntry }> = [];
     event.changes.keys.forEach((change, key) => {
       if (change.action === "delete") deletes.push(key);
-      else if (change.action === "add") adds.push(key);
+      else if (change.action === "add") {
+        const entry = this.manifestMap?.get(key);
+        if (entry) adds.push({ path: key, entry });
+      }
     });
 
     // Single delete + single add in one transaction is treated as a rename:
     // we move the local file, preserving its contents.
     if (deletes.length === 1 && adds.length === 1) {
-      await this.applyRemoteRename(deletes[0], adds[0]);
+      await this.applyRemoteRename(deletes[0], adds[0].path, adds[0].entry);
       return;
     }
 
     for (const path of deletes) await this.applyRemoteDelete(path);
-    for (const path of adds) await this.applyRemoteCreate(path);
+    for (const a of adds) await this.materialise(a.path, a.entry);
   }
 
-  private async applyRemoteRename(oldPath: string, newPath: string) {
+  // When the manifestBinaries map changes — typically because a peer
+  // re-uploaded an existing image — write the new bytes to local disk.
+  private async onBinaryDataChange(event: Y.YMapEvent<Uint8Array>) {
+    if (!this.manifestBinaries) return;
+    for (const [path, change] of event.changes.keys.entries()) {
+      if (change.action === "delete") continue; // delete is handled via manifestMap
+      const bytes = this.manifestBinaries.get(path);
+      if (!bytes) continue;
+      const local = this.app.vault.getAbstractFileByPath(path);
+      this.remoteApplyPaths.add(path);
+      try {
+        if (local instanceof TFile) {
+          await this.app.vault.modifyBinary(local, toArrayBuffer(bytes));
+          console.log(`[collab] remote binary update: ${path} (${bytes.byteLength} bytes)`);
+        } else if (!local) {
+          await this.ensureFolderExists(path);
+          await this.app.vault.createBinary(path, toArrayBuffer(bytes));
+          console.log(`[collab] remote binary create: ${path} (${bytes.byteLength} bytes)`);
+        }
+      } catch (err) {
+        console.warn("[collab] remote binary write failed", path, err);
+      } finally {
+        setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
+      }
+    }
+  }
+
+  private async applyRemoteRename(oldPath: string, newPath: string, entry: ManifestEntry) {
     const localFile = this.app.vault.getAbstractFileByPath(oldPath);
     if (!localFile) {
-      await this.applyRemoteCreate(newPath);
+      await this.materialise(newPath, entry);
       return;
     }
     this.remoteApplyPaths.add(oldPath);
@@ -545,21 +702,7 @@ export default class CollabPlugin extends Plugin {
       setTimeout(() => {
         this.remoteApplyPaths.delete(oldPath);
         this.remoteApplyPaths.delete(newPath);
-      }, 1000);
-    }
-  }
-
-  private async applyRemoteCreate(path: string) {
-    if (this.app.vault.getAbstractFileByPath(path)) return;
-    this.remoteApplyPaths.add(path);
-    try {
-      await this.ensureFolderExists(path);
-      await this.app.vault.create(path, "");
-      console.log(`[collab] remote create: ${path}`);
-    } catch (err) {
-      console.warn("[collab] remote create failed", path, err);
-    } finally {
-      setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
+      }, SUPPRESS_HOLD_MS);
     }
   }
 
@@ -568,12 +711,12 @@ export default class CollabPlugin extends Plugin {
     if (!localFile) return;
     this.remoteApplyPaths.add(path);
     try {
-      await this.app.vault.delete(localFile);
+      await this.app.vault.delete(localFile, true);
       console.log(`[collab] remote delete: ${path}`);
     } catch (err) {
       console.warn("[collab] remote delete failed", path, err);
     } finally {
-      setTimeout(() => this.remoteApplyPaths.delete(path), 1000);
+      setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
     }
   }
 
