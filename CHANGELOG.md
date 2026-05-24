@@ -2,6 +2,25 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.3 — 2026-05-24
+
+A hardening pass driven by a code review of the whole client + server. The plugin acquired a lot of guard-on-top-of-guard layers across 0.5.x; this release strips out the genuinely faulty patterns and replaces them with proper machinery.
+
+### Fixed
+- **`attachFile` race on rapid file switches.** `attachFile` is async and can wait up to 4 seconds for initial sync. When the user switched files quickly, the older call would resume from `await`, see its file still active locally, and clobber the binding the newer call had set up. Each invocation now mints a monotonic `attachToken`, stores it in `latestAttachToken[path]`, and bails before any `editor.dispatch` if a newer attach for the same path has bumped the value.
+- **Duplicate `createSession` for the same path.** Obsidian re-fires `file-open` for the same path under several conditions (workspace activation, focus shifts). Two `attachFile` calls would both see `sessions.get(path) === undefined` and race past `createSession`, leaving an orphan `HocuspocusProvider` permanently hooked into the shared socket. Concurrent calls now coalesce through an `attachInFlight: Map<string, Promise<FileSession>>`.
+- **Multi-pane binding.** When the user opened the same file in two panes, only the *active* pane's editor got yCollab attached. Typing in the inactive pane went through Obsidian's normal save path, bypassed the CRDT, and got silently overwritten the moment our disk-sync wrote Y.Text back. `attachFile` now walks every leaf with `iterateAllLeaves`, picks out every MarkdownView pointing at this file, and reconfigures the compartment on each editor view.
+- **Offline disk-seed loop.** The disk-seed branch (Y.Text empty → fill with disk content) used to run whether or not the provider had successfully synced with the server. If the server was slow to respond (>4s timeout), we'd seed from disk; the server's actual content would arrive afterwards and merge with ours, doubling the document. Now we only seed when `provider.synced === true`. If the server is unreachable after the wait, we leave Y.Text empty and log a clear notice — the editor stays blank until the real content arrives.
+- **`ytext.observe` leaks in per-file sessions.** The diagnostic logger and disk-sync observers were anonymous closures with no unobserve on destroy — they stayed in Y.Text's listener arrays forever and held the plugin instance alive through their closures. `FileSession` now carries an `observers` array that `destroySession` walks to call `ytext.unobserve(fn)` for each.
+- **Disk-sync timer leak.** The 300 ms `setTimeout` for disk-sync was held in a closure-local variable that nothing cleared on session destroy. A stale write could land after the session was torn down, after the file was deleted, or after the plugin was unloaded. `FileSession` now carries `diskWriteTimer`; `destroySession` flips a `destroyed` flag, clears the timer, and the disk-sync callback rechecks `destroyed` at each await point.
+- **Manifest map observers leak.** `manifestMap.observe(...)` and `manifestBinaries.observe(...)` were registered anonymously, with no `unobserve` in `stopVaultSync`. The observers could briefly fire on a torn-down Y.Doc during plugin reload. We now hold typed references to both observer functions and call `unobserve` explicitly before destroying the manifest Y.Doc.
+
+### Notes / known follow-ups (not in this release)
+- `remoteApplyPaths` is still a plain `Set<string>` rather than a refcount `Map`. Two concurrent flows suppressing the same path can race — one finishing decrements the flag the other still wants set. In practice this hasn't produced an observed bug, but it's the next thing on the cleanup list.
+- `purgeOldTrash` doesn't also remove the corresponding `binaryData["trash:UUID"]` entries explicitly; they're transitively kept around by the (also still-present) trash record, but if the trash map is mutated by a peer without the bytes being mirrored we could leak bytes. Worth tightening.
+- The diagnostic `[collab] ytext ROOM …` line dumps every keystroke (including potentially private content) to the dev console. Should sit behind a `debugLogging` setting, off by default.
+- The disk-sync write uses a non-refcounted single-element `remoteApplyPaths` suppression; same caveat as item one.
+
 ## 0.6.2 — 2026-05-24
 
 ### Added

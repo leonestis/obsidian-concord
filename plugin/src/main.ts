@@ -23,7 +23,7 @@ import { createCollabBinding } from "./collab-binding";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.6.2";
+const PLUGIN_VERSION = "0.6.3";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -71,6 +71,18 @@ interface FileSession {
   provider: HocuspocusProvider;
   ytext: Y.Text;
   persistence: IndexeddbPersistence;
+  // Set to true once destroySession has been called. Any pending timers
+  // (disk-sync debounce) bail out instead of writing to a now-dead Y.Doc
+  // or to a file the user has since closed.
+  destroyed: boolean;
+  // The ytext observers we install — saved so destroySession can
+  // unobserve them. Without this they linger in Y.Text's listener
+  // arrays and hold the closure (and its references to plugin / file)
+  // alive forever.
+  observers: Array<(event: Y.YTextEvent, tr: Y.Transaction) => void>;
+  // Pending disk-sync setTimeout id, cleared on destroy so a stale
+  // write doesn't land after the session is gone.
+  diskWriteTimer: ReturnType<typeof setTimeout> | null;
 }
 
 // Sessions for non-markdown files that we want fully collaborative. Two
@@ -250,14 +262,40 @@ export default class CollabPlugin extends Plugin {
   private manifestTrash: Y.Map<TrashEntry> | null = null;
   private manifestProvider: HocuspocusProvider | null = null;
   private manifestPersistence: IndexeddbPersistence | null = null;
+  // Saved observers on the manifest's Y.Maps so stopVaultSync can
+  // unobserve them explicitly before the Y.Doc is destroyed (otherwise
+  // they'd briefly fire on a torn-down doc).
+  private manifestMapObserver:
+    | ((event: Y.YMapEvent<ManifestEntry>) => void)
+    | null = null;
+  private manifestBinariesObserver:
+    | ((event: Y.YMapEvent<Uint8Array>) => void)
+    | null = null;
+
   // Per-file structural sessions for non-markdown content we want fully
   // synced. Canvas uses the structural variant; .base uses the atomic
   // whole-file variant. Both keyed by vault-relative file path.
   private structuralSessions = new Map<string, StructuralSession>();
+
   // Paths currently being applied from a remote manifest change. The local
   // vault event handlers skip these so we don't echo the change back into the
   // manifest (which would loop forever).
   private remoteApplyPaths = new Set<string>();
+
+  // In-flight createSession promises keyed by file path. Coalesces
+  // concurrent attachFile calls for the same file — without this,
+  // Obsidian re-firing `file-open` for one path quickly enough kicks
+  // off two parallel createSession runs, leaves orphan providers on
+  // the shared socket, and double-binds the editor.
+  private attachInFlight = new Map<string, Promise<FileSession>>();
+
+  // Monotonic per-path attach token. Each attachFile call mints the
+  // next number, writes it to latestAttachToken[path], and re-checks
+  // before each editor dispatch. If a newer attachFile for the same
+  // path has bumped the value while we were awaiting sync, we bail
+  // — the newer call will own the binding.
+  private nextAttachToken = 1;
+  private latestAttachToken = new Map<string, number>();
 
   async onload() {
     await this.loadSettings();
@@ -446,75 +484,36 @@ export default class CollabPlugin extends Plugin {
     this.attachFile(file);
   }
 
-  private async attachFile(file: TFile) {
+  // Collect every MarkdownView currently displaying `path`. Obsidian
+  // can show the same file in multiple panes simultaneously; we need
+  // to bind yCollab to each of them, otherwise typing into the
+  // un-bound pane goes through Obsidian's normal save path, bypasses
+  // the CRDT, and silently desynchronises with peers.
+  private editorsForPath(path: string): EditorView[] {
+    const out: EditorView[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) return;
+      if (view.file?.path !== path) return;
+      const editor = view.editor as unknown as { cm?: EditorView } | undefined;
+      if (editor?.cm) out.push(editor.cm);
+    });
+    return out;
+  }
+
+  // Bind yCollab to one editor view. Returns true on success. Pulled
+  // out of the main flow so attachFile can fan out to every pane
+  // showing the same file in one place. Caller is responsible for
+  // ordering relative to the pre-sync editor rewrite.
+  private bindCollabTo(
+    editorView: EditorView,
+    session: FileSession,
+    awareness: ReturnType<typeof Object>,
+    file: TFile,
+    targetRoom: string,
+  ): boolean {
     const tag = `[collab] attachFile(${file.path})`;
-    if (!this.socket) {
-      console.log(`${tag}: no socket, skipping`);
-      return;
-    }
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) {
-      console.log(`${tag}: no active MarkdownView`);
-      return;
-    }
-    if (view.file?.path !== file.path) {
-      console.log(`${tag}: active view is ${view.file?.path ?? "(none)"}, skipping`);
-      return;
-    }
 
-    let session = this.sessions.get(file.path);
-    const isNewSession = !session;
-    if (!session) {
-      console.log(`${tag}: creating new session`);
-      session = await this.createSession(file);
-    }
-
-    if (isNewSession) {
-      try {
-        await Promise.race([
-          Promise.all([
-            session.persistence.whenSynced,
-            waitForProviderSync(session.provider, 4000),
-          ]),
-          new Promise<void>((resolve) => setTimeout(resolve, 4000)),
-        ]);
-      } catch (err) {
-        console.warn(`${tag}: sync-before-bind raced an error`, err);
-      }
-      console.log(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
-      if (session.ytext.length === 0) {
-        try {
-          const diskContent = await this.app.vault.read(file);
-          if (diskContent.length > 0) {
-            session.ytext.insert(0, diskContent);
-            console.log(`${tag}: seeded ${diskContent.length} chars from disk`);
-          }
-        } catch (err) {
-          console.warn(`${tag}: disk-seed failed`, err);
-        }
-      }
-      const stillActive = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (!stillActive || stillActive.file?.path !== file.path) {
-        console.log(`${tag}: active view changed during await (now ${stillActive?.file?.path ?? "(none)"}), bailing — will re-attach on next file-open`);
-        return;
-      }
-    }
-
-    // Pull the underlying CodeMirror 6 EditorView. Obsidian exposes it as
-    // view.editor.cm — but if the view is in Reading mode there's no
-    // CodeMirror to bind to and `.cm` is absent.
-    const editor = view.editor as unknown as { cm?: EditorView } | undefined;
-    const editorView = editor?.cm;
-    if (!editorView) {
-      console.warn(`${tag}: view.editor.cm is missing — this view is probably in Reading mode. Switch to Edit / Source / Live Preview and reopen the file.`);
-      return;
-    }
-
-    const targetRoom = pathToRoom(file.path);
-
-    // Diagnostic listener — fires on every editor transaction so we
-    // can see in the console whether the editor is even emitting
-    // docChanged events.
     const debugListener = EditorView.updateListener.of((update) => {
       if (!update.docChanged) return;
       console.log(
@@ -522,36 +521,19 @@ export default class CollabPlugin extends Plugin {
       );
     });
 
-    const awareness = session.provider.awareness;
-    if (!awareness) {
-      console.warn(`${tag}: provider awareness is missing, cannot bind`);
-      return;
-    }
-    // Build a FRESH binding extension. createCollabBinding wraps each
-    // ViewPlugin definition in a brand-new spec on every call, so when
-    // we reconfigure the compartment below CodeMirror genuinely
-    // destroys the previous binding's plugins (its ytext/awareness
-    // observers come off cleanly) and instantiates new ones against
-    // this file's Y.Text + Awareness. That side-steps the y-codemirror
-    // .next plugin-reuse trap that broke file switching in 0.5.x.
     const collabExtension = [
       debugListener,
-      createCollabBinding(session.ytext, awareness),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createCollabBinding(session.ytext, awareness as any),
     ];
 
-    // Step 1: detach the previous binding (so its observers unhook)
-    // and so the editor rewrite in Step 2 isn't intercepted by any
-    // sync plugin that would forward our manual reset into Y.Text.
-    editorView.dispatch({
-      effects: this.editorCompartment.reconfigure([]),
-    });
+    // Detach the previous binding (so the rewrite isn't forwarded
+    // into Y.Text by a leftover ySync), align the editor doc with
+    // Y.Text, then install the fresh binding. Three dispatches —
+    // CodeMirror processes each synchronously, so the visible state
+    // jumps straight to the final.
+    editorView.dispatch({ effects: this.editorCompartment.reconfigure([]) });
 
-    // Step 2: with no binding attached, if the editor and Y.Text are
-    // out of sync, rewrite the editor to match Y.Text. Y.Text is the
-    // authoritative shared state — disk content (from Obsidian's
-    // initial read or a stale local copy) loses to whatever peers have
-    // agreed on. We don't need our COLLAB_SYNC annotation here because
-    // there's no binding to intercept.
     const ytextContent = session.ytext.toString();
     const editorContent = editorView.state.doc.toString();
     if (ytextContent !== editorContent) {
@@ -567,16 +549,130 @@ export default class CollabPlugin extends Plugin {
       );
     }
 
-    // Step 3: install the fresh binding.
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure(collabExtension),
     });
 
-    // Awareness handoff: clear local state on every other open session
-    // so peers stop seeing this user frozen inside files they're no
-    // longer editing. Then re-affirm name + color on the current
-    // session — the binding will populate the cursor field on the next
-    // editor selection update.
+    console.log(`${tag}: bound collab binding to editor (room=${targetRoom})`);
+    return true;
+  }
+
+  private async attachFile(file: TFile) {
+    const tag = `[collab] attachFile(${file.path})`;
+    if (!this.socket) {
+      console.log(`${tag}: no socket, skipping`);
+      return;
+    }
+
+    // Token captured at entry. Each attachFile invocation for this
+    // path bumps it; we re-check before doing anything irreversible
+    // (editor.dispatch) so a stale older call doesn't clobber the
+    // binding a newer call already set up.
+    const token = ++this.nextAttachToken;
+    this.latestAttachToken.set(file.path, token);
+    const isLatest = () =>
+      this.latestAttachToken.get(file.path) === token;
+
+    // Coalesce concurrent createSession runs. Without this, two
+    // attachFile calls firing back-to-back for the same path both
+    // see `sessions.get(path) === undefined` and race past createSession,
+    // leaving an orphan provider hooked into the shared socket.
+    let session = this.sessions.get(file.path);
+    let isNewSession = false;
+    if (!session) {
+      const existing = this.attachInFlight.get(file.path);
+      if (existing) {
+        session = await existing;
+      } else {
+        const creating = this.createSession(file);
+        this.attachInFlight.set(file.path, creating);
+        try {
+          session = await creating;
+          isNewSession = true;
+        } finally {
+          this.attachInFlight.delete(file.path);
+        }
+      }
+    }
+
+    if (isNewSession) {
+      try {
+        await Promise.race([
+          Promise.all([
+            session.persistence.whenSynced,
+            waitForProviderSync(session.provider, 4000),
+          ]),
+          new Promise<void>((resolve) => setTimeout(resolve, 4000)),
+        ]);
+      } catch (err) {
+        console.warn(`${tag}: sync-before-bind raced an error`, err);
+      }
+      console.log(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
+
+      // Seed Y.Text from disk only if we BOTH know Y.Text is genuinely
+      // empty AND we believe the server is reachable (provider is
+      // synced). Without the synced check we'd happily seed offline
+      // — and then the server's existing content would arrive later
+      // and merge with our seed, producing duplicate content.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const providerSynced = (session.provider as any).synced === true;
+      if (session.ytext.length === 0 && providerSynced) {
+        try {
+          const diskContent = await this.app.vault.read(file);
+          if (diskContent.length > 0) {
+            session.ytext.insert(0, diskContent);
+            console.log(`${tag}: seeded ${diskContent.length} chars from disk`);
+          }
+        } catch (err) {
+          console.warn(`${tag}: disk-seed failed`, err);
+        }
+      } else if (session.ytext.length === 0 && !providerSynced) {
+        console.warn(
+          `${tag}: provider not synced after wait, deferring disk seed (waiting for server). Editor will pick up content when sync completes.`,
+        );
+      }
+    }
+
+    // After potentially-multi-second awaits we may no longer be the
+    // newest attach call for this path. A more recent file-open
+    // event has its own attachFile in flight — let it own the
+    // binding. Avoids clobber races.
+    if (!isLatest()) {
+      console.log(`${tag}: a newer attach for the same path superseded us, bailing`);
+      return;
+    }
+
+    const awareness = session.provider.awareness;
+    if (!awareness) {
+      console.warn(`${tag}: provider awareness is missing, cannot bind`);
+      return;
+    }
+    const targetRoom = pathToRoom(file.path);
+
+    // Bind yCollab to EVERY editor currently displaying this file,
+    // not just the one Obsidian considers "active". Multi-pane
+    // editing of the same file is common, and a pane without the
+    // binding silently bypasses the CRDT — Obsidian's auto-save
+    // would write directly to disk, our disk-sync would then
+    // overwrite the user's edits with whatever Y.Text held.
+    const editorViews = this.editorsForPath(file.path);
+    if (editorViews.length === 0) {
+      console.log(`${tag}: no editor view for this file open right now, will rebind on next file-open`);
+      return;
+    }
+    for (const editorView of editorViews) {
+      if (!isLatest()) {
+        console.log(`${tag}: superseded mid-dispatch, aborting remaining panes`);
+        return;
+      }
+      this.bindCollabTo(editorView, session, awareness, file, targetRoom);
+    }
+
+    // Awareness handoff: clear local state on every other open
+    // session so peers stop seeing this user frozen inside files
+    // they're no longer editing. Re-affirm name + color on the
+    // current session — the binding will populate the cursor field
+    // on the next selection update.
     for (const [otherPath, otherSession] of this.sessions.entries()) {
       if (otherPath === file.path) continue;
       try {
@@ -589,8 +685,6 @@ export default class CollabPlugin extends Plugin {
       name: this.settings.userName,
       color: this.settings.userColor,
     });
-
-    console.log(`${tag}: bound collab binding to editor (room=${targetRoom})`);
   }
 
   private async createSession(file: TFile): Promise<FileSession> {
@@ -642,13 +736,20 @@ export default class CollabPlugin extends Plugin {
     // sync before deciding whether the Y.Text is genuinely empty — so we
     // don't accidentally double-seed and concatenate two copies of the file.)
 
+    const session: FileSession = {
+      filePath: file.path,
+      ydoc,
+      provider,
+      ytext,
+      persistence,
+      destroyed: false,
+      observers: [],
+      diskWriteTimer: null,
+    };
+
     // Diagnostic: every Y.Text change prints a line so we can see what's
-    // flowing through the CRDT. Transactions originated by our editor
-    // binding tag their origin with the sync plugin instance; everything
-    // else (network sync from peers, initial seed) reads as "remote-or-
-    // network". A null/undefined origin usually means a manual
-    // ytext.insert from our own code (initial disk seed).
-    ytext.observe((event, transaction) => {
+    // flowing through the CRDT.
+    const debugObserver = (event: Y.YTextEvent, transaction: Y.Transaction) => {
       const origin = transaction.origin;
       const kind = origin == null ? "manual" : "delta";
       const delta = event.changes.delta
@@ -660,21 +761,25 @@ export default class CollabPlugin extends Plugin {
         })
         .join(" ");
       console.log(`[collab] ytext ${room} ${kind}: ${delta} (length now ${ytext.length})`);
-    });
+    };
+    ytext.observe(debugObserver);
+    session.observers.push(debugObserver);
 
     // Keep disk content in lockstep with Y.Text. Obsidian's auto-save
-    // doesn't fire reliably for the editor.dispatch transactions our
-    // binding pushes (they aren't user-driven), so the file on disk
-    // would otherwise lag behind the real Y.Text state. The next time
-    // the user reopens the file, Obsidian reads disk → editor shows
-    // stale content → our pre-sync overwrites with Y.Text → the user
-    // sees an old-content flash on every switch. Writing Y.Text to
-    // disk ourselves on a small debounce keeps disk and Y.Text equal.
-    let diskWriteTimer: ReturnType<typeof setTimeout> | null = null;
-    ytext.observe(() => {
-      if (diskWriteTimer) clearTimeout(diskWriteTimer);
-      diskWriteTimer = setTimeout(async () => {
-        diskWriteTimer = null;
+    // doesn't reliably fire for the editor.dispatch transactions our
+    // binding pushes, so the file on disk lags behind real Y.Text. On
+    // the next reopen Obsidian reads disk → editor shows stale content
+    // → pre-sync overwrites with Y.Text → user sees a flash on every
+    // switch. Writing Y.Text to disk on a small debounce keeps them
+    // equal. Bailing on `session.destroyed` prevents stale writes
+    // landing after the session has been torn down (e.g. file
+    // deleted, or plugin unloading mid-debounce).
+    const diskSyncObserver = () => {
+      if (session.destroyed) return;
+      if (session.diskWriteTimer) clearTimeout(session.diskWriteTimer);
+      session.diskWriteTimer = setTimeout(async () => {
+        session.diskWriteTimer = null;
+        if (session.destroyed) return;
         const tfile = this.app.vault.getAbstractFileByPath(file.path);
         if (!(tfile instanceof TFile)) return;
         let content: string;
@@ -686,6 +791,7 @@ export default class CollabPlugin extends Plugin {
         }
         try {
           const current = await this.app.vault.read(tfile);
+          if (session.destroyed) return;
           if (current === content) return;
           this.remoteApplyPaths.add(file.path);
           await this.app.vault.modify(tfile, content);
@@ -701,14 +807,33 @@ export default class CollabPlugin extends Plugin {
           );
         }
       }, 300);
-    });
+    };
+    ytext.observe(diskSyncObserver);
+    session.observers.push(diskSyncObserver);
 
-    const session: FileSession = { filePath: file.path, ydoc, provider, ytext, persistence };
     this.sessions.set(file.path, session);
     return session;
   }
 
   private destroySession(session: FileSession) {
+    // Flip the destroyed flag first so any disk-sync timer that fires
+    // between now and clearTimeout below bails out at its first check.
+    session.destroyed = true;
+    if (session.diskWriteTimer) {
+      clearTimeout(session.diskWriteTimer);
+      session.diskWriteTimer = null;
+    }
+    // Unobserve the ytext listeners we registered. Without this they
+    // stay in Y.Text's listener arrays and hold the closures (and via
+    // them the plugin + session) alive forever.
+    for (const fn of session.observers) {
+      try {
+        session.ytext.unobserve(fn);
+      } catch (err) {
+        console.warn("[collab] ytext unobserve failed", err);
+      }
+    }
+    session.observers.length = 0;
     void session.persistence.destroy();
     try {
       // Tell peers we're gone — prevents lingering ghost cursors.
@@ -763,13 +888,33 @@ export default class CollabPlugin extends Plugin {
       void this.reconcileManifest();
     });
 
-    this.manifestMap.observe((event) => this.onManifestChange(event));
+    this.manifestMapObserver = (event) => this.onManifestChange(event);
+    this.manifestMap.observe(this.manifestMapObserver);
     // When the bytes of an existing binary are updated, write to local disk.
-    this.manifestBinaries.observe((event) => this.onBinaryDataChange(event));
+    this.manifestBinariesObserver = (event) => this.onBinaryDataChange(event);
+    this.manifestBinaries.observe(this.manifestBinariesObserver);
   }
 
   private stopVaultSync() {
     for (const path of Array.from(this.structuralSessions.keys())) this.closeStructuralSession(path);
+    // Unobserve before destroying the Y.Doc so the listeners can't
+    // briefly fire on a torn-down doc / hold the closures alive.
+    if (this.manifestMap && this.manifestMapObserver) {
+      try {
+        this.manifestMap.unobserve(this.manifestMapObserver);
+      } catch (err) {
+        console.warn("[collab] manifestMap unobserve failed", err);
+      }
+    }
+    this.manifestMapObserver = null;
+    if (this.manifestBinaries && this.manifestBinariesObserver) {
+      try {
+        this.manifestBinaries.unobserve(this.manifestBinariesObserver);
+      } catch (err) {
+        console.warn("[collab] manifestBinaries unobserve failed", err);
+      }
+    }
+    this.manifestBinariesObserver = null;
     this.manifestProvider?.destroy();
     this.manifestProvider = null;
     void this.manifestPersistence?.destroy();
