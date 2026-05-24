@@ -2,6 +2,13 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.5 — 2026-05-24
+
+### Fixed
+- **Typing in the editor finally reaches Y.Text again.** Since the Phase-2 rewrite we installed each per-file yCollab via `editorView.dispatch({ effects: StateEffect.appendConfig.of(compartment.of(yCollab(...))) })`. With that path the underlying `ySync` ViewPlugin from `y-codemirror.next` never received the editor's `update` calls — the editor still saved to disk through Obsidian's auto-save, but the CRDT never saw any local edits and so remote peers received nothing and never advertised their cursors back. Phase 1 used the same library successfully via a direct `appendConfig.of(yCollab(...))` (no Compartment wrapper), which is the regression boundary.
+- The fix moves to Obsidian's official extension API: a single per-plugin `Compartment` is installed on every editor via `this.registerEditorExtension(compartment.of([]))` at plugin load. `attachFile` then dispatches `compartment.reconfigure(yCollab(...))` on the specific editor view, swapping the active binding. This path keeps `ySync` wired into CodeMirror correctly and gives us per-editor reconfiguration for free.
+- Removed the legacy per-editor stash on `EditorView` (the `__collabCompartment__` property, owner-identity tracking, manual unload cleanup) — Obsidian's `registerEditorExtension` handles the lifecycle.
+
 ## 0.5.4 — 2026-05-24
 
 ### Added

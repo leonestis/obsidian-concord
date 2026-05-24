@@ -10,7 +10,7 @@ import {
   TFile,
   TFolder,
 } from "obsidian";
-import { Compartment, StateEffect } from "@codemirror/state";
+import { Compartment } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
@@ -201,22 +201,11 @@ function pathToRoom(path: string): string {
   return "file:" + path.replace(/\//g, "__");
 }
 
-// Per-editor compartment so we can swap the collab extension when the open file changes.
 // y-codemirror.next's yCollab() does NOT accept cursorBuilder/selectionBuilder
 // options — only `undoManager`. The default cursor widget renders a <span>
 // containing a hidden `.cm-ySelectionInfo` div with the user's name, which the
 // library's CSS only un-hides on hover. We patch the visibility via our own
 // styles.css so the name is shown all the time.
-const COLLAB_COMPARTMENT_KEY = "__collabCompartment__";
-// `owner` is the CollabPlugin instance that installed the compartment. We
-// use object identity to spot a holder that survived an earlier plugin
-// reload — its inner extension still references a now-destroyed Y.Doc and
-// must be replaced before the editor will see new updates again.
-type CompartmentHolder = {
-  compartment: Compartment;
-  activeRoom: string | null;
-  owner: object;
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // plugin
@@ -228,6 +217,19 @@ export default class CollabPlugin extends Plugin {
   private sessions = new Map<string, FileSession>();
   private statusEl: HTMLElement | null = null;
   private connected = false;
+
+  // Single per-plugin Compartment installed via Obsidian's official
+  // `registerEditorExtension` API. Every editor view Obsidian creates
+  // automatically gets an empty slot for it; in attachFile we reconfigure
+  // that slot for a specific editor with the right per-file yCollab.
+  //
+  // This replaces the previous approach of dispatching
+  // `StateEffect.appendConfig.of(compartment.of(yCollab(...)))` directly,
+  // which silently wired yCollab in a way that y-codemirror.next's ySync
+  // ViewPlugin never received editor `update` calls — local edits went to
+  // disk via Obsidian's auto-save but never reached the CRDT, so remote
+  // peers saw nothing and never sent their cursors back.
+  private editorCompartment = new Compartment();
 
   // Vault manifest — single shared Y.Doc tracking which paths exist in the vault.
   // Holds three maps:
@@ -257,6 +259,11 @@ export default class CollabPlugin extends Plugin {
     this.addSettingTab(new CollabSettingTab(this.app, this));
     this.statusEl = this.addStatusBarItem();
     this.renderStatus();
+
+    // Install the shared Compartment into every current and future editor
+    // through Obsidian's official extension API. Empty by default; we
+    // reconfigure the slot per-editor in attachFile.
+    this.registerEditorExtension(this.editorCompartment.of([]));
 
     this.addCommand({
       id: "collab-reconnect",
@@ -311,27 +318,9 @@ export default class CollabPlugin extends Plugin {
 
   async onunload() {
     console.log("[collab] unloading…");
-    // Detach yCollab from any markdown editors we'd bound: the per-file
-    // Y.Docs are about to be destroyed and a leftover binding to a dead
-    // Y.Doc on the EditorView would make the next plugin instance see a
-    // "compartment already installed" stub pointing at nothing.
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView)) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const editorView = (view.editor as unknown as { cm?: EditorView } | undefined)?.cm;
-      if (!editorView) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const viewAny = editorView as any;
-      const holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
-      if (!holder || holder.owner !== this) return;
-      try {
-        editorView.dispatch({ effects: holder.compartment.reconfigure([]) });
-        holder.activeRoom = null;
-      } catch (err) {
-        console.warn("[collab] compartment cleanup failed", err);
-      }
-    });
+    // The editorCompartment we installed via registerEditorExtension is
+    // automatically removed by Obsidian when the plugin unloads — we
+    // just need to tear down our Y.Doc state.
     this.stopVaultSync();
     for (const session of this.sessions.values()) this.destroySession(session);
     this.sessions.clear();
@@ -366,18 +355,22 @@ export default class CollabPlugin extends Plugin {
     lines.push(`Server URL: ${this.settings.serverUrl}`);
     lines.push(`Socket: ${this.socket ? (this.connected ? "🟢 connected" : "🟡 not connected") : "🔴 no socket"}`);
     lines.push(`Active sessions: ${this.sessions.size}`);
-    // Also note whether the active editor actually has our compartment.
+    // Check whether the active editor's compartment slot is reconfigured
+    // to our yCollab (vs. the empty default we install on plugin load).
     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (activeView) {
       const editor = activeView.editor as unknown as { cm?: EditorView } | undefined;
       const editorView = editor?.cm;
-      const bound = editorView
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ? ((editorView as any)[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined)
-        : undefined;
-      lines.push(
-        `Active file: ${activeView.file?.path ?? "(none)"} — yCollab ${bound && bound.owner === this ? "✅ bound (room=" + bound.activeRoom + ")" : "❌ NOT bound"}`,
-      );
+      let bound: string;
+      if (!editorView) {
+        bound = "❓ no CodeMirror view (Reading mode?)";
+      } else {
+        const slot = this.editorCompartment.get(editorView.state);
+        // An empty array means we never reconfigured this slot.
+        const hasExtension = Array.isArray(slot) ? slot.length > 0 : !!slot;
+        bound = hasExtension ? "✅ bound" : "❌ NOT bound (compartment empty)";
+      }
+      lines.push(`Active file: ${activeView.file?.path ?? "(none)"} — yCollab ${bound}`);
     } else {
       lines.push("Active view: (none)");
     }
@@ -508,9 +501,8 @@ export default class CollabPlugin extends Plugin {
     }
 
     const targetRoom = pathToRoom(file.path);
-    // Diagnostic listener: fires on every editor transaction. Lets us see
-    // whether the editor is even emitting docChanged events, separately
-    // from whether yCollab is forwarding them into Y.Text.
+    // Diagnostic listener: fires on every editor transaction so we can
+    // tell editor-emits-events apart from yCollab-doesn't-forward-them.
     const debugListener = EditorView.updateListener.of((update) => {
       if (!update.docChanged) return;
       console.log(
@@ -519,40 +511,14 @@ export default class CollabPlugin extends Plugin {
     });
     const collabExtension = [debugListener, yCollab(session.ytext, session.provider.awareness)];
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const viewAny = editorView as any;
-    const holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
-
-    if (!holder) {
-      const compartment = new Compartment();
-      const fresh: CompartmentHolder = { compartment, activeRoom: targetRoom, owner: this };
-      viewAny[COLLAB_COMPARTMENT_KEY] = fresh;
-      editorView.dispatch({
-        effects: StateEffect.appendConfig.of(compartment.of(collabExtension)),
-      });
-      console.log(`${tag}: installed fresh compartment (yCollab bound to ${targetRoom})`);
-      return;
-    }
-
-    if (holder.owner !== this) {
-      holder.owner = this;
-      holder.activeRoom = targetRoom;
-      editorView.dispatch({
-        effects: holder.compartment.reconfigure(collabExtension),
-      });
-      console.log(`${tag}: rebound stale compartment (from previous plugin instance)`);
-      return;
-    }
-
-    if (holder.activeRoom === targetRoom) {
-      console.log(`${tag}: compartment already bound to ${targetRoom}, no-op`);
-      return;
-    }
-    holder.activeRoom = targetRoom;
+    // Reconfigure the per-plugin compartment for THIS editor view. The
+    // compartment was installed via this.registerEditorExtension on
+    // plugin load, so every editor already has a slot for it. Dispatching
+    // `reconfigure` on a specific view updates only that view's slot.
     editorView.dispatch({
-      effects: holder.compartment.reconfigure(collabExtension),
+      effects: this.editorCompartment.reconfigure(collabExtension),
     });
-    console.log(`${tag}: reconfigured compartment from previous room → ${targetRoom}`);
+    console.log(`${tag}: bound yCollab to editor (room=${targetRoom})`);
   }
 
   private async createSession(file: TFile): Promise<FileSession> {
