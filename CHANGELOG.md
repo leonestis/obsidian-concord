@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.4 — 2026-05-24
+
+### Added
+- A Y.Text observer in every per-file session prints each change to the console with the kind ("local" vs "remote") and the delta — proves whether typing in the editor actually reaches the CRDT.
+- A CodeMirror `EditorView.updateListener` is now installed alongside the yCollab extension and prints every `docChanged` transaction. Lets us tell editor-emits-events apart from yCollab-doesn't-forward-them when something seems "stuck".
+
 ## 0.5.3 — 2026-05-24
 
 ### Added

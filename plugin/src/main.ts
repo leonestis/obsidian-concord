@@ -508,7 +508,16 @@ export default class CollabPlugin extends Plugin {
     }
 
     const targetRoom = pathToRoom(file.path);
-    const collabExtension = yCollab(session.ytext, session.provider.awareness);
+    // Diagnostic listener: fires on every editor transaction. Lets us see
+    // whether the editor is even emitting docChanged events, separately
+    // from whether yCollab is forwarding them into Y.Text.
+    const debugListener = EditorView.updateListener.of((update) => {
+      if (!update.docChanged) return;
+      console.log(
+        `[collab] editor ${file.path} changed: new length=${update.state.doc.length}`,
+      );
+    });
+    const collabExtension = [debugListener, yCollab(session.ytext, session.provider.awareness)];
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const viewAny = editorView as any;
@@ -594,6 +603,23 @@ export default class CollabPlugin extends Plugin {
     // (Seeding from disk now lives in attachFile, which awaits cache + server
     // sync before deciding whether the Y.Text is genuinely empty — so we
     // don't accidentally double-seed and concatenate two copies of the file.)
+
+    // Diagnostic: every Y.Text change prints a line so we can tell whether
+    // local editor edits actually reach the CRDT. Remote changes from
+    // peers arrive here with a non-null transaction.origin.
+    ytext.observe((event, transaction) => {
+      const origin = transaction.origin;
+      const kind = origin === null || origin === undefined ? "local" : "remote";
+      const delta = event.changes.delta
+        .map((d) => {
+          if ("insert" in d) return `+${JSON.stringify(d.insert)}`;
+          if ("delete" in d) return `-${d.delete}`;
+          if ("retain" in d) return `=${d.retain}`;
+          return "?";
+        })
+        .join(" ");
+      console.log(`[collab] ytext ${room} ${kind}: ${delta} (length now ${ytext.length})`);
+    });
 
     const session: FileSession = { filePath: file.path, ydoc, provider, ytext, persistence };
     this.sessions.set(file.path, session);
