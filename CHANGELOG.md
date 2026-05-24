@@ -2,6 +2,13 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.3 — 2026-05-24
+
+### Added
+- Verbose per-step logging inside `attachFile`. Every code path (skipping, creating session, awaiting sync, seeding from disk, bailing because the active view changed, installing the compartment, rebinding a stale one, reconfiguring) now prints a `[collab] attachFile(<path>): …` line so we can tell from a single log dump whether yCollab actually ended up wired to the editor.
+- The diagnostics command now reports whether the *currently active* editor has our compartment attached, which Y.Doc room it's pointing at, and surfaces "yCollab ❌ NOT bound" when something prevented the binding.
+- Defensive guard for `view.editor.cm` being absent (Reading-mode views) — the plugin now logs a clear message and skips instead of throwing.
+
 ## 0.5.2 — 2026-05-24
 
 ### Fixed

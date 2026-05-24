@@ -366,6 +366,21 @@ export default class CollabPlugin extends Plugin {
     lines.push(`Server URL: ${this.settings.serverUrl}`);
     lines.push(`Socket: ${this.socket ? (this.connected ? "🟢 connected" : "🟡 not connected") : "🔴 no socket"}`);
     lines.push(`Active sessions: ${this.sessions.size}`);
+    // Also note whether the active editor actually has our compartment.
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (activeView) {
+      const editor = activeView.editor as unknown as { cm?: EditorView } | undefined;
+      const editorView = editor?.cm;
+      const bound = editorView
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ? ((editorView as any)[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined)
+        : undefined;
+      lines.push(
+        `Active file: ${activeView.file?.path ?? "(none)"} — yCollab ${bound && bound.owner === this ? "✅ bound (room=" + bound.activeRoom + ")" : "❌ NOT bound"}`,
+      );
+    } else {
+      lines.push("Active view: (none)");
+    }
     for (const s of this.sessions.values()) {
       const wsStatus = (s.provider as unknown as { status: string }).status ?? "?";
       const peers = s.provider.awareness ? s.provider.awareness.getStates().size : 0;
@@ -373,7 +388,7 @@ export default class CollabPlugin extends Plugin {
     }
     const msg = lines.join("\n");
     console.log("[collab] diagnostics:\n" + msg);
-    new Notice(msg, 12_000);
+    new Notice(msg, 15_000);
   }
 
   // ── connection ─────────────────────────────────────────────────────────────
@@ -429,20 +444,28 @@ export default class CollabPlugin extends Plugin {
   }
 
   private async attachFile(file: TFile) {
-    if (!this.socket) return;
+    const tag = `[collab] attachFile(${file.path})`;
+    if (!this.socket) {
+      console.log(`${tag}: no socket, skipping`);
+      return;
+    }
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view || view.file?.path !== file.path) return;
+    if (!view) {
+      console.log(`${tag}: no active MarkdownView`);
+      return;
+    }
+    if (view.file?.path !== file.path) {
+      console.log(`${tag}: active view is ${view.file?.path ?? "(none)"}, skipping`);
+      return;
+    }
 
     let session = this.sessions.get(file.path);
     const isNewSession = !session;
-    if (!session) session = await this.createSession(file);
+    if (!session) {
+      console.log(`${tag}: creating new session`);
+      session = await this.createSession(file);
+    }
 
-    // CRITICAL: do NOT bind yCollab to the editor while Y.Text is still
-    // empty — yCollab would replace the editor's content with the empty
-    // Y.Text and Obsidian would auto-save the cleared buffer to disk,
-    // wiping the file. So for a fresh session: first await the local
-    // IndexedDB cache OR the first server sync, then seed Y.Text from
-    // disk if neither produced any content. Only after that bind yCollab.
     if (isNewSession) {
       try {
         await Promise.race([
@@ -453,26 +476,37 @@ export default class CollabPlugin extends Plugin {
           new Promise<void>((resolve) => setTimeout(resolve, 4000)),
         ]);
       } catch (err) {
-        console.warn("[collab] sync-before-bind raced an error", file.path, err);
+        console.warn(`${tag}: sync-before-bind raced an error`, err);
       }
+      console.log(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
       if (session.ytext.length === 0) {
         try {
           const diskContent = await this.app.vault.read(file);
           if (diskContent.length > 0) {
             session.ytext.insert(0, diskContent);
-            console.log(`[collab] seeded "${file.path}" from disk (${diskContent.length} chars)`);
+            console.log(`${tag}: seeded ${diskContent.length} chars from disk`);
           }
         } catch (err) {
-          console.warn("[collab] disk-seed failed", file.path, err);
+          console.warn(`${tag}: disk-seed failed`, err);
         }
       }
-      // The active view may have moved on while we were awaiting — re-check
-      // and bail rather than yank the user's editor.
       const stillActive = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (!stillActive || stillActive.file?.path !== file.path) return;
+      if (!stillActive || stillActive.file?.path !== file.path) {
+        console.log(`${tag}: active view changed during await (now ${stillActive?.file?.path ?? "(none)"}), bailing — will re-attach on next file-open`);
+        return;
+      }
     }
 
-    const editorView = (view.editor as unknown as { cm: EditorView }).cm;
+    // Pull the underlying CodeMirror 6 EditorView. Obsidian exposes it as
+    // view.editor.cm — but if the view is in Reading mode there's no
+    // CodeMirror to bind to and `.cm` is absent.
+    const editor = view.editor as unknown as { cm?: EditorView } | undefined;
+    const editorView = editor?.cm;
+    if (!editorView) {
+      console.warn(`${tag}: view.editor.cm is missing — this view is probably in Reading mode. Switch to Edit / Source / Live Preview and reopen the file.`);
+      return;
+    }
+
     const targetRoom = pathToRoom(file.path);
     const collabExtension = yCollab(session.ytext, session.provider.awareness);
 
@@ -481,38 +515,35 @@ export default class CollabPlugin extends Plugin {
     const holder = viewAny[COLLAB_COMPARTMENT_KEY] as CompartmentHolder | undefined;
 
     if (!holder) {
-      // Brand-new editor view, no compartment yet. Install one with the
-      // collab extension already inside, in a single dispatch.
       const compartment = new Compartment();
       const fresh: CompartmentHolder = { compartment, activeRoom: targetRoom, owner: this };
       viewAny[COLLAB_COMPARTMENT_KEY] = fresh;
       editorView.dispatch({
         effects: StateEffect.appendConfig.of(compartment.of(collabExtension)),
       });
+      console.log(`${tag}: installed fresh compartment (yCollab bound to ${targetRoom})`);
       return;
     }
 
-    // If the holder was installed by a previous instance of this plugin
-    // (Obsidian disable/enable, or "Reload app"), its compartment is still
-    // wired to a Y.Doc we already destroyed — the editor sees no updates
-    // even though the new providers are syncing in the background. Treat
-    // this case as "rebind everything" rather than the no-op we'd hit if
-    // we only checked activeRoom.
     if (holder.owner !== this) {
       holder.owner = this;
       holder.activeRoom = targetRoom;
       editorView.dispatch({
         effects: holder.compartment.reconfigure(collabExtension),
       });
-      console.log(`[collab] rebound stale compartment for ${file.path}`);
+      console.log(`${tag}: rebound stale compartment (from previous plugin instance)`);
       return;
     }
 
-    if (holder.activeRoom === targetRoom) return; // already bound to this room
+    if (holder.activeRoom === targetRoom) {
+      console.log(`${tag}: compartment already bound to ${targetRoom}, no-op`);
+      return;
+    }
     holder.activeRoom = targetRoom;
     editorView.dispatch({
       effects: holder.compartment.reconfigure(collabExtension),
     });
+    console.log(`${tag}: reconfigured compartment from previous room → ${targetRoom}`);
   }
 
   private async createSession(file: TFile): Promise<FileSession> {
