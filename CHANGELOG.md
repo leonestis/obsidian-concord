@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.1 — 2026-05-24
+
+### Fixed
+- `EditorView.update are not allowed while an update is in progress` thrown by the new binding. The chain was: sync plugin's `update` method publishes the local cursor with `awareness.setLocalStateField("cursor", ...)` → awareness fires its `change` event synchronously → the decoration plugin's listener tried to `view.dispatch({...})` to trigger a re-render → CodeMirror rejected the dispatch because the original `update` was still on the stack. The listener now defers the dispatch via `setTimeout(0)` (breaking out of the update call stack) and coalesces concurrent change events with a `pending` flag. It also skips entirely when the only client whose awareness changed is the local one — our own cursor isn't rendered locally anyway.
+
 ## 0.6.0 — 2026-05-24
 
 ### Changed

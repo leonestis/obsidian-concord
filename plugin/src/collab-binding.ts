@@ -177,18 +177,44 @@ export function createCollabBinding(
     class {
       private readonly view: EditorView;
       decorations: DecorationSet;
-      private readonly listener: () => void;
+      private readonly listener: (event: {
+        added: number[];
+        updated: number[];
+        removed: number[];
+      }) => void;
+      private pending = false;
 
       constructor(view: EditorView) {
         this.view = view;
         this.decorations = this.build();
-        this.listener = () => {
-          // Awareness changed — force CodeMirror to re-render by
-          // dispatching a no-op transaction with our sync annotation.
-          // The sync plugin sees the annotation and ignores it.
-          view.dispatch({
-            annotations: [COLLAB_SYNC.of(true)],
-          });
+
+        const localId = awareness.clientID;
+        this.listener = ({ added, updated, removed }) => {
+          // Ignore self-only changes — our own cursor never renders on
+          // our editor (we filter it out in build()), so no point
+          // re-running.
+          const hasRemote =
+            added.some((id) => id !== localId) ||
+            updated.some((id) => id !== localId) ||
+            removed.some((id) => id !== localId);
+          if (!hasRemote) return;
+
+          // Defer the dispatch. The 'change' event often fires
+          // *inside* CodeMirror's own update cycle (e.g. when our
+          // sync plugin updates the local cursor field on a typing
+          // transaction). CodeMirror forbids re-entering dispatch
+          // from within an update; setTimeout puts us outside that
+          // call stack. Coalesce concurrent events with a flag so we
+          // don't queue an avalanche of dispatches.
+          if (this.pending) return;
+          this.pending = true;
+          setTimeout(() => {
+            this.pending = false;
+            if (!view.dom.isConnected) return;
+            view.dispatch({
+              annotations: [COLLAB_SYNC.of(true)],
+            });
+          }, 0);
         };
         awareness.on("change", this.listener);
       }
