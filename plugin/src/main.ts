@@ -511,29 +511,21 @@ export default class CollabPlugin extends Plugin {
     });
     const collabExtension = [debugListener, yCollab(session.ytext, session.provider.awareness)];
 
-    // CRITICAL: CodeMirror identifies ViewPlugins by reference. yCollab
-    // re-exports the same `ySync` ViewPlugin spec every call, so a plain
-    // `compartment.reconfigure(yCollab(newYtext, ...))` REUSES the old
-    // ySync instance — its `this.conf` keeps pointing at the previous
-    // file's Y.Text, and the editor stays wired to the wrong CRDT.
-    //
-    // To force a clean lifecycle we dispatch the reconfigure in two
-    // hops: first clear the compartment to [], which calls ySync.destroy
-    // (unobserving the old Y.Text), then install the new yCollab, which
-    // runs ySync.constructor fresh with the new facet value.
+    // Step 1: detach any previous yCollab so the editor.dispatch in
+    // Step 2 isn't intercepted by ySync.update (otherwise our manual
+    // editor rewrite gets forwarded back into Y.Text, which produces
+    // a delete+insert pair on top of the existing content — i.e. it
+    // *doubles* the Y.Text and propagates that doubling to peers).
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure([]),
     });
-    editorView.dispatch({
-      effects: this.editorCompartment.reconfigure(collabExtension),
-    });
 
-    // After yCollab attaches, the editor and Y.Text content can still
-    // differ — yCollab does NOT auto-sync them on construction. If the
-    // file on disk drifted from the Y.Text (e.g., a peer wrote ahead
-    // while this client was offline, or Obsidian re-read disk after
-    // we already had a session), force the editor to match Y.Text now.
-    // The Y.Text is the authoritative shared state for collaborators.
+    // Step 2: with yCollab unattached, if the editor and Y.Text differ,
+    // overwrite the editor doc to match Y.Text. The Y.Text is the
+    // authoritative shared state. Because no ySync is in the editor at
+    // this moment, this transaction won't be forwarded into Y.Text and
+    // won't loop. Disk content (from Obsidian's initial read or a stale
+    // local copy) loses to whatever peers have agreed on.
     const ytextContent = session.ytext.toString();
     const editorContent = editorView.state.doc.toString();
     if (ytextContent !== editorContent) {
@@ -541,9 +533,17 @@ export default class CollabPlugin extends Plugin {
         changes: { from: 0, to: editorView.state.doc.length, insert: ytextContent },
       });
       console.log(
-        `${tag}: replaced editor doc (${editorContent.length} chars) with Y.Text (${ytextContent.length} chars)`,
+        `${tag}: pre-sync editor (${editorContent.length} chars) → Y.Text (${ytextContent.length} chars)`,
       );
     }
+
+    // Step 3: install the fresh yCollab. ySync.constructor runs against
+    // the current facet (this file's Y.Text), and since the editor doc
+    // now matches Y.Text, no diff is needed and no surprise inserts
+    // happen.
+    editorView.dispatch({
+      effects: this.editorCompartment.reconfigure(collabExtension),
+    });
 
     console.log(`${tag}: bound yCollab to editor (room=${targetRoom})`);
   }

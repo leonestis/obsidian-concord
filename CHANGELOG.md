@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.7 — 2026-05-24
+
+### Fixed
+- **Catastrophic doubling loop introduced in 0.5.6.** The "force-sync editor to Y.Text" step ran *after* yCollab had already attached. ySync.update saw our editor.dispatch as a local edit, converted it into `delete(0, editor.length) + insert(0, ytext.toString())` on the Y.Text, and applied that on top of the existing 40-char content — producing a `delete X chars + insert N chars` operation that the CRDT replayed as content append rather than no-op. Every file switch doubled (or worse) the Y.Text length and broadcast that to peers, who then doubled again. Logs showed Y.Text growing 46 → 175 → 458 → 832 → 1583 → 2577 → 5073 → 10138 characters within seconds.
+- The fix re-orders attachFile to: (1) compartment.reconfigure([]) to detach old yCollab, (2) editor.dispatch to align editor with Y.Text content while no ySync is attached, (3) compartment.reconfigure(yCollab(...)) to attach fresh. Because ySync isn't in the state during step 2, the editor rewrite no longer round-trips through Y.Text and no loop forms.
+
 ## 0.5.6 — 2026-05-24
 
 ### Fixed
