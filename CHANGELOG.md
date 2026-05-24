@@ -2,6 +2,14 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.2 — 2026-05-24
+
+### Added
+- **Client-version gate on the server.** The plugin now sends its version as a `clientVersion` query parameter on every WebSocket connection. The server's new `onConnect` hook reads it, compares against `MIN_CLIENT_VERSION` (default `0.6.2`, overridable via env var), and refuses connections below that threshold. Older clients can no longer write to the shared CRDT, so they can't corrupt rooms while you test with a current build.
+
+### Fixed
+- **Old-content flash on file switch.** Obsidian's auto-save doesn't reliably fire for the editor transactions our binding pushes (they aren't user-driven), so the file on disk would lag behind the real Y.Text state. The next time the user opened the file Obsidian read disk → editor briefly showed stale content → our pre-sync overwrote with Y.Text → user saw a flash on *every* switch (not just the first). The plugin now writes Y.Text to disk itself on a 300 ms debounce, keeping disk and Y.Text equal, so subsequent reopens show the right content immediately.
+
 ## 0.6.1 — 2026-05-24
 
 ### Fixed

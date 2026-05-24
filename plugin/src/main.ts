@@ -18,6 +18,13 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 import { createCollabBinding } from "./collab-binding";
 
+// Hardcoded — must match plugin/manifest.json. We send it as a URL
+// parameter on every connection so the server can reject clients on
+// versions with known data-corruption bugs (the 0.5.x doubling
+// regression) before they get to overwrite anything in the shared
+// CRDT.
+const PLUGIN_VERSION = "0.6.2";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,10 +396,13 @@ export default class CollabPlugin extends Plugin {
   private connect() {
     if (this.socket) return;
     try {
+      // Append clientVersion as a query parameter. The server reads it
+      // via `requestParameters` in its onConnect hook and refuses
+      // clients running releases with known data-corruption bugs.
+      const baseUrl = this.settings.serverUrl.replace(/\/+$/, "");
+      const sep = baseUrl.includes("?") ? "&" : "?";
       this.socket = new HocuspocusProviderWebsocket({
-        url: this.settings.serverUrl,
-        // y-websocket-style auto-reconnect with exponential backoff is on by default;
-        // we just don't have to disable it.
+        url: `${baseUrl}${sep}clientVersion=${encodeURIComponent(PLUGIN_VERSION)}`,
       });
       // HocuspocusProviderWebsocket emits a single `status` event with payload
       // `{ status: 'connecting' | 'connected' | 'disconnected' }`. Don't listen
@@ -632,12 +642,15 @@ export default class CollabPlugin extends Plugin {
     // sync before deciding whether the Y.Text is genuinely empty — so we
     // don't accidentally double-seed and concatenate two copies of the file.)
 
-    // Diagnostic: every Y.Text change prints a line so we can tell whether
-    // local editor edits actually reach the CRDT. Remote changes from
-    // peers arrive here with a non-null transaction.origin.
+    // Diagnostic: every Y.Text change prints a line so we can see what's
+    // flowing through the CRDT. Transactions originated by our editor
+    // binding tag their origin with the sync plugin instance; everything
+    // else (network sync from peers, initial seed) reads as "remote-or-
+    // network". A null/undefined origin usually means a manual
+    // ytext.insert from our own code (initial disk seed).
     ytext.observe((event, transaction) => {
       const origin = transaction.origin;
-      const kind = origin === null || origin === undefined ? "local" : "remote";
+      const kind = origin == null ? "manual" : "delta";
       const delta = event.changes.delta
         .map((d) => {
           if ("insert" in d) return `+${JSON.stringify(d.insert)}`;
@@ -647,6 +660,47 @@ export default class CollabPlugin extends Plugin {
         })
         .join(" ");
       console.log(`[collab] ytext ${room} ${kind}: ${delta} (length now ${ytext.length})`);
+    });
+
+    // Keep disk content in lockstep with Y.Text. Obsidian's auto-save
+    // doesn't fire reliably for the editor.dispatch transactions our
+    // binding pushes (they aren't user-driven), so the file on disk
+    // would otherwise lag behind the real Y.Text state. The next time
+    // the user reopens the file, Obsidian reads disk → editor shows
+    // stale content → our pre-sync overwrites with Y.Text → the user
+    // sees an old-content flash on every switch. Writing Y.Text to
+    // disk ourselves on a small debounce keeps disk and Y.Text equal.
+    let diskWriteTimer: ReturnType<typeof setTimeout> | null = null;
+    ytext.observe(() => {
+      if (diskWriteTimer) clearTimeout(diskWriteTimer);
+      diskWriteTimer = setTimeout(async () => {
+        diskWriteTimer = null;
+        const tfile = this.app.vault.getAbstractFileByPath(file.path);
+        if (!(tfile instanceof TFile)) return;
+        let content: string;
+        try {
+          content = ytext.toString();
+        } catch (err) {
+          console.warn(`[collab] disk-sync read failed for ${file.path}`, err);
+          return;
+        }
+        try {
+          const current = await this.app.vault.read(tfile);
+          if (current === content) return;
+          this.remoteApplyPaths.add(file.path);
+          await this.app.vault.modify(tfile, content);
+          console.log(
+            `[collab] disk-sync ${file.path}: wrote ${content.length} chars`,
+          );
+        } catch (err) {
+          console.warn(`[collab] disk-sync failed for ${file.path}`, err);
+        } finally {
+          setTimeout(
+            () => this.remoteApplyPaths.delete(file.path),
+            SUPPRESS_HOLD_MS,
+          );
+        }
+      }, 300);
     });
 
     const session: FileSession = { filePath: file.path, ydoc, provider, ytext, persistence };

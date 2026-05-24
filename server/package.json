@@ -1,6 +1,6 @@
 {
   "name": "@obsidian-collab/server",
-  "version": "0.1.0",
+  "version": "0.6.2",
   "private": true,
   "description": "Hocuspocus-based Yjs collaboration server for obsidian-collab",
   "license": "AGPL-3.0-only",
