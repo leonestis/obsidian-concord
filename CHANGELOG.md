@@ -2,6 +2,17 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.0 — 2026-05-24
+
+### Changed
+- **Replaced `y-codemirror.next`'s `yCollab` with our own bidirectional editor ↔ Y.Text binding** (`plugin/src/collab-binding.ts`). The library uses module-level `ViewPlugin` constants (`ySync`, `yRemoteSelections`) which CodeMirror identifies by reference, so swapping the compartment from one file to another reused the old plugin instances — their constructor-cached `this.conf` still pointed at the previous file's Y.Text and Awareness. Obsidian reuses the same `EditorView` across every file in a pane, so this reuse was the common path. Our `createCollabBinding(ytext, awareness)` calls `ViewPlugin.fromClass(...)` on inline classes — every call produces fresh `ViewPlugin` specs, so each compartment reconfigure is a genuine destroy-and-recreate. File switching is now reliable.
+- The binding handles editor → Y.Text forwarding, Y.Text → editor application (with a `COLLAB_SYNC` annotation as the loop breaker), local cursor publication to Awareness on selection / focus change, and rendering of remote cursors + selections as CodeMirror decorations. The remote caret widget keeps the same DOM structure as `y-codemirror.next` produced, so `styles.css` (which forces the name label to stay visible) carries over untouched.
+- Local cursor is cleared from Awareness when the editor loses focus, so peers stop seeing a stationary cursor when the user navigates away.
+
+### Removed
+- `yCollab`, `ySync`, `ySyncFacet`, `yRemoteSelections`, and `YSyncConfig` imports from `y-codemirror.next`. The runtime dependency stays in `package.json` for now in case future undo-manager integration wants it, but the plugin no longer pulls anything from it.
+- The 0.5.8 in-place hack that mutated `ySync.conf` and `yRemoteSelections._awareness` after each compartment reconfigure is no longer necessary — the new binding doesn't have the underlying caching problem.
+
 ## 0.5.8 — 2026-05-24
 
 ### Fixed

@@ -12,17 +12,11 @@ import {
 } from "obsidian";
 import { Compartment } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import {
-  yCollab,
-  ySync,
-  ySyncFacet,
-  YSyncConfig,
-  yRemoteSelections,
-} from "y-codemirror.next";
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { removeAwarenessStates } from "y-protocols/awareness";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
+import { createCollabBinding } from "./collab-binding";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -507,93 +501,72 @@ export default class CollabPlugin extends Plugin {
     }
 
     const targetRoom = pathToRoom(file.path);
-    // Diagnostic listener: fires on every editor transaction so we can
-    // tell editor-emits-events apart from yCollab-doesn't-forward-them.
+
+    // Diagnostic listener — fires on every editor transaction so we
+    // can see in the console whether the editor is even emitting
+    // docChanged events.
     const debugListener = EditorView.updateListener.of((update) => {
       if (!update.docChanged) return;
       console.log(
         `[collab] editor ${file.path} changed: new length=${update.state.doc.length}`,
       );
     });
-    const collabExtension = [debugListener, yCollab(session.ytext, session.provider.awareness)];
 
-    // Step 1: detach any previous yCollab so the editor.dispatch in
-    // Step 2 isn't intercepted by ySync.update (otherwise our manual
-    // editor rewrite gets forwarded back into Y.Text, which produces
-    // a delete+insert pair on top of the existing content — i.e. it
-    // *doubles* the Y.Text and propagates that doubling to peers).
+    const awareness = session.provider.awareness;
+    if (!awareness) {
+      console.warn(`${tag}: provider awareness is missing, cannot bind`);
+      return;
+    }
+    // Build a FRESH binding extension. createCollabBinding wraps each
+    // ViewPlugin definition in a brand-new spec on every call, so when
+    // we reconfigure the compartment below CodeMirror genuinely
+    // destroys the previous binding's plugins (its ytext/awareness
+    // observers come off cleanly) and instantiates new ones against
+    // this file's Y.Text + Awareness. That side-steps the y-codemirror
+    // .next plugin-reuse trap that broke file switching in 0.5.x.
+    const collabExtension = [
+      debugListener,
+      createCollabBinding(session.ytext, awareness),
+    ];
+
+    // Step 1: detach the previous binding (so its observers unhook)
+    // and so the editor rewrite in Step 2 isn't intercepted by any
+    // sync plugin that would forward our manual reset into Y.Text.
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure([]),
     });
 
-    // Step 2: with yCollab unattached, if the editor and Y.Text differ,
-    // overwrite the editor doc to match Y.Text. The Y.Text is the
-    // authoritative shared state. Because no ySync is in the editor at
-    // this moment, this transaction won't be forwarded into Y.Text and
-    // won't loop. Disk content (from Obsidian's initial read or a stale
-    // local copy) loses to whatever peers have agreed on.
+    // Step 2: with no binding attached, if the editor and Y.Text are
+    // out of sync, rewrite the editor to match Y.Text. Y.Text is the
+    // authoritative shared state — disk content (from Obsidian's
+    // initial read or a stale local copy) loses to whatever peers have
+    // agreed on. We don't need our COLLAB_SYNC annotation here because
+    // there's no binding to intercept.
     const ytextContent = session.ytext.toString();
     const editorContent = editorView.state.doc.toString();
     if (ytextContent !== editorContent) {
       editorView.dispatch({
-        changes: { from: 0, to: editorView.state.doc.length, insert: ytextContent },
+        changes: {
+          from: 0,
+          to: editorView.state.doc.length,
+          insert: ytextContent,
+        },
       });
       console.log(
         `${tag}: pre-sync editor (${editorContent.length} chars) → Y.Text (${ytextContent.length} chars)`,
       );
     }
 
-    // Step 3: install the fresh yCollab. ySync.constructor runs against
-    // the current facet (this file's Y.Text), and since the editor doc
-    // now matches Y.Text, no diff is needed and no surprise inserts
-    // happen.
+    // Step 3: install the fresh binding.
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure(collabExtension),
     });
 
-    // CodeMirror identifies ViewPlugins by reference. y-codemirror.next
-    // exports the SAME `ySync` and `yRemoteSelections` instances every
-    // yCollab() call, so even after our reconfigure([]) → reconfigure(yCollab)
-    // dance CM6 sometimes reuses the previous plugin instance — and its
-    // constructor-cached `this.conf` still points at the previous file's
-    // Y.Text and awareness. The result: typing in file B forwards into
-    // file A's Y.Text, and remote cursors on A end up on B's editor.
-    // We can't change library internals, so we reach into the live
-    // instances and rewire their observers + conf in-place.
-    const newConf = editorView.state.facet(ySyncFacet) as YSyncConfig | undefined;
-    if (newConf) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const syncInst = editorView.plugin(ySync) as any;
-      if (syncInst && syncInst.conf !== newConf) {
-        try {
-          syncInst._ytext?.unobserve?.(syncInst._observer);
-        } catch (err) {
-          console.warn(`${tag}: failed to unobserve old ySync ytext`, err);
-        }
-        syncInst.conf = newConf;
-        syncInst._ytext = newConf.ytext;
-        newConf.ytext.observe(syncInst._observer);
-        console.log(`${tag}: force-reset ySync internal state to room=${targetRoom}`);
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const selInst = editorView.plugin(yRemoteSelections) as any;
-      if (selInst && selInst.conf !== newConf) {
-        try {
-          selInst._awareness?.off?.("change", selInst._listener);
-        } catch (err) {
-          console.warn(`${tag}: failed to unbind old awareness listener`, err);
-        }
-        selInst.conf = newConf;
-        selInst._awareness = newConf.awareness;
-        newConf.awareness.on("change", selInst._listener);
-        console.log(`${tag}: force-reset yRemoteSelections to current awareness`);
-      }
-    }
-
-    // Awareness handoff: clear user state on every other open session so
-    // peers stop seeing this user "frozen" inside files they're no longer
-    // editing. Then re-affirm user info on the current session so the
-    // cursor that's about to appear here has a name and color.
+    // Awareness handoff: clear local state on every other open session
+    // so peers stop seeing this user frozen inside files they're no
+    // longer editing. Then re-affirm name + color on the current
+    // session — the binding will populate the cursor field on the next
+    // editor selection update.
     for (const [otherPath, otherSession] of this.sessions.entries()) {
       if (otherPath === file.path) continue;
       try {
@@ -607,7 +580,7 @@ export default class CollabPlugin extends Plugin {
       color: this.settings.userColor,
     });
 
-    console.log(`${tag}: bound yCollab to editor (room=${targetRoom})`);
+    console.log(`${tag}: bound collab binding to editor (room=${targetRoom})`);
   }
 
   private async createSession(file: TFile): Promise<FileSession> {
