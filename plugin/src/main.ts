@@ -511,13 +511,40 @@ export default class CollabPlugin extends Plugin {
     });
     const collabExtension = [debugListener, yCollab(session.ytext, session.provider.awareness)];
 
-    // Reconfigure the per-plugin compartment for THIS editor view. The
-    // compartment was installed via this.registerEditorExtension on
-    // plugin load, so every editor already has a slot for it. Dispatching
-    // `reconfigure` on a specific view updates only that view's slot.
+    // CRITICAL: CodeMirror identifies ViewPlugins by reference. yCollab
+    // re-exports the same `ySync` ViewPlugin spec every call, so a plain
+    // `compartment.reconfigure(yCollab(newYtext, ...))` REUSES the old
+    // ySync instance — its `this.conf` keeps pointing at the previous
+    // file's Y.Text, and the editor stays wired to the wrong CRDT.
+    //
+    // To force a clean lifecycle we dispatch the reconfigure in two
+    // hops: first clear the compartment to [], which calls ySync.destroy
+    // (unobserving the old Y.Text), then install the new yCollab, which
+    // runs ySync.constructor fresh with the new facet value.
+    editorView.dispatch({
+      effects: this.editorCompartment.reconfigure([]),
+    });
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure(collabExtension),
     });
+
+    // After yCollab attaches, the editor and Y.Text content can still
+    // differ — yCollab does NOT auto-sync them on construction. If the
+    // file on disk drifted from the Y.Text (e.g., a peer wrote ahead
+    // while this client was offline, or Obsidian re-read disk after
+    // we already had a session), force the editor to match Y.Text now.
+    // The Y.Text is the authoritative shared state for collaborators.
+    const ytextContent = session.ytext.toString();
+    const editorContent = editorView.state.doc.toString();
+    if (ytextContent !== editorContent) {
+      editorView.dispatch({
+        changes: { from: 0, to: editorView.state.doc.length, insert: ytextContent },
+      });
+      console.log(
+        `${tag}: replaced editor doc (${editorContent.length} chars) with Y.Text (${ytextContent.length} chars)`,
+      );
+    }
+
     console.log(`${tag}: bound yCollab to editor (room=${targetRoom})`);
   }
 

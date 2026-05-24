@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.6 — 2026-05-24
+
+### Fixed
+- **yCollab is now actually re-bound when you switch files in the same pane.** CodeMirror identifies ViewPlugins by reference, and y-codemirror.next exports the same `ySync` instance every time, so `compartment.reconfigure(yCollab(newYtext, ...))` was reusing the old `ySync` — its cached `this.conf` (containing the *previous* file's Y.Text) survived the reconfigure. The result: typing in shared.md after opening it on top of Хуй утки.md forwarded edits into Хуй утки's Y.Text, and Хуй утки's remote updates were applied to the visible shared.md editor. To force a fresh lifecycle we now dispatch the reconfigure in two hops — `compartment.reconfigure([])` first (which triggers `ySync.destroy()` and unobserves the old Y.Text), then `compartment.reconfigure(yCollab(...))`, which re-runs `ySync.constructor` against the new facet.
+- **Editor doc is force-synced to Y.Text on attach.** yCollab does not reconcile editor and Y.Text on construction — if disk content drifted from the shared Y.Text (peer typed while we were offline, or Obsidian re-read the file), they stayed inconsistent. The plugin now treats Y.Text as authoritative and rewrites the editor doc to match it after attaching, with a log line stating the size change.
+
 ## 0.5.5 — 2026-05-24
 
 ### Fixed
