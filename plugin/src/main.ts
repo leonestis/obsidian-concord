@@ -12,7 +12,13 @@ import {
 } from "obsidian";
 import { Compartment } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { yCollab } from "y-codemirror.next";
+import {
+  yCollab,
+  ySync,
+  ySyncFacet,
+  YSyncConfig,
+  yRemoteSelections,
+} from "y-codemirror.next";
 import { HocuspocusProvider, HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { removeAwarenessStates } from "y-protocols/awareness";
 import { IndexeddbPersistence } from "y-indexeddb";
@@ -543,6 +549,62 @@ export default class CollabPlugin extends Plugin {
     // happen.
     editorView.dispatch({
       effects: this.editorCompartment.reconfigure(collabExtension),
+    });
+
+    // CodeMirror identifies ViewPlugins by reference. y-codemirror.next
+    // exports the SAME `ySync` and `yRemoteSelections` instances every
+    // yCollab() call, so even after our reconfigure([]) → reconfigure(yCollab)
+    // dance CM6 sometimes reuses the previous plugin instance — and its
+    // constructor-cached `this.conf` still points at the previous file's
+    // Y.Text and awareness. The result: typing in file B forwards into
+    // file A's Y.Text, and remote cursors on A end up on B's editor.
+    // We can't change library internals, so we reach into the live
+    // instances and rewire their observers + conf in-place.
+    const newConf = editorView.state.facet(ySyncFacet) as YSyncConfig | undefined;
+    if (newConf) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const syncInst = editorView.plugin(ySync) as any;
+      if (syncInst && syncInst.conf !== newConf) {
+        try {
+          syncInst._ytext?.unobserve?.(syncInst._observer);
+        } catch (err) {
+          console.warn(`${tag}: failed to unobserve old ySync ytext`, err);
+        }
+        syncInst.conf = newConf;
+        syncInst._ytext = newConf.ytext;
+        newConf.ytext.observe(syncInst._observer);
+        console.log(`${tag}: force-reset ySync internal state to room=${targetRoom}`);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const selInst = editorView.plugin(yRemoteSelections) as any;
+      if (selInst && selInst.conf !== newConf) {
+        try {
+          selInst._awareness?.off?.("change", selInst._listener);
+        } catch (err) {
+          console.warn(`${tag}: failed to unbind old awareness listener`, err);
+        }
+        selInst.conf = newConf;
+        selInst._awareness = newConf.awareness;
+        newConf.awareness.on("change", selInst._listener);
+        console.log(`${tag}: force-reset yRemoteSelections to current awareness`);
+      }
+    }
+
+    // Awareness handoff: clear user state on every other open session so
+    // peers stop seeing this user "frozen" inside files they're no longer
+    // editing. Then re-affirm user info on the current session so the
+    // cursor that's about to appear here has a name and color.
+    for (const [otherPath, otherSession] of this.sessions.entries()) {
+      if (otherPath === file.path) continue;
+      try {
+        otherSession.provider.awareness?.setLocalState(null);
+      } catch (err) {
+        console.warn(`${tag}: failed to clear awareness on ${otherPath}`, err);
+      }
+    }
+    session.provider.awareness?.setLocalStateField("user", {
+      name: this.settings.userName,
+      color: this.settings.userColor,
     });
 
     console.log(`${tag}: bound yCollab to editor (room=${targetRoom})`);

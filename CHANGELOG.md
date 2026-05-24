@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.5.8 — 2026-05-24
+
+### Fixed
+- **Switching files no longer wires the editor to the previous file's CRDT.** CodeMirror identifies ViewPlugins by reference, and `y-codemirror.next` re-exports the same `ySync` and `yRemoteSelections` instances on every `yCollab()` call. So even after our two-step `reconfigure([])` → `reconfigure(yCollab)` dance, CM6 could reuse the previous ViewPlugin instances — their constructor-cached `this.conf` kept pointing at the old file's Y.Text and awareness. Typing in file B then forwarded edits into file A's Y.Text, and A's remote cursors landed in B's editor. To work around it we reach into the live instances after the reconfigure dispatches and rewire `this.conf`, the Y.Text observer, and the awareness `change` listener to the current file's facet.
+- **Awareness handoff on file switch.** When a user moved from file A to file B, their cursor in A stayed frozen at its last position for every peer still on A. We now clear local awareness on every other open session in `attachFile`, and re-affirm the user's name + color on the session for the active file, so peers see the user actually leave A and appear on B.
+
 ## 0.5.7 — 2026-05-24
 
 ### Fixed
