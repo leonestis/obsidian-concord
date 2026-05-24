@@ -23,7 +23,7 @@ import { createCollabBinding } from "./collab-binding";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.6.4";
+const PLUGIN_VERSION = "0.6.5";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -267,7 +267,7 @@ export default class CollabPlugin extends Plugin {
   // ViewPlugin never received editor `update` calls — local edits went to
   // disk via Obsidian's auto-save but never reached the CRDT, so remote
   // peers saw nothing and never sent their cursors back.
-  private editorCompartment = new Compartment();
+  private readonly editorCompartment = new Compartment();
 
   // Vault manifest — single shared Y.Doc tracking which paths exist in the vault.
   // Holds three maps:
@@ -417,8 +417,14 @@ export default class CollabPlugin extends Plugin {
     // The editorCompartment we installed via registerEditorExtension is
     // automatically removed by Obsidian when the plugin unloads — we
     // just need to tear down our Y.Doc state.
-    this.stopVaultSync();
-    for (const session of this.sessions.values()) this.destroySession(session);
+    await this.stopVaultSync();
+    // Sequential awaits — each destroySession awaits its persistence
+    // flush before tearing down the Y.Doc. Parallel awaits would still
+    // be safe (each session is independent), but sequential keeps log
+    // output ordered and CPU bounded.
+    for (const session of this.sessions.values()) {
+      await this.destroySession(session);
+    }
     this.sessions.clear();
     this.socket?.destroy();
     this.socket = null;
@@ -525,9 +531,11 @@ export default class CollabPlugin extends Plugin {
     }
   }
 
-  private reconnect() {
-    this.stopVaultSync();
-    for (const session of this.sessions.values()) this.destroySession(session);
+  private async reconnect() {
+    await this.stopVaultSync();
+    for (const session of this.sessions.values()) {
+      await this.destroySession(session);
+    }
     this.sessions.clear();
     this.socket?.destroy();
     this.socket = null;
@@ -618,7 +626,13 @@ export default class CollabPlugin extends Plugin {
 
   private async attachFile(file: TFile) {
     const tag = `[collab] attachFile(${file.path})`;
-    if (!this.socket) {
+    // Capture the socket reference now. If reconnect() runs while we
+    // sit inside an await later, `this.socket` gets nulled and
+    // replaced; our captured `socket` is the one the session and the
+    // editor binding will use, and reading `this.socket!` from inside
+    // createSession would otherwise race.
+    const socket = this.socket;
+    if (!socket) {
       this.debug(`${tag}: no socket, skipping`);
       return;
     }
@@ -643,7 +657,7 @@ export default class CollabPlugin extends Plugin {
       if (existing) {
         session = await existing;
       } else {
-        const creating = this.createSession(file);
+        const creating = this.createSession(file, socket);
         this.attachInFlight.set(file.path, creating);
         try {
           session = await creating;
@@ -664,7 +678,7 @@ export default class CollabPlugin extends Plugin {
           new Promise<void>((resolve) => setTimeout(resolve, 4000)),
         ]);
       } catch (err) {
-        console.warn(`${tag}: sync-before-bind raced an error`, err);
+        console.warn(`${tag}: sync-before-bind errored`, err);
       }
       this.debug(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
 
@@ -746,13 +760,22 @@ export default class CollabPlugin extends Plugin {
     });
   }
 
-  private async createSession(file: TFile): Promise<FileSession> {
+  private async createSession(
+    file: TFile,
+    socket: HocuspocusProviderWebsocket,
+  ): Promise<FileSession> {
+    // Socket is passed in explicitly rather than read from `this.socket`
+    // at use-time — by the time createSession runs we may already have
+    // gone through a reconnect that nulled the field. The caller
+    // (attachFile) captures `this.socket` at entry, before any await,
+    // so the binding here always uses the same socket instance the
+    // caller saw.
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText("content");
     const room = pathToRoom(file.path);
 
     const provider = new HocuspocusProvider({
-      websocketProvider: this.socket!,
+      websocketProvider: socket,
       name: room,
       document: ydoc,
       token: this.settings.authToken || undefined,
@@ -874,7 +897,7 @@ export default class CollabPlugin extends Plugin {
     return session;
   }
 
-  private destroySession(session: FileSession) {
+  private async destroySession(session: FileSession) {
     // Flip the destroyed flag first so any disk-sync timer that fires
     // between now and clearTimeout below bails out at its first check.
     session.destroyed = true;
@@ -893,7 +916,13 @@ export default class CollabPlugin extends Plugin {
       }
     }
     session.observers.length = 0;
-    void session.persistence.destroy();
+    // Await persistence destroy BEFORE the Y.Doc destroy so a final
+    // IndexedDB flush isn't writing into an already-torn-down doc.
+    try {
+      await session.persistence.destroy();
+    } catch (err) {
+      console.warn("[collab] persistence destroy failed", err);
+    }
     try {
       // Tell peers we're gone — prevents lingering ghost cursors.
       if (session.provider.awareness) {
@@ -911,11 +940,11 @@ export default class CollabPlugin extends Plugin {
     session.ydoc.destroy();
   }
 
-  private onRename(file: TAbstractFile, oldPath: string) {
+  private async onRename(file: TAbstractFile, oldPath: string) {
     const session = this.sessions.get(oldPath);
     if (!session) return;
-    this.destroySession(session);
     this.sessions.delete(oldPath);
+    await this.destroySession(session);
     if (file instanceof TFile && file.extension === "md") void this.attachFile(file);
   }
 
@@ -946,6 +975,20 @@ export default class CollabPlugin extends Plugin {
       console.log(`[collab] manifest synced (${this.manifestMap?.size ?? 0} entries)`);
       void this.reconcileManifest();
     });
+    // Surface auth failures for the manifest connection too — the
+    // per-file providers already had this handler, the manifest was
+    // missing it. Without it a JWT-rejected manifest provider stays
+    // silent in the log and the user never finds out their structure-
+    // sync is dead.
+    this.manifestProvider.on(
+      "authenticationFailed",
+      (data: { reason: string }) => {
+        console.error(`[collab] manifest auth failed: ${data.reason}`);
+        new Notice(
+          "Collab: server rejected the manifest connection (auth). Vault structure won't sync until you fix the token.",
+        );
+      },
+    );
 
     this.manifestMapObserver = (event) => this.onManifestChange(event);
     this.manifestMap.observe(this.manifestMapObserver);
@@ -954,8 +997,10 @@ export default class CollabPlugin extends Plugin {
     this.manifestBinaries.observe(this.manifestBinariesObserver);
   }
 
-  private stopVaultSync() {
-    for (const path of Array.from(this.structuralSessions.keys())) this.closeStructuralSession(path);
+  private async stopVaultSync() {
+    for (const path of Array.from(this.structuralSessions.keys())) {
+      await this.closeStructuralSession(path);
+    }
     // Unobserve before destroying the Y.Doc so the listeners can't
     // briefly fire on a torn-down doc / hold the closures alive.
     if (this.manifestMap && this.manifestMapObserver) {
@@ -1005,21 +1050,35 @@ export default class CollabPlugin extends Plugin {
       await this.materialise(path, entry);
     }
 
-    // Local → manifest (for anything not yet registered)
+    // Local → manifest (for anything not yet registered). Processed in
+    // batches with an event-loop yield between batches: a 10 000-file
+    // vault would otherwise sit inside a single Y.Doc transaction for
+    // hundreds of milliseconds, freezing Obsidian and producing one
+    // gigantic update message every peer has to download.
     const newBinaries: TFile[] = [];
     const newStructural: Array<{ file: TFile; kind: "canvas" | "text" }> = [];
-    this.manifestYDoc.transact(() => {
-      for (const file of allLocal) {
-        if (this.manifestMap!.has(file.path)) continue;
-        const kind = this.classify(file);
-        if (!kind) continue;
-        this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
-        if (kind === "binary" && file instanceof TFile) newBinaries.push(file);
-        if ((kind === "canvas" || kind === "text") && file instanceof TFile) {
-          newStructural.push({ file, kind });
+    const CHUNK = 200;
+    for (let i = 0; i < allLocal.length; i += CHUNK) {
+      const slice = allLocal.slice(i, i + CHUNK);
+      this.manifestYDoc.transact(() => {
+        for (const file of slice) {
+          if (this.manifestMap!.has(file.path)) continue;
+          const kind = this.classify(file);
+          if (!kind) continue;
+          this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
+          if (kind === "binary" && file instanceof TFile) newBinaries.push(file);
+          if ((kind === "canvas" || kind === "text") && file instanceof TFile) {
+            newStructural.push({ file, kind });
+          }
         }
+      });
+      // Yield between batches so the UI thread can paint, handle
+      // keypresses, and so any peer receiving our updates can apply
+      // them incrementally.
+      if (i + CHUNK < allLocal.length) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
-    });
+    }
     for (const f of newBinaries) void this.uploadBinary(f);
     for (const s of newStructural) this.openStructuralSession(s.file.path, s.kind);
 
@@ -1336,18 +1395,24 @@ export default class CollabPlugin extends Plugin {
     this.debug(`[collab] opened atomic session for ${path}`);
   }
 
-  private closeStructuralSession(path: string) {
+  private async closeStructuralSession(path: string) {
     const session = this.structuralSessions.get(path);
     if (!session) return;
+    this.structuralSessions.delete(path);
     if (session.kind === "canvas") {
       session.deepObserver();
     } else {
       session.doc.unobserve(session.observer);
     }
-    void session.persistence.destroy();
+    // Await persistence destroy before the Y.Doc destroy so any
+    // pending IndexedDB flush isn't writing into a torn-down doc.
+    try {
+      await session.persistence.destroy();
+    } catch (err) {
+      console.warn(`[collab] structural persistence destroy failed for ${path}`, err);
+    }
     session.provider.destroy();
     session.ydoc.destroy();
-    this.structuralSessions.delete(path);
   }
 
   private async writeStructuralFile(path: string, content: string) {
@@ -1479,12 +1544,24 @@ export default class CollabPlugin extends Plugin {
     }
     try {
       const raw = await this.app.vault.read(file);
-      const next = JSON.stringify(this.safeParseCanvas(raw, file.path), null, "\t");
-      if (next === session.lastSerialized) return;
+      // Parse once. The previous version called safeParseCanvas twice
+      // for the same `raw` and compared a freshly stringified parse
+      // with the session's lastSerialized snapshot — but `lastSerialized`
+      // is produced by `buildCanvasJsonFromY` with sorted keys, while
+      // the freshly-parsed JSON retains whatever key order disk had.
+      // The string comparison therefore mis-identified equivalent
+      // canvases as different and ran a redundant diff every save.
+      // `applyCanvasJsonToY` is idempotent (diffApplyMap compares
+      // per-value with JSON.stringify), so we just always apply and
+      // let it short-circuit field by field.
       const parsed = this.safeParseCanvas(raw, file.path);
       if (!parsed) return;
       this.applyCanvasJsonToY(parsed, session);
-      session.lastSerialized = JSON.stringify(this.buildCanvasJsonFromY(session), null, "\t");
+      session.lastSerialized = JSON.stringify(
+        this.buildCanvasJsonFromY(session),
+        null,
+        "\t",
+      );
     } catch (err) {
       console.warn("[collab] canvas read-from-disk failed", file.path, err);
     }
@@ -1569,7 +1646,12 @@ export default class CollabPlugin extends Plugin {
     const entry = this.manifestMap.get(file.path);
     if (!entry) return;
     // Tear down any structural session before forgetting the path.
-    if (entry.kind === "canvas" || entry.kind === "text") this.closeStructuralSession(file.path);
+    // The close is async (awaits IndexedDB destroy), but we don't
+    // need to wait — subsequent code only touches the manifest, not
+    // the structural session.
+    if (entry.kind === "canvas" || entry.kind === "text") {
+      void this.closeStructuralSession(file.path);
+    }
     // Move into trash with a UUID so the original path can later be reused
     // for a new file without clobbering the soft-deleted copy.
     const uuid = (globalThis.crypto?.randomUUID?.()) ?? `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1596,8 +1678,12 @@ export default class CollabPlugin extends Plugin {
     const kind = this.classify(file);
     if (!kind) return;
     // If a structural session was watching the old path, move it.
+    // Close is async; we kick off the new session immediately so the
+    // user doesn't see a sync gap, and rely on closeStructuralSession's
+    // earlier `delete(path)` to make sure we're not handing the same
+    // path to two simultaneous sessions.
     if (kind === "canvas" || kind === "text") {
-      this.closeStructuralSession(oldPath);
+      void this.closeStructuralSession(oldPath);
       this.openStructuralSession(file.path, kind);
     }
     // Group delete + set in one transaction so peers can recognise this as
@@ -1726,8 +1812,11 @@ export default class CollabPlugin extends Plugin {
   private onDelete(file: TAbstractFile) {
     const session = this.sessions.get(file.path);
     if (!session) return;
-    this.destroySession(session);
     this.sessions.delete(file.path);
+    // destroySession is now async (awaits IndexedDB destroy); we
+    // don't need to block the Obsidian event handler on it, so
+    // fire-and-forget. The session is already out of `this.sessions`.
+    void this.destroySession(session);
   }
 
   // ── status bar ─────────────────────────────────────────────────────────────

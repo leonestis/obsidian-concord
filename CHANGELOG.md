@@ -2,6 +2,23 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.5 — 2026-05-24
+
+Mops up the residual items the 0.6.3 changelog tagged "follow-up".
+
+### Fixed
+- **Persistence destroy now sequential.** `destroySession` and `closeStructuralSession` previously did `void session.persistence.destroy()` then immediately `session.ydoc.destroy()`. `IndexeddbPersistence.destroy()` is async — a flush in progress could end up writing into an already-torn-down doc. Both methods are now `async` and `await` the persistence cleanup before destroying the provider and the Y.Doc. All callers (`onunload`, `reconnect`, `onRename`, `onDelete`, `stopVaultSync`, `onLocalVault{Delete,Rename}`) updated to await or fire-and-forget as appropriate.
+- **`attachFile` socket race.** Captured `this.socket` into a local at function entry. `createSession` now takes the socket as an explicit parameter rather than reading `this.socket!` inside its async body, so a reconnect that nulls `this.socket` mid-flight no longer leaves a half-constructed session pointing at a dead reference.
+- **`reconcileManifest` blocks the UI on large vaults.** A 10 000-file vault used to sit in one giant `Y.Doc.transact` populating the manifest, freezing Obsidian for hundreds of ms and producing one massive update message every peer had to replay. Local→manifest registration is now batched 200 files per transact, with `await setTimeout(0)` between batches so the UI thread can paint and peers can apply updates incrementally.
+- **Canvas `updateCanvasFromDisk` ran a redundant diff every save.** It compared the freshly-parsed disk JSON (in disk's key order) to `lastSerialized` (in our sorted-key order) as strings — they always differed even for identical canvases. Removed the (broken) fast-path comparison; `applyCanvasJsonToY` was already idempotent via `diffApplyMap`'s per-value `JSON.stringify` compare, so the diff short-circuits field by field anyway. Also fixed: parse the raw JSON once instead of twice.
+
+### Added
+- **`authenticationFailed` handler on the manifest provider.** Per-file providers had this; the manifest provider didn't, so a JWT-rejected manifest stayed silent in the log and the user never found out structure-sync was dead. Now logs an error and shows a `Notice`.
+
+### Minor
+- `editorCompartment` marked `readonly`.
+- Typo in `attachFile` log: "raced an error" → "errored".
+
 ## 0.6.4 — 2026-05-24
 
 Wraps up the follow-ups listed at the end of 0.6.3 plus an admin-side validation fix.
