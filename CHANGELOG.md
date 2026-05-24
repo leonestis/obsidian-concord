@@ -2,6 +2,21 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.6.4 — 2026-05-24
+
+Wraps up the follow-ups listed at the end of 0.6.3 plus an admin-side validation fix.
+
+### Added
+- **`Debug logging` toggle in settings.** Off by default. When off, the verbose per-keystroke / per-event lines (`[collab] ytext …`, `[collab] editor … changed`, `[collab] reconcile: created …`, `[collab] remote rename/delete/create`, `[collab] disk-sync …`, every `attachFile` step, every binding bind, etc.) are silent. Errors, warnings, the diagnostic command output, plugin-load/unload markers, socket status, manifest-synced and reconcile-complete summaries stay on always. The motivation: those debug lines contain literal note content, and they'd leak into the dev console during a screen-share.
+
+### Fixed
+- **`remoteApplyPaths` race**. The set-based suppression flag could be cleared by one flow while another still needed it set — e.g. our 300 ms disk-sync write and a remote rename touching the same path within the same `SUPPRESS_HOLD_MS` window. Replaced with a refcount `Map<path, number>`; `add(path)` increments and the matching `delete(path)` decrements — only when the count reaches 0 does `has(path)` become false. The 20+ call sites are unchanged: an `add` / `delete` / `has` shim preserves the old API while the underlying storage is a `Map`.
+- **Redundant binary uploads.** `uploadBinary` rewrote the full bytes into the manifest even when nothing had actually changed. Each rewrite broadcast a fresh full-content `Y.Map.set` to every peer, which rewrote the file on disk, which fired a `modify` event, which called `uploadBinary` again — a stable cycle whenever any tool touched a binary file's mtime. We now byte-compare against the existing value and skip the write if equal.
+- **`gen-token` accepts malformed `expiresIn`.** A common mistake: passing `365` (intended as days) is silently treated by `jsonwebtoken` as 365 *seconds* — about six minutes. The script now validates `expiresIn` against `/^\d+(ms|s|m|h|d|w|y)?$/i` up front and refuses to sign on garbage input.
+
+### Notes
+- `purgeOldTrash` already removes the corresponding `binaryData["trash:UUID"]` entries in the same transact block (line ~996); the 0.6.3 changelog flagged this as a follow-up but the code review was mistaken — it was already correct.
+
 ## 0.6.3 — 2026-05-24
 
 A hardening pass driven by a code review of the whole client + server. The plugin acquired a lot of guard-on-top-of-guard layers across 0.5.x; this release strips out the genuinely faulty patterns and replaces them with proper machinery.

@@ -23,6 +23,19 @@ if (!secret) {
   process.exit(2);
 }
 
+// jsonwebtoken accepts `expiresIn` as either a bare number (seconds) or
+// a string in `1s | 2m | 3h | 4d | 5w | 6y` form. If you pass it the
+// string "365", it silently treats it as 365 *seconds* — about six
+// minutes — which has caught people before. Validate up front so we
+// never sign a token that expires the same hour it was minted.
+const validExpiresIn = /^\d+(ms|s|m|h|d|w|y)?$/i;
+if (!validExpiresIn.test(expiresIn)) {
+  console.error(
+    `invalid expiresIn "${expiresIn}". Use a number followed by a unit (s|m|h|d|w|y), e.g. 90d, 12h, 30s.`,
+  );
+  process.exit(2);
+}
+
 const token = jwt.sign({ name }, secret, { expiresIn } as jwt.SignOptions);
 
 console.log(token);

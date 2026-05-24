@@ -23,7 +23,7 @@ import { createCollabBinding } from "./collab-binding";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.6.3";
+const PLUGIN_VERSION = "0.6.4";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -35,6 +35,13 @@ interface CollabSettings {
   userName: string;
   userColor: string;
   autoConnect: boolean;
+  // When true, every Y.Text delta, every editor docChanged, every
+  // manifest reconcile step, every remote create/delete/rename, etc.
+  // is printed to the dev console. Off by default — those lines
+  // contain the actual content of the user's notes, and they leak it
+  // into the console where a screen-share could expose them. Errors,
+  // warnings, and socket/handshake events are always logged.
+  debugLogging: boolean;
 }
 
 const DEFAULT_SETTINGS: CollabSettings = {
@@ -43,6 +50,7 @@ const DEFAULT_SETTINGS: CollabSettings = {
   userName: "",
   userColor: "",
   autoConnect: true,
+  debugLogging: false,
 };
 
 // Pleasant palette for auto-assigning a color when the user hasn't picked one.
@@ -187,6 +195,17 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return ab;
 }
 
+// Equality check for Uint8Array contents (no native deep-equal in
+// JS, and TypedArrays do reference equality with ===).
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 // Wait until a HocuspocusProvider has completed its first sync with the
 // server (or until `timeoutMs` elapses). Resolves immediately if the
 // provider already reports synced. Used so we never bind yCollab to an
@@ -277,10 +296,42 @@ export default class CollabPlugin extends Plugin {
   // whole-file variant. Both keyed by vault-relative file path.
   private structuralSessions = new Map<string, StructuralSession>();
 
-  // Paths currently being applied from a remote manifest change. The local
-  // vault event handlers skip these so we don't echo the change back into the
-  // manifest (which would loop forever).
-  private remoteApplyPaths = new Set<string>();
+  // Refcounted suppression of "I just dispatched this change, the
+  // resulting event isn't a user edit, ignore it". A plain Set<string>
+  // would race: two concurrent flows both suppressing the same path
+  // would conflict on cleanup — the first finishing would `delete`
+  // the flag the second still wanted set. The Map holds an integer
+  // refcount per path; `suppress(path)` returns a `release()` fn
+  // whose decrement clears the entry only when it reaches zero.
+  private remoteApplyPathCounts = new Map<string, number>();
+
+  // Backwards-compatible legacy API used at every call site in
+  // attachFile, the disk-sync timer, applyRemote{Create,Delete,Rename},
+  // the binary observer, etc. We expose `add`/`delete`/`has` so we
+  // didn't have to refactor twenty-plus call sites; internally they
+  // increment / decrement the Map. Each `add(path)` MUST be paired
+  // with exactly one `delete(path)` later (otherwise the path stays
+  // suppressed forever) — every call site already does that via
+  // `setTimeout(..., SUPPRESS_HOLD_MS)`, just on a Set instead of
+  // a Map. `has` returns true iff the path's current count > 0.
+  private remoteApplyPaths = {
+    add: (path: string) => {
+      this.remoteApplyPathCounts.set(
+        path,
+        (this.remoteApplyPathCounts.get(path) ?? 0) + 1,
+      );
+    },
+    delete: (path: string) => {
+      const next = (this.remoteApplyPathCounts.get(path) ?? 0) - 1;
+      if (next <= 0) this.remoteApplyPathCounts.delete(path);
+      else this.remoteApplyPathCounts.set(path, next);
+    },
+    has: (path: string): boolean =>
+      (this.remoteApplyPathCounts.get(path) ?? 0) > 0,
+    clear: () => {
+      this.remoteApplyPathCounts.clear();
+    },
+  };
 
   // In-flight createSession promises keyed by file path. Coalesces
   // concurrent attachFile calls for the same file — without this,
@@ -379,6 +430,14 @@ export default class CollabPlugin extends Plugin {
     if (!this.settings.userName) this.settings.userName = randomName();
     if (!this.settings.userColor) this.settings.userColor = colorFromName(this.settings.userName);
     await this.saveSettings();
+  }
+
+  // Gated console.log. Only fires when the user has explicitly turned
+  // on `Debug logging` in settings — otherwise we'd spew every keystroke
+  // (and the content of every note touched) into the dev console, which
+  // is awkward during screen-shares. Errors and warnings stay un-gated.
+  private debug(...args: unknown[]) {
+    if (this.settings?.debugLogging) console.log(...args);
   }
 
   async saveSettings() {
@@ -516,7 +575,7 @@ export default class CollabPlugin extends Plugin {
 
     const debugListener = EditorView.updateListener.of((update) => {
       if (!update.docChanged) return;
-      console.log(
+      this.debug(
         `[collab] editor ${file.path} changed: new length=${update.state.doc.length}`,
       );
     });
@@ -544,7 +603,7 @@ export default class CollabPlugin extends Plugin {
           insert: ytextContent,
         },
       });
-      console.log(
+      this.debug(
         `${tag}: pre-sync editor (${editorContent.length} chars) → Y.Text (${ytextContent.length} chars)`,
       );
     }
@@ -553,14 +612,14 @@ export default class CollabPlugin extends Plugin {
       effects: this.editorCompartment.reconfigure(collabExtension),
     });
 
-    console.log(`${tag}: bound collab binding to editor (room=${targetRoom})`);
+    this.debug(`${tag}: bound collab binding to editor (room=${targetRoom})`);
     return true;
   }
 
   private async attachFile(file: TFile) {
     const tag = `[collab] attachFile(${file.path})`;
     if (!this.socket) {
-      console.log(`${tag}: no socket, skipping`);
+      this.debug(`${tag}: no socket, skipping`);
       return;
     }
 
@@ -607,7 +666,7 @@ export default class CollabPlugin extends Plugin {
       } catch (err) {
         console.warn(`${tag}: sync-before-bind raced an error`, err);
       }
-      console.log(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
+      this.debug(`${tag}: post-wait, ytext.length=${session.ytext.length}`);
 
       // Seed Y.Text from disk only if we BOTH know Y.Text is genuinely
       // empty AND we believe the server is reachable (provider is
@@ -621,7 +680,7 @@ export default class CollabPlugin extends Plugin {
           const diskContent = await this.app.vault.read(file);
           if (diskContent.length > 0) {
             session.ytext.insert(0, diskContent);
-            console.log(`${tag}: seeded ${diskContent.length} chars from disk`);
+            this.debug(`${tag}: seeded ${diskContent.length} chars from disk`);
           }
         } catch (err) {
           console.warn(`${tag}: disk-seed failed`, err);
@@ -638,7 +697,7 @@ export default class CollabPlugin extends Plugin {
     // event has its own attachFile in flight — let it own the
     // binding. Avoids clobber races.
     if (!isLatest()) {
-      console.log(`${tag}: a newer attach for the same path superseded us, bailing`);
+      this.debug(`${tag}: a newer attach for the same path superseded us, bailing`);
       return;
     }
 
@@ -657,12 +716,12 @@ export default class CollabPlugin extends Plugin {
     // overwrite the user's edits with whatever Y.Text held.
     const editorViews = this.editorsForPath(file.path);
     if (editorViews.length === 0) {
-      console.log(`${tag}: no editor view for this file open right now, will rebind on next file-open`);
+      this.debug(`${tag}: no editor view for this file open right now, will rebind on next file-open`);
       return;
     }
     for (const editorView of editorViews) {
       if (!isLatest()) {
-        console.log(`${tag}: superseded mid-dispatch, aborting remaining panes`);
+        this.debug(`${tag}: superseded mid-dispatch, aborting remaining panes`);
         return;
       }
       this.bindCollabTo(editorView, session, awareness, file, targetRoom);
@@ -708,10 +767,10 @@ export default class CollabPlugin extends Plugin {
     provider.attach();
 
     provider.on("status", (event: { status: string }) => {
-      console.log(`[collab] room "${room}" status: ${event.status}`);
+      this.debug(`[collab] room "${room}" status: ${event.status}`);
     });
     provider.on("synced", () => {
-      console.log(`[collab] room "${room}" synced`);
+      this.debug(`[collab] room "${room}" synced`);
     });
     provider.on("authenticationFailed", (data: { reason: string }) => {
       console.error(`[collab] room "${room}" auth failed: ${data.reason}`);
@@ -729,7 +788,7 @@ export default class CollabPlugin extends Plugin {
     const persistenceKey = `obsidian-collab::${this.settings.serverUrl}::${room}`;
     const persistence = new IndexeddbPersistence(persistenceKey, ydoc);
     persistence.on("synced", () => {
-      console.log(`[collab] local cache loaded for ${room}`);
+      this.debug(`[collab] local cache loaded for ${room}`);
     });
 
     // (Seeding from disk now lives in attachFile, which awaits cache + server
@@ -760,7 +819,7 @@ export default class CollabPlugin extends Plugin {
           return "?";
         })
         .join(" ");
-      console.log(`[collab] ytext ${room} ${kind}: ${delta} (length now ${ytext.length})`);
+      this.debug(`[collab] ytext ${room} ${kind}: ${delta} (length now ${ytext.length})`);
     };
     ytext.observe(debugObserver);
     session.observers.push(debugObserver);
@@ -795,7 +854,7 @@ export default class CollabPlugin extends Plugin {
           if (current === content) return;
           this.remoteApplyPaths.add(file.path);
           await this.app.vault.modify(tfile, content);
-          console.log(
+          this.debug(
             `[collab] disk-sync ${file.path}: wrote ${content.length} chars`,
           );
         } catch (err) {
@@ -1063,7 +1122,7 @@ export default class CollabPlugin extends Plugin {
       if (entry.kind === "folder") {
         if (!this.app.vault.getAbstractFileByPath(path)) {
           await this.app.vault.createFolder(path);
-          console.log(`[collab] reconcile: created folder ${path}`);
+          this.debug(`[collab] reconcile: created folder ${path}`);
         }
         return;
       }
@@ -1071,7 +1130,7 @@ export default class CollabPlugin extends Plugin {
       if (entry.kind === "file") {
         if (!this.app.vault.getAbstractFileByPath(path)) {
           await this.app.vault.create(path, "");
-          console.log(`[collab] reconcile: created file ${path}`);
+          this.debug(`[collab] reconcile: created file ${path}`);
         }
         return;
       }
@@ -1080,7 +1139,7 @@ export default class CollabPlugin extends Plugin {
         // its `synced` handler writes the merged content to disk.
         if (!this.app.vault.getAbstractFileByPath(path)) {
           await this.app.vault.create(path, entry.kind === "canvas" ? "{}" : "");
-          console.log(`[collab] reconcile: created ${entry.kind} file ${path}`);
+          this.debug(`[collab] reconcile: created ${entry.kind} file ${path}`);
         }
         this.openStructuralSession(path, entry.kind);
         return;
@@ -1090,12 +1149,12 @@ export default class CollabPlugin extends Plugin {
       if (!bytes) {
         // Either not uploaded yet or peer is offline. Skip — we'll catch the
         // bytes via the binaryData observer once they arrive.
-        console.log(`[collab] reconcile: binary ${path} has no data yet — waiting`);
+        this.debug(`[collab] reconcile: binary ${path} has no data yet — waiting`);
         return;
       }
       if (!this.app.vault.getAbstractFileByPath(path)) {
         await this.app.vault.createBinary(path, toArrayBuffer(bytes));
-        console.log(`[collab] reconcile: created binary ${path} (${bytes.byteLength} bytes)`);
+        this.debug(`[collab] reconcile: created binary ${path} (${bytes.byteLength} bytes)`);
       }
     } catch (err) {
       console.warn("[collab] materialise failed", path, err);
@@ -1199,11 +1258,11 @@ export default class CollabPlugin extends Plugin {
           console.warn("[collab] canvas initial write failed", path, err);
         }
       }
-      console.log(`[collab] canvas session "${path}" synced (nodes=${nodes.size}, edges=${edges.size})`);
+      this.debug(`[collab] canvas session "${path}" synced (nodes=${nodes.size}, edges=${edges.size})`);
     });
 
     this.structuralSessions.set(path, session);
-    console.log(`[collab] opened canvas session for ${path}`);
+    this.debug(`[collab] opened canvas session for ${path}`);
   }
 
   // Atomic text: one Y.Map cell holds the whole file content. Saves replace
@@ -1270,11 +1329,11 @@ export default class CollabPlugin extends Plugin {
           console.warn("[collab] atomic initial write failed", path, err);
         }
       }
-      console.log(`[collab] atomic session "${path}" synced (${remoteContent.length} chars)`);
+      this.debug(`[collab] atomic session "${path}" synced (${remoteContent.length} chars)`);
     });
 
     this.structuralSessions.set(path, session);
-    console.log(`[collab] opened atomic session for ${path}`);
+    this.debug(`[collab] opened atomic session for ${path}`);
   }
 
   private closeStructuralSession(path: string) {
@@ -1299,7 +1358,7 @@ export default class CollabPlugin extends Plugin {
       if (current === content) return;
       this.remoteApplyPaths.add(path);
       await this.app.vault.modify(file, content);
-      console.log(`[collab] structural → disk: ${path} (${content.length} chars)`);
+      this.debug(`[collab] structural → disk: ${path} (${content.length} chars)`);
     } catch (err) {
       console.warn("[collab] structural write failed", path, err);
     } finally {
@@ -1460,8 +1519,17 @@ export default class CollabPlugin extends Plugin {
         new Notice(`Collab: ${file.path} is too large to sync (>${Math.floor(MAX_BINARY_BYTES / 1024 / 1024)} MB)`);
         return;
       }
-      this.manifestBinaries.set(file.path, new Uint8Array(buf));
-      console.log(`[collab] uploaded binary ${file.path} (${buf.byteLength} bytes)`);
+      const next = new Uint8Array(buf);
+      // Skip the write if the bytes haven't actually changed. Without
+      // this every Obsidian "modify" event on a binary file (e.g. when
+      // a sync layer touches mtime) triggers a fresh full-content
+      // Y.Map.set, which the CRDT then broadcasts to every peer. Same
+      // bytes, but each peer rewrites the file on disk → modify event
+      // → uploadBinary again. Cheap byte-equal check breaks the loop.
+      const prev = this.manifestBinaries.get(file.path);
+      if (prev && bytesEqual(prev, next)) return;
+      this.manifestBinaries.set(file.path, next);
+      this.debug(`[collab] uploaded binary ${file.path} (${buf.byteLength} bytes)`);
     } catch (err) {
       console.warn("[collab] uploadBinary failed", file.path, err);
     }
@@ -1519,7 +1587,7 @@ export default class CollabPlugin extends Plugin {
         this.manifestBinaries!.set(`trash:${uuid}`, bytes);
       }
     });
-    console.log(`[collab] soft-deleted ${file.path} → trash:${uuid}`);
+    this.debug(`[collab] soft-deleted ${file.path} → trash:${uuid}`);
   }
 
   private onLocalVaultRename(file: TAbstractFile, oldPath: string) {
@@ -1605,11 +1673,11 @@ export default class CollabPlugin extends Plugin {
       try {
         if (local instanceof TFile) {
           await this.app.vault.modifyBinary(local, toArrayBuffer(bytes));
-          console.log(`[collab] remote binary update: ${path} (${bytes.byteLength} bytes)`);
+          this.debug(`[collab] remote binary update: ${path} (${bytes.byteLength} bytes)`);
         } else if (!local) {
           await this.ensureFolderExists(path);
           await this.app.vault.createBinary(path, toArrayBuffer(bytes));
-          console.log(`[collab] remote binary create: ${path} (${bytes.byteLength} bytes)`);
+          this.debug(`[collab] remote binary create: ${path} (${bytes.byteLength} bytes)`);
         }
       } catch (err) {
         console.warn("[collab] remote binary write failed", path, err);
@@ -1630,7 +1698,7 @@ export default class CollabPlugin extends Plugin {
     try {
       await this.ensureFolderExists(newPath);
       await this.app.fileManager.renameFile(localFile, newPath);
-      console.log(`[collab] remote rename: ${oldPath} → ${newPath}`);
+      this.debug(`[collab] remote rename: ${oldPath} → ${newPath}`);
     } catch (err) {
       console.warn("[collab] remote rename failed", oldPath, newPath, err);
     } finally {
@@ -1647,7 +1715,7 @@ export default class CollabPlugin extends Plugin {
     this.remoteApplyPaths.add(path);
     try {
       await this.app.vault.delete(localFile, true);
-      console.log(`[collab] remote delete: ${path}`);
+      this.debug(`[collab] remote delete: ${path}`);
     } catch (err) {
       console.warn("[collab] remote delete failed", path, err);
     } finally {
@@ -1794,6 +1862,18 @@ class CollabSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
             this.display(); // re-render so the picker shows the new value
           }),
+      );
+
+    new Setting(containerEl)
+      .setName("Debug logging")
+      .setDesc(
+        "Print every keystroke, every Y.Text delta and every remote event to the dev console. Useful for debugging, but the lines contain the actual content of your notes — leave off during screen-shares.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.debugLogging).onChange(async (value) => {
+          this.plugin.settings.debugLogging = value;
+          await this.plugin.saveSettings();
+        }),
       );
 
     new Setting(containerEl)
