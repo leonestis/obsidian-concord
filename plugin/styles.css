@@ -52,6 +52,47 @@
   display: none; /* the always-visible label is enough of a marker */
 }
 
+/* ─── Canvas cursor overlay ───────────────────────────────────────── */
+
+.collab-canvas-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 50;
+  overflow: hidden;
+}
+
+.collab-canvas-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  will-change: transform;
+  transition: transform 60ms linear;
+  /* the SVG inside uses currentColor for fill so we tint via color */
+}
+
+.collab-canvas-cursor svg {
+  display: block;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.collab-canvas-cursor-label {
+  position: absolute;
+  left: 18px;
+  top: 16px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #ffffff;
+  white-space: nowrap;
+  font-family: var(--font-interface, sans-serif);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+
 /* Trash modal: list of soft-deleted files with restore buttons. */
 .collab-trash-list {
   display: flex;

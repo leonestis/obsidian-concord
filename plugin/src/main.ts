@@ -17,13 +17,14 @@ import { removeAwarenessStates } from "y-protocols/awareness";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 import { createCollabBinding } from "./collab-binding";
+import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 
 // Hardcoded — must match plugin/manifest.json. We send it as a URL
 // parameter on every connection so the server can reject clients on
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.6.5";
+const PLUGIN_VERSION = "0.7.0";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -110,6 +111,9 @@ interface CanvasSession {
   lastSerialized: string;
   // Reference so we can stop observing on destroy.
   deepObserver: () => void;
+  // DOM cursor overlay + mousemove publisher for Canvas — see
+  // ./canvas-cursors.ts. Created on session open, torn down on close.
+  cursorHook: CanvasCursorHook | null;
 }
 
 interface AtomicTextSession {
@@ -1266,7 +1270,26 @@ export default class CollabPlugin extends Plugin {
       meta,
       lastSerialized: "",
       deepObserver: () => {},
+      cursorHook: null,
     };
+
+    // Publish "this is me" into the canvas session's Awareness so
+    // peers get a name + color next to our cursor when we move it.
+    provider.awareness?.setLocalStateField("user", {
+      name: this.settings.userName,
+      color: this.settings.userColor,
+    });
+
+    // Mouse-tracker + overlay for Figma-style live cursors. Idempotent
+    // — re-attaches when new canvas leaves open for this file via the
+    // internal `layout-change` listener inside attachCanvasCursors.
+    if (provider.awareness) {
+      session.cursorHook = attachCanvasCursors(
+        this.app,
+        path,
+        provider.awareness,
+      );
+    }
 
     // Y.Doc → disk: any change to nodes/edges/meta serialises the canvas
     // and (if different) writes it to disk.
@@ -1401,6 +1424,8 @@ export default class CollabPlugin extends Plugin {
     this.structuralSessions.delete(path);
     if (session.kind === "canvas") {
       session.deepObserver();
+      session.cursorHook?.destroy();
+      session.cursorHook = null;
     } else {
       session.doc.unobserve(session.observer);
     }

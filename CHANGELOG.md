@@ -2,6 +2,18 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.7.0 — 2026-05-24
+
+### Added
+- **Live cursors on Canvas (Phase 1 of full canvas realtime).** Every canvas session now publishes the local mouse position into the canvas's Yjs Awareness (throttled ~30 Hz), and renders an absolutely-positioned overlay over `.canvas-wrapper` showing every other connected user's cursor — Figma-style arrow with the user's name and color. Positions are stored in canvas WORLD coordinates so two viewers panned/zoomed differently still see the cursor at the same conceptual point in the document.
+- New `plugin/src/canvas-cursors.ts` module. Defensive against unannounced Obsidian internal API drift — falls back to manual rect/zoom/pan math if `canvas.posFromEvt` is missing on a particular build.
+- Idempotent attachment: opening the same canvas in multiple panes (or reloading the leaf) doesn't double-attach the listeners; an `data-collab-attached` marker on the wrapper guards re-entry.
+
+### Notes
+- This is Phase 1 of a planned 4-phase canvas realtime push. Subsequent releases add: (2) live selection sync — highlight nodes other users have selected; (3) live drag — see node positions update in real time as a peer drags, without waiting for Obsidian's debounced save round-trip; (4) live add / delete / edit / connect operations. Each builds on monkey-patching internal `CanvasView` / `Canvas` methods and is more fragile to Obsidian's release cycle.
+- Cursor overlay only shows up when the canvas leaf is in the foreground. Background canvas tabs don't render until you switch to them.
+- On mobile (no mouse) the publisher does nothing for now; touch / pencil tracking is a separate hook.
+
 ## 0.6.5 — 2026-05-24
 
 Mops up the residual items the 0.6.3 changelog tagged "follow-up".
