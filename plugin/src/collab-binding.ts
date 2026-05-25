@@ -102,10 +102,45 @@ export function createCollabBinding(
             }
           }
           if (changes.length === 0) return;
-          view.dispatch({
-            changes,
-            annotations: [COLLAB_SYNC.of(true)],
-          });
+
+          // Apply the delta. If the editor and ytext have drifted out
+          // of sync (e.g. an offline-merge brought in a delta whose
+          // positions reference content the editor hasn't received
+          // yet, or a previous dispatch failed), CodeMirror throws
+          // "Invalid change range". When that happens we MUST resync,
+          // not silently leave the two sides diverged — divergence is
+          // the trigger for the exponential doubling loop: each
+          // subsequent successful delta gets re-pushed by the editor
+          // as a "fresh user edit" and ytext grows uncontrollably.
+          //
+          // Resync strategy: replace the entire editor doc with the
+          // current ytext content, in a single dispatch carrying the
+          // COLLAB_SYNC annotation so the editor→Y.Text path doesn't
+          // try to echo this huge replacement back into ytext.
+          try {
+            view.dispatch({
+              changes,
+              annotations: [COLLAB_SYNC.of(true)],
+            });
+          } catch (err) {
+            console.warn(
+              "[collab] editor dispatch failed, force-resyncing editor to ytext",
+              err,
+            );
+            try {
+              const ytextStr = ytext.toString();
+              const docLen = view.state.doc.length;
+              view.dispatch({
+                changes: { from: 0, to: docLen, insert: ytextStr },
+                annotations: [COLLAB_SYNC.of(true)],
+              });
+            } catch (err2) {
+              console.error(
+                "[collab] force-resync ALSO failed; editor/ytext now permanently diverged for this session",
+                err2,
+              );
+            }
+          }
         };
         ytext.observe(this.observer);
       }

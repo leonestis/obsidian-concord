@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.9.1 — 2026-05-25
+
+### Fixed
+- **Editor↔Y.Text doubling loop after a failed remote-delta dispatch.** When two peers came online from offline edits and their Y.Text states merged, the receiving editor sometimes got a delta whose positions referenced content the editor hadn't yet caught up to. CodeMirror threw `RangeError: Invalid change range N to N (in doc of length M)`. The thrown dispatch left the editor at the OLD length and Y.Text at the NEW (merged) length — silently divergent. Every subsequent ViewUpdate then re-pushed the editor's stale content into Y.Text as a "fresh user edit", producing the same exponential text-doubling pattern the 0.5.6→0.5.7 fix had cured for a different code path. The fix now catches the RangeError from the observer-side dispatch and force-resyncs the editor by replacing its entire document with `ytext.toString()` in a single COLLAB_SYNC-annotated dispatch. Divergence is impossible to leave behind: either the patched delta lands cleanly, or the editor snaps to the authoritative Y.Text content. The "fresh user edit" loop is starved at the source.
+
 ## 0.9.0 — 2026-05-25
 
 ### Changed
