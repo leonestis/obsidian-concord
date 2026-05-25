@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { Server } from "@hocuspocus/server";
 import { SQLite } from "@hocuspocus/extension-sqlite";
@@ -9,11 +9,6 @@ const DATA_DIR = resolve(process.env.DATA_DIR ?? "./data");
 const DB_PATH = resolve(DATA_DIR, "documents.sqlite");
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 
-// Plugin versions strictly below this are rejected at the WebSocket
-// handshake. Bump it any time we ship a fix that older clients lack
-// and that could corrupt shared data if they keep writing. Older
-// clients see a connection error and a server-side log entry — they
-// cannot pollute the CRDT.
 const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION ?? "0.6.2";
 
 mkdirSync(DATA_DIR, { recursive: true });
@@ -25,9 +20,6 @@ if (!JWT_SECRET) {
 }
 console.log(`🧱 Minimum accepted client version: ${MIN_CLIENT_VERSION}`);
 
-// Tiny semver comparator: returns -1 / 0 / 1 like String.localeCompare.
-// We only care about the dotted-numeric part — pre-release suffixes are
-// ignored. Robust enough for our "is this client too old?" question.
 function compareVersions(a: string, b: string): number {
   const parts = (s: string) =>
     s
@@ -57,12 +49,42 @@ function readClientVersion(requestParameters: unknown): string {
   return "";
 }
 
+// Wraps SQLite to log every fetch / store. If `store` isn't called,
+// we'll see silence; if it is called and the file doesn't grow, the
+// problem is in better-sqlite3 or filesystem.
+const sqlite = new SQLite({ database: DB_PATH });
+const origConfig = (sqlite as any).configuration;
+const wrappedFetch = origConfig.fetch;
+const wrappedStore = origConfig.store;
+(sqlite as any).configuration = {
+  ...origConfig,
+  fetch: async (data: { documentName: string }) => {
+    try {
+      const result = await wrappedFetch(data);
+      console.log(`💾 FETCH "${data.documentName}" → ${result ? `${result.length} bytes` : "nothing"}`);
+      return result;
+    } catch (err) {
+      console.error(`💥 FETCH failed for "${data.documentName}":`, err);
+      throw err;
+    }
+  },
+  store: async (data: { documentName: string; state: Buffer }) => {
+    const before = (() => { try { return statSync(DB_PATH).size; } catch { return -1; } })();
+    try {
+      await wrappedStore(data);
+      const after = (() => { try { return statSync(DB_PATH).size; } catch { return -1; } })();
+      console.log(`💾 STORE "${data.documentName}" ${data.state.length} bytes → sqlite ${before}→${after} bytes`);
+    } catch (err) {
+      console.error(`💥 STORE failed for "${data.documentName}":`, err);
+      throw err;
+    }
+  },
+};
+
 const server = new Server({
   port: PORT,
-  extensions: [new SQLite({ database: DB_PATH })],
+  extensions: [sqlite],
 
-  // Refuse clients on versions known to corrupt the CRDT. Throwing here
-  // closes the WebSocket before any sync messages flow.
   async onConnect({ documentName, requestParameters }) {
     const clientVersion = readClientVersion(requestParameters);
     if (
@@ -82,11 +104,16 @@ const server = new Server({
     );
   },
 
-  // When JWT_SECRET is set, every client must present a valid token in the
-  // HocuspocusProvider `token` option. Verified tokens are returned as the
-  // connection context so downstream hooks can read e.g. ctx.user.name.
+  async onChange({ documentName, clientsCount, update }) {
+    console.log(`📝 CHANGE in "${documentName}" (update=${update.length}b, clients=${clientsCount})`);
+  },
+
+  async onStoreDocument({ documentName, clientsCount }) {
+    console.log(`📌 onStoreDocument hook fired: "${documentName}" (clients=${clientsCount})`);
+  },
+
   async onAuthenticate({ token }) {
-    if (!JWT_SECRET) return {}; // auth disabled
+    if (!JWT_SECRET) return {};
     if (!token) throw new Error("auth required: no token");
     try {
       const payload = jwt.verify(token, JWT_SECRET) as Record<string, unknown>;
