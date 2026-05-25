@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.8.4 — 2026-05-25
+
+### Changed
+- **Always-on diagnostic logging for vault event handlers and manifest updates.** `vault.create`, `vault.modify` and the manifest-map change observer now log unconditionally (not gated by the debug-logging setting). The 0.8.3 fix unblocked the bigger issue but a separate report came in that nothing was syncing even with manifest reported as `synced` — and the existing logs gave no signal whether local events were even firing. These new logs make it obvious in 30 seconds whether the bug is upstream (events don't fire), at our handler (suppressed / classified out), or downstream (handler ran but peer never got the manifest change). To be revisited and tightened once the underlying issue is identified.
+
 ## 0.8.3 — 2026-05-25
 
 ### Fixed

@@ -24,7 +24,7 @@ import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.8.3";
+const PLUGIN_VERSION = "0.8.4";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -1653,12 +1653,29 @@ export default class CollabPlugin extends Plugin {
   // ── local → manifest ───────────────────────────────────────────────────────
 
   private onLocalVaultCreate(file: TAbstractFile) {
-    if (!this.manifestMap) return;
-    if (this.remoteApplyPaths.has(file.path)) return;
+    // High-signal diagnostics — kept always-on (not behind debug
+    // gate) because "create event didn't reach me" is a hard bug
+    // to spot any other way. Same for modify/rename/delete below.
+    console.log(`[collab] vault.create: ${file.path}`);
+    if (!this.manifestMap) {
+      console.warn(`[collab] vault.create: manifestMap not ready, dropping ${file.path}`);
+      return;
+    }
+    if (this.remoteApplyPaths.has(file.path)) {
+      console.log(`[collab] vault.create: suppressed (remote echo) ${file.path}`);
+      return;
+    }
     const kind = this.classify(file);
-    if (!kind) return;
-    if (this.manifestMap.has(file.path)) return;
+    if (!kind) {
+      console.log(`[collab] vault.create: classified as skip ${file.path}`);
+      return;
+    }
+    if (this.manifestMap.has(file.path)) {
+      console.log(`[collab] vault.create: already in manifest ${file.path}`);
+      return;
+    }
     this.manifestMap.set(file.path, { kind, createdAt: Date.now() });
+    console.log(`[collab] vault.create: → manifest set ${file.path} (${kind})`);
     if (kind === "binary" && file instanceof TFile) void this.uploadBinary(file);
     if ((kind === "canvas" || kind === "text") && file instanceof TFile) {
       this.openStructuralSession(file.path, kind);
@@ -1727,9 +1744,13 @@ export default class CollabPlugin extends Plugin {
 
   private onLocalVaultModify(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
+    console.log(`[collab] vault.modify: ${file.path} (.${file.extension})`);
     if (file.extension === "md") return; // markdown content syncs via editor binding
     if (!this.manifestMap || !this.manifestBinaries) return;
-    if (this.remoteApplyPaths.has(file.path)) return;
+    if (this.remoteApplyPaths.has(file.path)) {
+      console.log(`[collab] vault.modify: suppressed (remote echo) ${file.path}`);
+      return;
+    }
     const kind = this.classify(file);
     if (kind === "canvas") {
       void this.updateCanvasFromDisk(file);
@@ -1759,6 +1780,17 @@ export default class CollabPlugin extends Plugin {
         if (entry) adds.push({ path: key, entry });
       }
     });
+    // Always-on telemetry — manifest changes are the primary signal
+    // that anything is moving between peers. If this never fires
+    // after a peer does an action, the manifest provider isn't
+    // broadcasting and the bug is on the wire / server / observer.
+    if (deletes.length > 0 || adds.length > 0) {
+      console.log(
+        `[collab] manifestChange: +${adds.length} -${deletes.length}` +
+          (adds.length > 0 ? ` adds=${adds.map((a) => a.path).join(",")}` : "") +
+          (deletes.length > 0 ? ` dels=${deletes.join(",")}` : ""),
+      );
+    }
 
     // Single delete + single add in one transaction is treated as a rename:
     // we move the local file, preserving its contents.
