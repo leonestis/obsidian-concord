@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.8.3 — 2026-05-25
+
+### Fixed
+- **Manifest sync silently broken by trash-key collision.** The vault-structure manifest stores raw bytes for every file under its path in `manifestBinaries`. Soft-deleted entries are kept in the same map under reserved keys of the form `trash:<uuid>` so they can be restored later. The remote-update observer was iterating ALL keys of that map, including the `trash:` ones, and feeding them straight to `vault.createBinary()` — which Obsidian rejects because `:` is illegal in vault paths. The thrown exception aborted the rest of the observer's work, so every subsequent remote binary update silently failed too. Worst-case symptom looked like "create some folders, everything stops syncing on both peers", because once a few trash entries accumulated the observer reliably threw on every manifest tick. Fix: skip any key starting with `trash:` in `onBinaryDataChange`. They're handled separately by the restore flow.
+
 ## 0.8.2 — 2026-05-25
 
 ### Fixed

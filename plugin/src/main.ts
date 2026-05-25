@@ -24,7 +24,7 @@ import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.8.2";
+const PLUGIN_VERSION = "0.8.3";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -1775,8 +1775,17 @@ export default class CollabPlugin extends Plugin {
   // re-uploaded an existing image — write the new bytes to local disk.
   private async onBinaryDataChange(event: Y.YMapEvent<Uint8Array>) {
     if (!this.manifestBinaries) return;
-    for (const [path, change] of event.changes.keys.entries()) {
+    for (const [key, change] of event.changes.keys.entries()) {
       if (change.action === "delete") continue; // delete is handled via manifestMap
+      // The manifestBinaries map is also used to hold raw bytes for
+      // soft-deleted entries under reserved keys like `trash:<uuid>`
+      // (so they can be restored later without losing data). Those
+      // keys are NOT real vault paths and must never reach
+      // createBinary — Obsidian rejects them because `:` is illegal
+      // in path names and the resulting exception used to bubble up
+      // every time the manifest synced, blocking real updates.
+      if (key.startsWith("trash:")) continue;
+      const path = key;
       const bytes = this.manifestBinaries.get(path);
       if (!bytes) continue;
       const local = this.app.vault.getAbstractFileByPath(path);
