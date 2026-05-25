@@ -1,64 +1,74 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Realtime canvas presence — Figma-style cursors + live selection + live
-// drag preview. We can't bind to Canvas the way we do to CodeMirror
-// because it's a closed custom view, so everything here happens via:
+// drag preview + marquee selection rectangles. Canvas is a closed
+// custom view so everything here happens via:
 //
-//   1. DOM listeners on `.canvas-wrapper` (mouse position, button state)
+//   1. DOM listeners on `.canvas-wrapper` for pointer + button state
 //   2. Polling of `canvas.selection` and `canvas.nodes` (no public events)
 //   3. y-protocols Awareness for low-latency broadcast
 //   4. An absolutely-positioned overlay div for remote rendering
 //
-// Everything ephemeral (cursor position, selection, "I'm currently
-// dragging node X to (px, py)") goes through Awareness rather than
-// Y.Doc — we don't want presence churn rewriting the .canvas file on
-// every frame. Permanent state (the eventual settled node position
-// after a drag ends) flows through the existing Y.Doc → JSON → disk
-// path when Obsidian saves the canvas naturally.
+// Everything ephemeral (cursor position, selection, drag-ghost,
+// marquee box) flows through Awareness rather than the Y.Doc — we
+// don't want presence churn rewriting the .canvas file on every
+// frame. Final settled state (node positions after a drag ends) goes
+// through the normal Y.Doc → JSON → disk path when Obsidian's save
+// fires.
 //
-// World vs screen coords: positions are exchanged in WORLD space (the
-// canvas's logical document coordinate system) so they survive
-// different peers' pan/zoom. We derive a screen↔world transform by
+// World vs screen: positions are exchanged in WORLD space so they
+// survive different peers' pan/zoom. Screen↔world is recovered by
 // probing `canvas.posFromEvt` at three known wrapper-local screen
-// points, which works regardless of how the canvas internals
-// represent pan/zoom.
+// points.
 //
-// Node positions (x, y, width, height) are ALREADY in world space —
-// they come straight off the canvas node objects.
+// Cursor action state mirrors the local OS cursor convention:
+//   idle    — arrow over empty canvas
+//   hover   — open hand when hovering a node
+//   drag    — closed/grabbing hand while actually moving a node
+//   marquee — arrow + a dashed selection rectangle on the canvas
 //
-// Action state on the cursor: idle / selecting / dragging. The cursor
-// SVG and a small action badge changes accordingly so peers can see
-// what their collaborators are doing, like in Figma.
-//
-// All polling intervals and thresholds are tuned for "looks live" at
-// 30 Hz while keeping per-frame work cheap.
+// Smoothing: peer cursors are interpolated toward their target
+// position every animation frame (exponential ease, ~0.25/frame),
+// rather than snapping to whichever sample the network just
+// delivered. Network samples arrive every ~33 ms throttled plus
+// jitter; raw teleporting reads as laggy / stutter even though the
+// data is timely. The lerp turns it into smooth motion.
 
 import type { App, WorkspaceLeaf } from "obsidian";
 import type { Awareness } from "y-protocols/awareness";
 
-const CURSOR_PUBLISH_MS = 33;     // ~30 Hz cursor throttle
-const SELECTION_POLL_MS = 150;    // selection is bursty, low-rate ok
-const DRAG_POLL_MS = 33;          // ~30 Hz drag-ghost updates
-const RENDER_INTERVAL_MS = 33;    // ~30 Hz overlay redraw
+const CURSOR_PUBLISH_MS = 33;     // ~30 Hz throttle on outbound pointer
+const SELECTION_POLL_MS = 150;    // node-selection set is bursty, low rate fine
+const DRAG_POLL_MS = 33;          // ~30 Hz drag-ghost sampling
+const MARQUEE_PUBLISH_MS = 33;    // ~30 Hz marquee-box sampling
+// Per-frame easing toward the target. 1 = teleport (no smoothing),
+// values near 0.2-0.3 give a "live but not snappy" feel.
+const CURSOR_EASE = 0.28;
 
-type ActionKind = "idle" | "selecting" | "dragging";
+type ActionKind = "idle" | "hover" | "drag" | "marquee";
 
 interface CanvasAwarenessUser {
   name?: string;
   color?: string;
 }
 
-// Cursor pointer published into Awareness.
 interface CanvasAwarenessPointer {
   x: number;
   y: number;
   mode?: "world" | "screen";
 }
 
-// "Where peer is dragging selected nodes to" — world coords + size so
-// remote can render a ghost rectangle even when their copy of the node
-// has different (still-old) coords.
 interface DragGhost {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Marquee box in WORLD coords. Sender keeps it normalized (width/
+// height non-negative) so receiver doesn't have to special-case
+// inverted drags.
+interface MarqueeBox {
   x: number;
   y: number;
   width: number;
@@ -69,15 +79,14 @@ interface CanvasAwarenessState {
   user?: CanvasAwarenessUser;
   cursor?: CanvasAwarenessPointer | null;
   action?: ActionKind;
-  // Sorted array of node ids in the peer's current selection.
   selection?: string[];
-  // Map of nodeId → ghost rect, only populated while peer is dragging.
   drag?: Record<string, DragGhost> | null;
+  marquee?: MarqueeBox | null;
 }
 
-// ─── Obsidian Canvas private API surface we depend on ──────────────────
-// All optional / defensive — Canvas is undocumented and may differ
-// across builds. Every access is guarded.
+// ─── Obsidian Canvas private API surface we depend on ────────────────
+// All optional / defensive — undocumented and may differ across
+// builds. Every access is guarded.
 
 interface CanvasNodeLike {
   id?: string;
@@ -89,10 +98,8 @@ interface CanvasNodeLike {
 
 interface CanvasInternals {
   posFromEvt?: (evt: MouseEvent) => { x: number; y: number };
-  // Could be Map<id, node>, Set<node>, or array — we normalise.
-  nodes?: unknown;
-  // Could be Set<node>, Map<id, node>, or array.
-  selection?: unknown;
+  nodes?: unknown;     // Map | Set | Array | plain object
+  selection?: unknown; // Set | Map | Array | plain object
 }
 
 interface CanvasViewLike {
@@ -163,7 +170,33 @@ function attachToLeafIfCanvas(
   overlay.className = "collab-canvas-overlay";
   wrapper.appendChild(overlay);
 
-  // ─── Cursor publish (throttled) ──────────────────────────────────
+  // ─── Action state machine ─────────────────────────────────────
+  //
+  // Tracks what the local user is doing right now and broadcasts it
+  // via Awareness so peer cursors can switch their SVG and the
+  // marquee/drag visuals appear at the right time.
+  //
+  // The state transitions are inferred from raw DOM events because
+  // Canvas doesn't fire helpful semantic events. The rules:
+  //
+  //   mousemove over .canvas-node     → action = hover (when no button)
+  //   mousemove over empty canvas      → action = idle  (when no button)
+  //   mousedown on .canvas-node        → action = hover, will promote
+  //                                       to "drag" when positions move
+  //   mousedown on empty canvas        → action = marquee, publish box
+  //   mouseup anywhere                 → clear → hover/idle based on
+  //                                       current pointer
+  let action: ActionKind = "idle";
+  let pressKind: "none" | "node" | "empty" = "none";
+  let pressStartWorld: { x: number; y: number } | null = null;
+  let overNode = false;
+  const setAction = (next: ActionKind) => {
+    if (next === action) return;
+    action = next;
+    awareness.setLocalStateField("action", action);
+  };
+
+  // ─── Cursor publish (throttled) ───────────────────────────────
   let lastCursorPublish = 0;
   let pendingCursor: CanvasAwarenessPointer | null = null;
   const publishCursor = (pos: CanvasAwarenessPointer | null) => {
@@ -188,43 +221,79 @@ function attachToLeafIfCanvas(
 
   const onMove = (e: MouseEvent) => {
     publishCursor(eventToCanvasPos(view, wrapper, e));
+    const target = e.target as HTMLElement | null;
+    overNode = !!target?.closest?.(".canvas-node");
+    if (pressKind === "none") {
+      setAction(overNode ? "hover" : "idle");
+    } else if (pressKind === "empty" && pressStartWorld) {
+      // Marquee drag — recompute the box and publish (throttled
+      // by marqueePoll loop, which checks freshness).
+      const cur = eventToWorld(view, wrapper, e);
+      if (cur) {
+        pendingMarqueeEnd = cur;
+      }
+    }
   };
-  const onLeave = () => publishCursor(null);
+  const onLeave = () => {
+    publishCursor(null);
+  };
   wrapper.addEventListener("mousemove", onMove);
   wrapper.addEventListener("mouseleave", onLeave);
 
-  // ─── Action state (mousedown / mouseup) ──────────────────────────
-  //
-  // We don't know up-front whether mousedown means "click selecting"
-  // or "starting a drag". Strategy: when the button goes down we mark
-  // action=selecting; if the selected-node positions then change while
-  // the button stays down, we promote to action=dragging. On mouseup
-  // we go back to idle and clear any drag ghosts.
-  let action: ActionKind = "idle";
-  let mouseDown = false;
-  const setAction = (next: ActionKind) => {
-    if (next === action) return;
-    action = next;
-    awareness.setLocalStateField("action", action);
-  };
-  const onDown = () => {
-    mouseDown = true;
-    setAction("selecting");
+  // ─── Mouse button state ───────────────────────────────────────
+  let pendingMarqueeEnd: { x: number; y: number } | null = null;
+  let lastPublishedMarquee = "";
+  const onDown = (e: MouseEvent) => {
+    if (e.button !== 0) return; // only left-button
+    const target = e.target as HTMLElement | null;
+    const onNode = !!target?.closest?.(".canvas-node");
+    if (onNode) {
+      pressKind = "node";
+      // Keep showing the open hand until we detect actual movement
+      // — promotion to "drag" happens inside the drag-poll below.
+      setAction("hover");
+    } else {
+      pressKind = "empty";
+      const start = eventToWorld(view, wrapper, e);
+      if (start) {
+        pressStartWorld = start;
+        pendingMarqueeEnd = start;
+      }
+      setAction("marquee");
+    }
   };
   const onUp = () => {
-    mouseDown = false;
-    setAction("idle");
-    // Drop drag ghosts so peers stop seeing the floating rectangle —
-    // the real position will arrive via the normal save-file path.
+    pressKind = "none";
+    pressStartWorld = null;
+    pendingMarqueeEnd = null;
+    if (lastPublishedMarquee !== "") {
+      awareness.setLocalStateField("marquee", null);
+      lastPublishedMarquee = "";
+    }
     awareness.setLocalStateField("drag", null);
     lastDragSnapshot = {};
+    setAction(overNode ? "hover" : "idle");
   };
   wrapper.addEventListener("mousedown", onDown);
   // Listen on window for mouseup — pointer often releases outside
   // the wrapper after a drag flick.
   window.addEventListener("mouseup", onUp);
 
-  // ─── Selection polling ───────────────────────────────────────────
+  // ─── Marquee publish loop ─────────────────────────────────────
+  const marqueePoll = window.setInterval(() => {
+    if (pressKind !== "empty" || !pressStartWorld || !pendingMarqueeEnd) return;
+    const x = Math.min(pressStartWorld.x, pendingMarqueeEnd.x);
+    const y = Math.min(pressStartWorld.y, pendingMarqueeEnd.y);
+    const width = Math.abs(pressStartWorld.x - pendingMarqueeEnd.x);
+    const height = Math.abs(pressStartWorld.y - pendingMarqueeEnd.y);
+    const box: MarqueeBox = { x, y, width, height };
+    const key = `${x.toFixed(2)}|${y.toFixed(2)}|${width.toFixed(2)}|${height.toFixed(2)}`;
+    if (key === lastPublishedMarquee) return;
+    lastPublishedMarquee = key;
+    awareness.setLocalStateField("marquee", box);
+  }, MARQUEE_PUBLISH_MS);
+
+  // ─── Selection set polling ────────────────────────────────────
   let lastSelectionKey = "";
   const selectionPoll = window.setInterval(() => {
     const ids = readSelection(view).sort();
@@ -234,15 +303,10 @@ function attachToLeafIfCanvas(
     awareness.setLocalStateField("selection", ids);
   }, SELECTION_POLL_MS);
 
-  // ─── Drag ghost polling ──────────────────────────────────────────
-  //
-  // While the mouse button is held AND we have a non-empty selection,
-  // sample the selected nodes' world positions and publish them as
-  // a per-id ghost rect. We compare against a snapshot to detect
-  // genuine movement vs. just a static selection.
+  // ─── Drag ghost polling ───────────────────────────────────────
   let lastDragSnapshot: Record<string, DragGhost> = {};
   const dragPoll = window.setInterval(() => {
-    if (!mouseDown) return;
+    if (pressKind !== "node") return;
     const ids = readSelection(view);
     if (ids.length === 0) return;
     const next: Record<string, DragGhost> = {};
@@ -258,26 +322,25 @@ function attachToLeafIfCanvas(
       const prev = lastDragSnapshot[id];
       if (!prev || prev.x !== x || prev.y !== y) moved = true;
     }
-    // Promote action to "dragging" the first time we see movement
-    // while the mouse is held — until then it's still "selecting".
-    if (moved) setAction("dragging");
-    // Publish even when not moved (yet), so peers see something the
-    // moment we start; but cheap-compare against last to avoid churn.
+    if (moved) setAction("drag");
     if (!shallowGhostEqual(next, lastDragSnapshot)) {
       lastDragSnapshot = next;
       awareness.setLocalStateField("drag", next);
     }
   }, DRAG_POLL_MS);
 
-  // ─── Render loop ─────────────────────────────────────────────────
+  // ─── Render loop ──────────────────────────────────────────────
+  //
+  // rAF-driven. Each frame we step every visible peer's cursor
+  // toward its target position by CURSOR_EASE so motion is smooth
+  // even when network samples arrive at 30 Hz with jitter.
+  const cursorState = new Map<
+    number,
+    { tx: number; ty: number; cx: number; cy: number }
+  >();
   let rafHandle = 0;
-  let lastRender = 0;
   const tick = () => {
-    const now = Date.now();
-    if (now - lastRender >= RENDER_INTERVAL_MS) {
-      lastRender = now;
-      renderRemote(view, wrapper, overlay, awareness);
-    }
+    renderRemote(view, wrapper, overlay, awareness, cursorState);
     rafHandle = requestAnimationFrame(tick);
   };
   rafHandle = requestAnimationFrame(tick);
@@ -290,17 +353,19 @@ function attachToLeafIfCanvas(
     window.clearInterval(cursorFlush);
     window.clearInterval(selectionPoll);
     window.clearInterval(dragPoll);
+    window.clearInterval(marqueePoll);
     cancelAnimationFrame(rafHandle);
     overlay.remove();
     delete wrapper.dataset.collabAttached;
     awareness.setLocalStateField("cursor", null);
     awareness.setLocalStateField("selection", []);
     awareness.setLocalStateField("drag", null);
+    awareness.setLocalStateField("marquee", null);
     awareness.setLocalStateField("action", "idle");
   });
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────
 
 function numOr(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
@@ -324,7 +389,6 @@ function shallowGhostEqual(
   return true;
 }
 
-// Iterate over canvas.nodes regardless of whether it's a Map/Set/Array.
 function iterCanvasNodes(view: CanvasViewLike): CanvasNodeLike[] {
   const c = view.canvas;
   if (!c || !c.nodes) return [];
@@ -409,6 +473,24 @@ function eventToCanvasPos(
   };
 }
 
+// Like eventToCanvasPos but returns null when world coords aren't
+// available — used for marquee start where we strictly need world.
+function eventToWorld(
+  view: CanvasViewLike,
+  _wrapper: HTMLElement,
+  evt: MouseEvent,
+): { x: number; y: number } | null {
+  const canvas = view.canvas;
+  if (!canvas || typeof canvas.posFromEvt !== "function") return null;
+  try {
+    const w = canvas.posFromEvt(evt);
+    if (w && Number.isFinite(w.x) && Number.isFinite(w.y)) return w;
+  } catch {
+    /* fall through */
+  }
+  return null;
+}
+
 interface ScreenFromWorld {
   scaleX: number;
   scaleY: number;
@@ -416,9 +498,6 @@ interface ScreenFromWorld {
   offsetY: number;
 }
 
-// Probe canvas.posFromEvt at three known wrapper-local screen points
-// to derive the world→screen affine inverse. Returns null when
-// posFromEvt is unavailable or samples are degenerate.
 function deriveScreenFromWorld(
   view: CanvasViewLike,
   wrapper: HTMLElement,
@@ -469,11 +548,55 @@ function worldToScreen(
   };
 }
 
+// SVG markup for each cursor variant. We swap the inner HTML when
+// `data-cursor-kind` changes so the visual matches the peer's action.
+//
+// "arrow"  — default Figma-style pointer
+// "hand"   — open hand (peer is hovering over a node)
+// "grab"   — closed/grabbing hand (peer is moving a node)
+//
+// Sizes are kept ~22×22 so the hotspot stays in roughly the same
+// place across all variants.
+const CURSOR_SVG = {
+  arrow: `
+    <svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
+      <path d="M3 2 L3 17 L7 13 L10 19 L13 18 L10 12 L17 12 Z"
+        fill="currentColor" stroke="white" stroke-width="1" />
+    </svg>`,
+  hand: `
+    <svg width="22" height="24" viewBox="0 0 22 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M6 11 V4.5 a1.4 1.4 0 0 1 2.8 0 V10 M8.8 10 V3 a1.4 1.4 0 0 1 2.8 0 V10 M11.6 10 V3.5 a1.4 1.4 0 0 1 2.8 0 V11 M14.4 11 V5 a1.4 1.4 0 0 1 2.8 0 V14 c0 4-2.6 7-6.6 7 -3.6 0-5.4-2-6.4-5 L2.4 13 a1.3 1.3 0 0 1 1.9-1.7 L6 13 Z"
+        fill="currentColor" stroke="white" stroke-width="1" stroke-linejoin="round" stroke-linecap="round" />
+    </svg>`,
+  grab: `
+    <svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
+      <path d="M5 10 V7 a1.3 1.3 0 0 1 2.6 0 V9.5 M7.6 9.5 V5.5 a1.3 1.3 0 0 1 2.6 0 V9.5 M10.2 9.5 V6 a1.3 1.3 0 0 1 2.6 0 V10 M12.8 10 V7 a1.3 1.3 0 0 1 2.6 0 V13 c0 3.5-2.4 6-6 6 -3.2 0-5-1.8-5.8-4.5 L2 12 a1.2 1.2 0 0 1 1.8-1.6 L5 12 Z"
+        fill="currentColor" stroke="white" stroke-width="1" stroke-linejoin="round" stroke-linecap="round" />
+    </svg>`,
+};
+
+function cursorKindFor(action: ActionKind): "arrow" | "hand" | "grab" {
+  switch (action) {
+    case "hover":
+      return "hand";
+    case "drag":
+      return "grab";
+    case "marquee":
+    case "idle":
+    default:
+      return "arrow";
+  }
+}
+
 function renderRemote(
   view: CanvasViewLike,
   wrapper: HTMLElement,
   overlay: HTMLDivElement,
   awareness: Awareness,
+  cursorState: Map<
+    number,
+    { tx: number; ty: number; cx: number; cy: number }
+  >,
 ) {
   const localId = awareness.clientID;
   const states = awareness.getStates();
@@ -481,8 +604,9 @@ function renderRemote(
   const rect = wrapper.getBoundingClientRect();
 
   const seenCursor = new Set<number>();
-  const seenSelection = new Set<string>(); // `${clientId}:${nodeId}`
-  const seenDrag = new Set<string>();      // `${clientId}:${nodeId}`
+  const seenSelection = new Set<string>();
+  const seenDrag = new Set<string>();
+  const seenMarquee = new Set<number>();
 
   states.forEach((stateRaw, clientId) => {
     if (clientId === localId) return;
@@ -491,7 +615,7 @@ function renderRemote(
     const name = state.user?.name ?? "anonymous";
     const action: ActionKind = state.action ?? "idle";
 
-    // ── Selection outlines ────────────────────────────────────────
+    // ── Selection outlines ──────────────────────────────────────
     if (state.selection && state.selection.length > 0) {
       for (const nodeId of state.selection) {
         const node = findNodeById(view, nodeId);
@@ -501,8 +625,6 @@ function renderRemote(
         const ww = numOr(node.width, NaN);
         const wh = numOr(node.height, NaN);
         if (!Number.isFinite(wx) || !Number.isFinite(wy)) continue;
-        // Skip the selection outline if this node is also being
-        // drag-ghosted by the same peer — the ghost rect covers it.
         if (state.drag && state.drag[nodeId]) continue;
         const tl = worldToScreen(xform, wx, wy);
         const w = ww * xform.scaleX;
@@ -526,7 +648,7 @@ function renderRemote(
       }
     }
 
-    // ── Drag ghosts ───────────────────────────────────────────────
+    // ── Drag ghosts ─────────────────────────────────────────────
     if (state.drag && xform) {
       for (const [nodeId, ghost] of Object.entries(state.drag)) {
         if (!ghost) continue;
@@ -552,21 +674,69 @@ function renderRemote(
       }
     }
 
-    // ── Cursor ────────────────────────────────────────────────────
+    // ── Marquee selection rectangle ─────────────────────────────
+    if (state.marquee && xform) {
+      const m = state.marquee;
+      const tl = worldToScreen(xform, m.x, m.y);
+      const w = m.width * xform.scaleX;
+      const h = m.height * xform.scaleY;
+      seenMarquee.add(clientId);
+      let el = overlay.querySelector(
+        `[data-marquee-client="${clientId}"]`,
+      ) as HTMLDivElement | null;
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "collab-canvas-marquee";
+        el.dataset.marqueeClient = String(clientId);
+        overlay.appendChild(el);
+      }
+      el.style.transform = `translate(${tl.x}px, ${tl.y}px)`;
+      el.style.width = `${w}px`;
+      el.style.height = `${h}px`;
+      el.style.borderColor = color;
+      el.style.backgroundColor = hexWithAlpha(color, 0.08);
+    }
+
+    // ── Cursor with smoothing ───────────────────────────────────
     const cursor = state.cursor;
     if (cursor && typeof cursor.x === "number" && typeof cursor.y === "number") {
       const mode = cursor.mode ?? "screen";
-      let screenX: number;
-      let screenY: number;
+      let tx: number;
+      let ty: number;
       if (mode === "world" && xform) {
         const p = worldToScreen(xform, cursor.x, cursor.y);
-        screenX = p.x;
-        screenY = p.y;
+        tx = p.x;
+        ty = p.y;
       } else {
-        screenX = cursor.x;
-        screenY = cursor.y;
+        tx = cursor.x;
+        ty = cursor.y;
       }
-      // Hide cursors far outside the viewport.
+
+      // Step the rendered position toward the target. First time we
+      // see a client, snap to it so they don't fly in from (0,0).
+      let st = cursorState.get(clientId);
+      if (!st) {
+        st = { tx, ty, cx: tx, cy: ty };
+        cursorState.set(clientId, st);
+      } else {
+        st.tx = tx;
+        st.ty = ty;
+        // Snap if huge jump (canvas pan, leaf switch) — otherwise
+        // the smoothing would noticeably crawl across the screen.
+        const dx = st.tx - st.cx;
+        const dy = st.ty - st.cy;
+        if (dx * dx + dy * dy > 500 * 500) {
+          st.cx = st.tx;
+          st.cy = st.ty;
+        } else {
+          st.cx += dx * CURSOR_EASE;
+          st.cy += dy * CURSOR_EASE;
+        }
+      }
+
+      const screenX = st.cx;
+      const screenY = st.cy;
+
       if (
         screenX < -120 ||
         screenY < -120 ||
@@ -575,6 +745,7 @@ function renderRemote(
       ) {
         const stale = overlay.querySelector(`[data-client-id="${clientId}"]`);
         stale?.remove();
+        cursorState.delete(clientId);
       } else {
         seenCursor.add(clientId);
         let el = overlay.querySelector(
@@ -585,12 +756,7 @@ function renderRemote(
           el.dataset.clientId = String(clientId);
           el.className = "collab-canvas-cursor";
           el.innerHTML = `
-            <svg class="collab-canvas-cursor-svg" width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
-              <path d="M3 2 L3 17 L7 13 L10 19 L13 18 L10 12 L17 12 Z"
-                fill="currentColor"
-                stroke="white"
-                stroke-width="1" />
-            </svg>
+            <span class="collab-canvas-cursor-svg-wrap"></span>
             <span class="collab-canvas-cursor-label"></span>
           `;
           overlay.appendChild(el);
@@ -598,27 +764,38 @@ function renderRemote(
         el.style.transform = `translate(${screenX}px, ${screenY}px)`;
         el.style.color = color;
         el.dataset.action = action;
+
+        const kind = cursorKindFor(action);
+        if (el.dataset.cursorKind !== kind) {
+          el.dataset.cursorKind = kind;
+          const wrap = el.querySelector(
+            ".collab-canvas-cursor-svg-wrap",
+          ) as HTMLSpanElement | null;
+          if (wrap) wrap.innerHTML = CURSOR_SVG[kind];
+        }
+
         const label = el.querySelector(
           ".collab-canvas-cursor-label",
         ) as HTMLSpanElement;
         if (label) {
-          const text =
-            action === "dragging"
-              ? `${name} · dragging`
-              : action === "selecting"
-              ? `${name} · selecting`
-              : name;
-          if (label.textContent !== text) label.textContent = text;
+          if (label.textContent !== name) label.textContent = name;
           label.style.backgroundColor = color;
         }
       }
+    } else {
+      // No cursor for this peer — drop interpolation state so a
+      // future cursor doesn't lerp from a stale point.
+      cursorState.delete(clientId);
     }
   });
 
-  // ─── Garbage-collect overlay nodes for vanished state ───────────
+  // ─── Garbage-collect overlay nodes for vanished state ─────────
   overlay.querySelectorAll("[data-client-id]").forEach((el) => {
     const id = parseInt((el as HTMLElement).dataset.clientId ?? "", 10);
-    if (!seenCursor.has(id)) el.remove();
+    if (!seenCursor.has(id)) {
+      el.remove();
+      cursorState.delete(id);
+    }
   });
   overlay.querySelectorAll("[data-selection-key]").forEach((el) => {
     const key = (el as HTMLElement).dataset.selectionKey ?? "";
@@ -628,10 +805,12 @@ function renderRemote(
     const key = (el as HTMLElement).dataset.dragKey ?? "";
     if (!seenDrag.has(key)) el.remove();
   });
+  overlay.querySelectorAll("[data-marquee-client]").forEach((el) => {
+    const id = parseInt((el as HTMLElement).dataset.marqueeClient ?? "", 10);
+    if (!seenMarquee.has(id)) el.remove();
+  });
 }
 
-// "#rrggbb" + alpha → "rgba(r,g,b,a)". Falls back to the input if
-// the string isn't a 6-digit hex.
 function hexWithAlpha(hex: string, alpha: number): string {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
   if (!m) return hex;

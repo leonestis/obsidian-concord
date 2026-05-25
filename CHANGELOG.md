@@ -2,6 +2,20 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.8.1 — 2026-05-25
+
+### Changed
+- **Peer cursors now change shape to match what the peer is doing**, the same way the OS cursor on the local side already does: an arrow over empty canvas, an open hand when hovering a node, a closed/grabbing hand while moving a node. The SVG is swapped on the receiving side based on the `action` field — no more text suffixes on the label.
+- **Cursor label is just the name again** — `name`, not `name · selecting` / `name · dragging`. Activity is communicated by the SVG variant instead, which is more like Figma and less like a chat log.
+- **Smooth cursor motion via per-frame interpolation.** Network samples arrive at ~30 Hz with jitter, so previously the cursor would tele-snap to each new packet and feel laggy. The render loop now lerps the on-screen position toward the latest received target by ~0.28 per frame (rAF-driven), which produces continuous motion between samples without adding measurable delay. Big jumps (>500 px — e.g. peer panned the canvas) snap rather than crawl.
+
+### Added
+- **Marquee selection rectangle.** When a peer drags on empty canvas to select a region (the dashed rectangle you see in Obsidian's own UI), that rectangle is broadcast in world coordinates and rendered as a tinted dashed box on every other peer's screen at ~30 Hz. Vanishes the moment the peer releases the mouse.
+- New `action` value `marquee` and `hover` (replaces the earlier `selecting`).
+
+### Removed
+- Action-suffixed cursor labels. The variant SVG carries that information now.
+
 ## 0.8.0 — 2026-05-25
 
 ### Added

@@ -68,8 +68,14 @@
   left: 0;
   pointer-events: none;
   will-change: transform;
-  transition: transform 60ms linear;
+  /* No CSS transition: smoothing is done in JS via per-frame lerp
+   * inside the rAF render loop. A CSS transition on top would fight
+   * the lerp and add visible delay. */
   /* the SVG inside uses currentColor for fill so we tint via color */
+}
+
+.collab-canvas-cursor .collab-canvas-cursor-svg-wrap {
+  display: block;
 }
 
 .collab-canvas-cursor svg {
@@ -122,15 +128,19 @@
   box-sizing: border-box;
 }
 
-/* Cursor variants by action. data-action is set on the cursor wrapper.
- * "dragging" gets a small squeeze + brighter shadow so the activity
- * reads at a glance. */
-.collab-canvas-cursor[data-action="dragging"] .collab-canvas-cursor-svg {
-  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
-  transform: scale(0.9);
-}
-.collab-canvas-cursor[data-action="selecting"] .collab-canvas-cursor-svg {
-  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4));
+/* Marquee selection rectangle — the dashed box a peer drags out on
+ * the empty canvas to select multiple nodes. Mirrors the look of
+ * Obsidian's own selection rectangle but tinted with the peer's
+ * colour and made non-interactive. */
+.collab-canvas-marquee {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  border: 1.5px dashed;
+  border-radius: 2px;
+  will-change: transform, width, height;
+  box-sizing: border-box;
 }
 
 /* Trash modal: list of soft-deleted files with restore buttons. */
