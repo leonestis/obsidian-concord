@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.7.2 — 2026-05-24
+
+### Fixed
+- **Canvas cursors are world-anchored again** (proper fix this time). 0.7.0 tried to compute world-space coordinates from `canvas.x/y/zoom` directly and got the sign conventions wrong, producing mirrored cursors. 0.7.1 worked around that by dropping world coordinates entirely and shipping wrapper-relative pixels — direction was correct but a cursor in the same logical document point appeared at different screen positions on iPhone vs desktop. This release computes world coordinates the safe way: use `canvas.posFromEvt(evt)` (Obsidian's own screen→world helper) to publish, and **probe** the inverse by synthesising MouseEvents at known wrapper-local pixel offsets and reading the world coords posFromEvt returns. The affine inverse is derived from those samples, independent of whatever the underlying canvas zoom/pan representation looks like. Now a cursor pointed at the corner of a node on one peer shows up at the corner of that same node on the other peer regardless of pan, zoom, or viewport size.
+- The wire format gained a `mode: "world" | "screen"` field on the cursor payload so older peers (0.7.1) and newer peers can coexist gracefully. If a peer publishes `"screen"` mode we render at wrapper-local pixels; if `"world"` we apply the probed inverse.
+
 ## 0.7.1 — 2026-05-24
 
 ### Fixed

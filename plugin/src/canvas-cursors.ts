@@ -1,36 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Live cursor overlay for Obsidian Canvas views.
+// Live cursor overlay for Obsidian Canvas views — world-space.
 //
-// Canvas in Obsidian is a closed custom view (not CodeMirror), so we
-// can't bind to it the same way we bind to markdown editors. Instead
-// we attach DOM listeners to the .canvas-wrapper element, publish the
-// mouse position into the canvas session's Awareness, and render
-// remote users' pointers as absolutely-positioned overlay DOM nodes.
+// Canvas is a closed custom view; we can't bind to it like CodeMirror.
+// Instead we attach DOM listeners to `.canvas-wrapper`, publish the
+// pointer position via Awareness, and render every other user's
+// pointer as an absolutely-positioned overlay div.
 //
-// Coordinates are stored in WORLD space — i.e. canvas-internal
-// coordinates that don't change with pan/zoom. Each viewer transforms
-// world → screen using their own canvas pan/zoom state, so two users
-// looking at the same logical point in the canvas see the cursor at
-// the same conceptual place regardless of how each has panned/zoomed.
+// Coordinates travel in WORLD space — i.e. the same logical document
+// point regardless of each peer's pan/zoom. That requires converting
+// between screen pixels and world coords using Obsidian's canvas
+// transform.
 //
-// We poke into the private Obsidian canvas API (`view.canvas`,
-// `canvas.posFromEvt`, `canvas.x/y/tx/ty/zoom/tZoom`) with defensive
-// fallbacks. The plugin keeps working even if any of those names
-// change in a future Obsidian release — the cursor overlay just goes
-// quiet on that one canvas.
+// Obsidian exposes `canvas.posFromEvt(evt) → {x, y}` which does the
+// screen→world conversion correctly. The reverse (world→screen) isn't
+// exposed cleanly, and the obvious `canvas.x/y/zoom` properties had
+// non-standard sign conventions in 0.7.0 that produced mirrored
+// cursors. Rather than guess the formula again we PROBE the transform
+// at render time: synthesize three MouseEvents at known wrapper-local
+// screen points (origin, +100x, +100y), feed them through posFromEvt
+// to read out their world coords, and from those derive the affine
+// inverse. Works on any Obsidian build whose canvas exposes
+// posFromEvt, no matter what the underlying pan/zoom representation
+// looks like.
 
 import type { App, WorkspaceLeaf } from "obsidian";
 import type { Awareness } from "y-protocols/awareness";
 
-// Throttle pointer publishing to ~30 Hz. Higher than this just wastes
-// network traffic without any visible smoothness gain.
+// Throttle publish to ~30 Hz — anything faster just wastes traffic.
 const PUBLISH_INTERVAL_MS = 33;
-
-// Re-render overlay this often when the canvas itself isn't dispatching
-// awareness events (e.g. local user panned, remote cursor still at the
-// same world coords but its screen position needs updating). Driven by
-// rAF, this is the maximum delay.
+// Re-render at most this often. rAF-driven, this is the cap.
 const RENDER_INTERVAL_MS = 50;
 
 interface CanvasAwarenessUser {
@@ -38,33 +37,22 @@ interface CanvasAwarenessUser {
   color?: string;
 }
 
+// Pointer published into Awareness. `mode` lets us evolve the coord
+// system without breaking older peers — "world" means a world-space
+// point from posFromEvt; "screen" means wrapper-local pixels (used as
+// fallback when the local canvas has no posFromEvt).
 interface CanvasAwarenessPointer {
   x: number;
   y: number;
+  mode?: "world" | "screen";
 }
 
 interface CanvasAwarenessState {
   user?: CanvasAwarenessUser;
-  // `cursor` is reused for markdown sessions' editor cursor, but on
-  // canvas sessions it stores a world-space pointer. They never mix
-  // because each .canvas file has its own session / Awareness.
-  cursor?: CanvasAwarenessPointer;
+  cursor?: CanvasAwarenessPointer | null;
 }
 
 interface CanvasInternals {
-  // Pan offset in world units. Different Obsidian builds have called
-  // these `x/y`, `tx/ty`, or `posX/posY` — we try each.
-  x?: number;
-  y?: number;
-  tx?: number;
-  ty?: number;
-  // Current zoom factor. Often `zoom` for the rendered value and
-  // `tZoom` for the animated target.
-  zoom?: number;
-  tZoom?: number;
-  // page-to-world conversion supplied by Obsidian. If present we use
-  // it; otherwise we approximate from x/y/zoom + the wrapper's
-  // boundingClientRect.
   posFromEvt?: (evt: MouseEvent) => { x: number; y: number };
 }
 
@@ -79,11 +67,6 @@ export interface CanvasCursorHook {
   destroy: () => void;
 }
 
-// Attach the cursor publisher + overlay renderer to every canvas
-// view currently showing `filePath`. Returns a hook with a destroy()
-// that removes the listeners + overlay DOM cleanly. The plugin
-// should also re-call this whenever a new canvas leaf opens for the
-// same path; existing hooks are idempotent (no double-attach).
 export function attachCanvasCursors(
   app: App,
   filePath: string,
@@ -97,11 +80,7 @@ export function attachCanvasCursors(
     });
   };
 
-  // Initial pass — covers canvases already open.
   tryAttach();
-
-  // Re-scan on layout changes so newly-opened canvas leaves get the
-  // overlay too. Cheap — iterateAllLeaves is in-memory.
   const onLayout = () => tryAttach();
   app.workspace.on("layout-change", onLayout);
   app.workspace.on("active-leaf-change", onLayout);
@@ -138,8 +117,6 @@ function attachToLeafIfCanvas(
   ) as HTMLElement | null;
   if (!wrapper) return;
 
-  // Idempotency: one overlay div per wrapper. If we've already
-  // attached, skip — the renderer is still running.
   if (wrapper.dataset.collabAttached === "1") return;
   wrapper.dataset.collabAttached = "1";
 
@@ -164,16 +141,13 @@ function attachToLeafIfCanvas(
   };
 
   const onMove = (e: MouseEvent) => {
-    publish(pageToLocal(wrapper, e));
+    publish(eventToCanvasPos(view, wrapper, e));
   };
-
   const onLeave = () => publish(null);
 
   wrapper.addEventListener("mousemove", onMove);
   wrapper.addEventListener("mouseleave", onLeave);
 
-  // Flush trailing publish on the way out so the cursor doesn't get
-  // stuck at the second-to-last position.
   const flushInterval = window.setInterval(() => {
     if (!pendingPos) return;
     const now = Date.now();
@@ -182,10 +156,6 @@ function attachToLeafIfCanvas(
     awareness.setLocalStateField("cursor", pendingPos);
   }, PUBLISH_INTERVAL_MS);
 
-  // Render loop: redraw overlay positions on rAF tick. Driven by rAF
-  // (not by awareness 'change') because local pan/zoom doesn't fire
-  // any awareness event, but the remote cursor's screen position
-  // needs to follow.
   let rafHandle = 0;
   let lastRender = 0;
   const tick = () => {
@@ -209,33 +179,93 @@ function attachToLeafIfCanvas(
   });
 }
 
-// Convert a page-space MouseEvent into a position we can publish to
-// peers. For Phase 1 of canvas realtime we use wrapper-relative
-// PIXEL coordinates (NOT canvas world coordinates). The world-space
-// transform requires the right semantics on `canvas.x/y/zoom` —
-// those properties exist on the Obsidian canvas object but their
-// sign/scale conventions don't match the standard pan-zoom math the
-// 0.7.0 implementation assumed (cursors came out mirrored). Until we
-// reverse-engineer the right transform, wrapper-relative pixels at
-// least guarantee direction is correct — your friend's cursor moves
-// the same way your mouse does. The trade-off: pan/zoom mismatches
-// between peers offset the cursor from the actual world point —
-// fine for a first cut, fixed in Phase 2 when we monkey-patch the
-// canvas to publish + consume real world coords through Obsidian's
-// own helpers.
-function pageToLocal(
+// Convert a real MouseEvent into a CanvasAwarenessPointer suitable
+// for the wire. If posFromEvt is available, publish world coords; if
+// not, fall back to wrapper-local pixels and tag the mode so peers
+// know not to apply the inverse transform.
+function eventToCanvasPos(
+  view: CanvasViewLike,
   wrapper: HTMLElement,
   evt: MouseEvent,
 ): CanvasAwarenessPointer {
+  const canvas = view.canvas;
+  if (canvas && typeof canvas.posFromEvt === "function") {
+    try {
+      const w = canvas.posFromEvt(evt);
+      if (
+        w &&
+        typeof w.x === "number" &&
+        typeof w.y === "number" &&
+        Number.isFinite(w.x) &&
+        Number.isFinite(w.y)
+      ) {
+        return { x: w.x, y: w.y, mode: "world" };
+      }
+    } catch (err) {
+      console.warn("[collab] posFromEvt threw on local event", err);
+    }
+  }
   const rect = wrapper.getBoundingClientRect();
   return {
     x: evt.clientX - rect.left,
     y: evt.clientY - rect.top,
+    mode: "screen",
   };
 }
 
+interface ScreenFromWorld {
+  // Linear: screen.x = scaleX * (world.x - offsetX)
+  scaleX: number;
+  scaleY: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+// Probe canvas.posFromEvt at known wrapper-local screen points to
+// derive the world→screen inverse without having to know the canvas
+// internals' sign / scale conventions. Returns null when the canvas
+// doesn't expose posFromEvt or its samples are degenerate.
+function deriveScreenFromWorld(
+  view: CanvasViewLike,
+  wrapper: HTMLElement,
+): ScreenFromWorld | null {
+  const canvas = view.canvas;
+  if (!canvas || typeof canvas.posFromEvt !== "function") return null;
+  const rect = wrapper.getBoundingClientRect();
+  try {
+    const make = (clientX: number, clientY: number) =>
+      new MouseEvent("mousemove", { clientX, clientY });
+    const A = canvas.posFromEvt(make(rect.left, rect.top));
+    const B = canvas.posFromEvt(make(rect.left + 100, rect.top));
+    const C = canvas.posFromEvt(make(rect.left, rect.top + 100));
+    if (
+      !A ||
+      !B ||
+      !C ||
+      !Number.isFinite(A.x) ||
+      !Number.isFinite(A.y) ||
+      !Number.isFinite(B.x) ||
+      !Number.isFinite(C.y)
+    ) {
+      return null;
+    }
+    const dxw = B.x - A.x; // world delta for +100 px screen X
+    const dyw = C.y - A.y; // world delta for +100 px screen Y
+    if (Math.abs(dxw) < 1e-9 || Math.abs(dyw) < 1e-9) return null;
+    return {
+      scaleX: 100 / dxw,
+      scaleY: 100 / dyw,
+      offsetX: A.x,
+      offsetY: A.y,
+    };
+  } catch (err) {
+    console.warn("[collab] failed to derive canvas transform", err);
+    return null;
+  }
+}
+
 function renderRemoteCursors(
-  _view: CanvasViewLike,
+  view: CanvasViewLike,
   wrapper: HTMLElement,
   overlay: HTMLDivElement,
   awareness: Awareness,
@@ -243,29 +273,48 @@ function renderRemoteCursors(
   const localId = awareness.clientID;
   const states = awareness.getStates();
   const seen = new Set<number>();
+  const xform = deriveScreenFromWorld(view, wrapper);
+  const rect = wrapper.getBoundingClientRect();
 
   states.forEach((stateRaw, clientId) => {
     if (clientId === localId) return;
     const state = stateRaw as CanvasAwarenessState;
     const cursor = state.cursor;
-    if (!cursor || typeof cursor.x !== "number") return;
-    // Phase 1 uses wrapper-local pixel coords. Render at the same.
-    const screen = { x: cursor.x, y: cursor.y };
-    const rect = wrapper.getBoundingClientRect();
+    if (!cursor || typeof cursor.x !== "number" || typeof cursor.y !== "number") {
+      return;
+    }
+    const mode = cursor.mode ?? "screen";
+
+    let screenX: number;
+    let screenY: number;
+    if (mode === "world" && xform) {
+      screenX = (cursor.x - xform.offsetX) * xform.scaleX;
+      screenY = (cursor.y - xform.offsetY) * xform.scaleY;
+    } else {
+      // Mode is "screen" (peer couldn't get world coords) or we
+      // can't derive the transform locally — render as wrapper-
+      // relative pixels. Cursor direction stays correct; absolute
+      // position only matches when both peers are at the same
+      // pan/zoom.
+      screenX = cursor.x;
+      screenY = cursor.y;
+    }
+
+    // Hide cursors well outside the wrapper to avoid keeping DOM
+    // around for far-off pointers (it would still render, just off
+    // the visible area).
     if (
-      screen.x < -100 ||
-      screen.y < -100 ||
-      screen.x > rect.width + 100 ||
-      screen.y > rect.height + 100
+      screenX < -100 ||
+      screenY < -100 ||
+      screenX > rect.width + 100 ||
+      screenY > rect.height + 100
     ) {
-      // still remove existing cursor for this client if any
-      const stale = overlay.querySelector(
-        `[data-client-id="${clientId}"]`,
-      );
+      const stale = overlay.querySelector(`[data-client-id="${clientId}"]`);
       stale?.remove();
       return;
     }
     seen.add(clientId);
+
     const color = state.user?.color ?? "#888";
     const name = state.user?.name ?? "anonymous";
 
@@ -287,7 +336,7 @@ function renderRemoteCursors(
       `;
       overlay.appendChild(el);
     }
-    el.style.transform = `translate(${screen.x}px, ${screen.y}px)`;
+    el.style.transform = `translate(${screenX}px, ${screenY}px)`;
     el.style.color = color;
     const label = el.querySelector(
       ".collab-canvas-cursor-label",
@@ -298,12 +347,8 @@ function renderRemoteCursors(
     }
   });
 
-  // Remove cursors of clients that aren't broadcasting any more.
   overlay.querySelectorAll("[data-client-id]").forEach((el) => {
-    const id = parseInt(
-      (el as HTMLElement).dataset.clientId ?? "",
-      10,
-    );
+    const id = parseInt((el as HTMLElement).dataset.clientId ?? "", 10);
     if (!seen.has(id)) el.remove();
   });
 }

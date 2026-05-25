@@ -24,7 +24,7 @@ import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.7.1";
+const PLUGIN_VERSION = "0.7.2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
