@@ -2,6 +2,18 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.8.0 — 2026-05-25
+
+### Added
+- **Canvas Phase 2 + 3: live selection + live drag preview.** The canvas overlay now shows, for every connected peer, (a) a colored frame around each node the peer has selected, and (b) a dashed ghost rectangle of where the peer is currently dragging a node to — updated at ~30 Hz so the motion is smooth, not stutter-stepped from save round-trips. When the peer releases the mouse the ghost vanishes and the eventual settled position arrives via the normal canvas-file save path (Y.Doc → JSON → disk). Everything ephemeral travels over Awareness so we don't churn the `.canvas` file once per frame.
+- **Action-aware cursors.** Each peer's cursor now carries an `action` field — `idle`, `selecting`, or `dragging` — and the label changes accordingly (`name`, `name · selecting`, `name · dragging`). The SVG also shifts a tiny bit (subtle squeeze on drag, brighter drop-shadow) so the collaborator's activity reads at a glance, like in Figma.
+- **Selection sync poll** at 150 ms and **drag-position poll** at 33 ms, both running on the local side and publishing into Awareness. Reads are defensive against whether `canvas.selection` / `canvas.nodes` is a `Set`, `Map`, plain object, or array — Obsidian's canvas internals are undocumented and the shape has differed between builds historically.
+- Positions for selection outlines and drag ghosts are exchanged in WORLD coordinates and projected to each peer's screen using the same probed affine inverse introduced in 0.7.2, so two viewers at different pan/zoom both see the outline aligned with the actual node.
+
+### Notes
+- Phase 4 (live add / delete / edit / connect) still relies on the existing save-debounce path — when a peer adds, deletes, edits, or connects nodes the change arrives via the normal Y.Doc canvas-JSON sync after Obsidian's save fires. That's typically sub-second but not frame-rate. A true real-time Phase 4 would need direct hooks into Canvas's internal mutation methods, which we're deferring until Obsidian's plugin API surfaces them publicly — monkey-patching private APIs there is the most version-fragile thing we could do.
+- The `drag` ghost is purely visual; we never mutate the peer's local `canvas.nodes` object behind the scenes. The peer's actual nodes only move when the save round-trip lands. This keeps the receive side cheap and avoids fighting Obsidian's own canvas renderer.
+
 ## 0.7.2 — 2026-05-24
 
 ### Fixed

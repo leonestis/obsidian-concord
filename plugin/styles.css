@@ -93,6 +93,46 @@
   user-select: none;
 }
 
+/* Selection outline: thin coloured frame around a node that a remote
+ * peer has selected. Drawn in screen space inside the overlay; we set
+ * width/height via inline style so the box matches the node exactly. */
+.collab-canvas-selection {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  border: 2px solid;
+  border-radius: 6px;
+  will-change: transform;
+  transition: transform 80ms linear, width 80ms linear, height 80ms linear;
+  box-sizing: border-box;
+}
+
+/* Drag ghost: a translucent coloured rectangle showing where a peer is
+ * currently dragging a node to, before the move is committed. */
+.collab-canvas-drag-ghost {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  border: 2px dashed;
+  border-radius: 6px;
+  will-change: transform;
+  transition: transform 50ms linear;
+  box-sizing: border-box;
+}
+
+/* Cursor variants by action. data-action is set on the cursor wrapper.
+ * "dragging" gets a small squeeze + brighter shadow so the activity
+ * reads at a glance. */
+.collab-canvas-cursor[data-action="dragging"] .collab-canvas-cursor-svg {
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+  transform: scale(0.9);
+}
+.collab-canvas-cursor[data-action="selecting"] .collab-canvas-cursor-svg {
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4));
+}
+
 /* Trash modal: list of soft-deleted files with restore buttons. */
 .collab-trash-list {
   display: flex;
