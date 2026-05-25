@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.7.1 — 2026-05-24
+
+### Fixed
+- **Mirrored canvas cursors.** 0.7.0 published cursor positions in canvas-WORLD coordinates by feeding `canvas.x/y/zoom` into a standard pan-zoom transform. Those properties exist on the live Obsidian canvas object but their semantics don't match the standard formula — the result was that a peer's cursor moved in the opposite direction on the receiving side. Phase 1 now uses wrapper-relative pixel coordinates (no world transform), which guarantees correct movement direction at the cost of cursor positions diverging from the actual document point when peers have different pan/zoom states. Phase 2 will fix this properly by reading the canvas's actual transform via Obsidian's `posFromEvt` and a probed inverse instead of guessing the math.
+
 ## 0.7.0 — 2026-05-24
 
 ### Added

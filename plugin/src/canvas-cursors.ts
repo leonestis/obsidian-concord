@@ -164,9 +164,7 @@ function attachToLeafIfCanvas(
   };
 
   const onMove = (e: MouseEvent) => {
-    const world = pageToWorld(view, wrapper, e);
-    if (!world) return;
-    publish(world);
+    publish(pageToLocal(wrapper, e));
   };
 
   const onLeave = () => publish(null);
@@ -211,57 +209,33 @@ function attachToLeafIfCanvas(
   });
 }
 
-// Convert a page-space MouseEvent into canvas world coordinates.
-// Tries Obsidian's `posFromEvt` first, then falls back to the
-// boundingClientRect + canvas.x/y/zoom triangulation.
-function pageToWorld(
-  view: CanvasViewLike,
+// Convert a page-space MouseEvent into a position we can publish to
+// peers. For Phase 1 of canvas realtime we use wrapper-relative
+// PIXEL coordinates (NOT canvas world coordinates). The world-space
+// transform requires the right semantics on `canvas.x/y/zoom` —
+// those properties exist on the Obsidian canvas object but their
+// sign/scale conventions don't match the standard pan-zoom math the
+// 0.7.0 implementation assumed (cursors came out mirrored). Until we
+// reverse-engineer the right transform, wrapper-relative pixels at
+// least guarantee direction is correct — your friend's cursor moves
+// the same way your mouse does. The trade-off: pan/zoom mismatches
+// between peers offset the cursor from the actual world point —
+// fine for a first cut, fixed in Phase 2 when we monkey-patch the
+// canvas to publish + consume real world coords through Obsidian's
+// own helpers.
+function pageToLocal(
   wrapper: HTMLElement,
   evt: MouseEvent,
-): CanvasAwarenessPointer | null {
-  const canvas = view.canvas;
-  if (!canvas) return null;
-  if (typeof canvas.posFromEvt === "function") {
-    try {
-      const p = canvas.posFromEvt(evt);
-      if (typeof p?.x === "number" && typeof p?.y === "number") return p;
-    } catch {
-      // fall through to manual computation
-    }
-  }
+): CanvasAwarenessPointer {
   const rect = wrapper.getBoundingClientRect();
-  const zoom = canvas.zoom ?? canvas.tZoom ?? 1;
-  const panX = canvas.x ?? canvas.tx ?? 0;
-  const panY = canvas.y ?? canvas.ty ?? 0;
-  // Screen coordinate relative to the wrapper, divided by zoom, then
-  // shifted by canvas pan. This is the world coordinate.
-  const sx = evt.clientX - rect.left;
-  const sy = evt.clientY - rect.top;
   return {
-    x: sx / zoom - panX,
-    y: sy / zoom - panY,
-  };
-}
-
-// Inverse of pageToWorld: from world coordinates to screen-relative
-// pixels inside the wrapper.
-function worldToScreen(
-  view: CanvasViewLike,
-  pos: CanvasAwarenessPointer,
-): { x: number; y: number } | null {
-  const canvas = view.canvas;
-  if (!canvas) return null;
-  const zoom = canvas.zoom ?? canvas.tZoom ?? 1;
-  const panX = canvas.x ?? canvas.tx ?? 0;
-  const panY = canvas.y ?? canvas.ty ?? 0;
-  return {
-    x: (pos.x + panX) * zoom,
-    y: (pos.y + panY) * zoom,
+    x: evt.clientX - rect.left,
+    y: evt.clientY - rect.top,
   };
 }
 
 function renderRemoteCursors(
-  view: CanvasViewLike,
+  _view: CanvasViewLike,
   wrapper: HTMLElement,
   overlay: HTMLDivElement,
   awareness: Awareness,
@@ -275,11 +249,8 @@ function renderRemoteCursors(
     const state = stateRaw as CanvasAwarenessState;
     const cursor = state.cursor;
     if (!cursor || typeof cursor.x !== "number") return;
-    const screen = worldToScreen(view, cursor);
-    if (!screen) return;
-    // Skip cursors outside the visible wrapper (just to avoid keeping
-    // DOM nodes for far-off pointers; an extra-large viewport would
-    // still pick them up).
+    // Phase 1 uses wrapper-local pixel coords. Render at the same.
+    const screen = { x: cursor.x, y: cursor.y };
     const rect = wrapper.getBoundingClientRect();
     if (
       screen.x < -100 ||
