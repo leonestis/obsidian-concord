@@ -67,6 +67,10 @@
   top: 0;
   left: 0;
   pointer-events: none;
+  /* Always above selection frames, drag ghosts and marquee boxes —
+   * the cursor icon is the most important "where is the user"
+   * signal, the other shapes are context for it. */
+  z-index: 30;
   will-change: transform;
   /* No CSS transition: smoothing is done in JS via per-frame lerp
    * inside the rAF render loop. A CSS transition on top would fight
@@ -107,6 +111,7 @@
   top: 0;
   left: 0;
   pointer-events: none;
+  z-index: 10;
   border: 2px solid;
   border-radius: 6px;
   will-change: transform;
@@ -121,6 +126,7 @@
   top: 0;
   left: 0;
   pointer-events: none;
+  z-index: 20;
   border: 2px dashed;
   border-radius: 6px;
   will-change: transform;
@@ -137,6 +143,7 @@
   top: 0;
   left: 0;
   pointer-events: none;
+  z-index: 10;
   border: 1.5px dashed;
   border-radius: 2px;
   will-change: transform, width, height;

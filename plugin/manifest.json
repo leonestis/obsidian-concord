@@ -1,7 +1,7 @@
 {
   "id": "obsidian-collab",
   "name": "Collab (self-hosted realtime)",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "minAppVersion": "1.5.0",
   "description": "Self-hosted realtime collaboration with live cursors. Open-source, AGPLv3.",
   "author": "obsidian-collab contributors",

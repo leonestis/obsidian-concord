@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.8.2 — 2026-05-25
+
+### Fixed
+- **Peer cursors no longer drift during pan/zoom.** The 0.8.1 lerp ran in screen coordinates, so when the local user panned or zoomed the canvas the projection of every peer's world point changed instantly while the cursor — being lerped in screen space — crawled toward the new screen position over the next ~10 frames. Result: cards moved cleanly with the canvas, peer cursors visibly trailed them like they were on a different rubber band. Fixed by lerping in WORLD coordinates and projecting to screen each frame using the current transform. Now the cursor is glued to its world point exactly like the nodes are.
+- **Cursor icon now renders on top of selection frames, drag ghosts and marquee rectangles.** Before, those overlays sat at higher DOM index so they painted over the cursor SVG when they happened to coincide. Explicit z-index on each overlay class fixes the stacking: cursor (30) > drag ghost (20) > selection / marquee (10).
+
 ## 0.8.1 — 2026-05-25
 
 ### Changed

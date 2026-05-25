@@ -334,9 +334,26 @@ function attachToLeafIfCanvas(
   // rAF-driven. Each frame we step every visible peer's cursor
   // toward its target position by CURSOR_EASE so motion is smooth
   // even when network samples arrive at 30 Hz with jitter.
+  // Per-peer cursor interpolation state. We track BOTH the target
+  // and the current rendered position in WORLD coordinates (not
+  // screen), then project to screen each frame. This is critical:
+  // if we lerped in screen space, then pan/zoom would change the
+  // projection of the same world point and the cursor would
+  // visibly crawl toward its new screen position even though the
+  // peer hasn't actually moved. By lerping in world coords, the
+  // cursor stays anchored to its world point and reprojects in
+  // lockstep with the canvas's own pan/zoom — same as the nodes.
+  //
+  // `mode` is per-peer because some clients fall back to screen
+  // coords when they can't get posFromEvt; for those we keep the
+  // lerp in screen space.
   const cursorState = new Map<
     number,
-    { tx: number; ty: number; cx: number; cy: number }
+    {
+      mode: "world" | "screen";
+      tx: number; ty: number; // target
+      cx: number; cy: number; // current (rendered)
+    }
   >();
   let rafHandle = 0;
   const tick = () => {
@@ -595,7 +612,11 @@ function renderRemote(
   awareness: Awareness,
   cursorState: Map<
     number,
-    { tx: number; ty: number; cx: number; cy: number }
+    {
+      mode: "world" | "screen";
+      tx: number; ty: number;
+      cx: number; cy: number;
+    }
   >,
 ) {
   const localId = awareness.clientID;
@@ -698,34 +719,38 @@ function renderRemote(
     }
 
     // ── Cursor with smoothing ───────────────────────────────────
+    //
+    // Interpolation happens in WORLD coords when we have them, so
+    // the cursor stays glued to its world point during pan/zoom
+    // (cards move; cursor moves with them, exact same projection).
+    // For peers that publish only screen coords (no posFromEvt on
+    // their build) we fall back to screen-space lerp.
     const cursor = state.cursor;
     if (cursor && typeof cursor.x === "number" && typeof cursor.y === "number") {
-      const mode = cursor.mode ?? "screen";
-      let tx: number;
-      let ty: number;
-      if (mode === "world" && xform) {
-        const p = worldToScreen(xform, cursor.x, cursor.y);
-        tx = p.x;
-        ty = p.y;
-      } else {
-        tx = cursor.x;
-        ty = cursor.y;
-      }
+      const sampleMode: "world" | "screen" =
+        cursor.mode === "world" ? "world" : "screen";
 
-      // Step the rendered position toward the target. First time we
-      // see a client, snap to it so they don't fly in from (0,0).
       let st = cursorState.get(clientId);
-      if (!st) {
-        st = { tx, ty, cx: tx, cy: ty };
+      // Snap distance is mode-dependent: world coords aren't bound
+      // by pixel scale, so a generous threshold keeps the lerp from
+      // crawling across a big canvas teleport while still smoothing
+      // ordinary motion.
+      const SNAP_SQ = sampleMode === "world" ? 4000 * 4000 : 500 * 500;
+      if (!st || st.mode !== sampleMode) {
+        st = {
+          mode: sampleMode,
+          tx: cursor.x,
+          ty: cursor.y,
+          cx: cursor.x,
+          cy: cursor.y,
+        };
         cursorState.set(clientId, st);
       } else {
-        st.tx = tx;
-        st.ty = ty;
-        // Snap if huge jump (canvas pan, leaf switch) — otherwise
-        // the smoothing would noticeably crawl across the screen.
+        st.tx = cursor.x;
+        st.ty = cursor.y;
         const dx = st.tx - st.cx;
         const dy = st.ty - st.cy;
-        if (dx * dx + dy * dy > 500 * 500) {
+        if (dx * dx + dy * dy > SNAP_SQ) {
           st.cx = st.tx;
           st.cy = st.ty;
         } else {
@@ -734,8 +759,19 @@ function renderRemote(
         }
       }
 
-      const screenX = st.cx;
-      const screenY = st.cy;
+      // Project to screen NOW, after the lerp, using the current
+      // frame's transform. Pan/zoom updates xform; cursor stays
+      // anchored to its world position with no crawl.
+      let screenX: number;
+      let screenY: number;
+      if (st.mode === "world" && xform) {
+        const p = worldToScreen(xform, st.cx, st.cy);
+        screenX = p.x;
+        screenY = p.y;
+      } else {
+        screenX = st.cx;
+        screenY = st.cy;
+      }
 
       if (
         screenX < -120 ||
