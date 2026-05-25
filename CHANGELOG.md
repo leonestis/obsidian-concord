@@ -2,6 +2,17 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.9.0 — 2026-05-25
+
+### Changed
+- **Binary file bytes moved out of the shared vault manifest into per-file Y.Doc rooms.** Until 0.8.x every binary attachment (image, PDF, audio, …) had its raw bytes inlined into a `Y.Map<Uint8Array>` named `binaryData` on the shared `vault:manifest` Y.Doc. On the user's reference vault that grew the manifest to 21 MB even though there were only a handful of actual files, and every new peer had to download the full 21 MB before they could open their first markdown file. Brutal on mobile. As of 0.9.0 each binary lives in its own dedicated room — `bin:<path>` for live files and `bin:trash:<uuid>` for soft-deleted ones — containing a one-key `Y.Map<Uint8Array>` named `blob`. The manifest now only carries the lightweight `path → {kind, createdAt}` existence record, so it stays in the low kilobytes regardless of vault size. Binary rooms are opened lazily (only when uploading, downloading, renaming, or trashing the file) and torn down after the local change has had time to flush to the server. The 30-day trash flow, restore, rename and 25 MB cap all keep working — they now orchestrate cross-room byte moves instead of mutating the manifest.
+
+### Added
+- **Automatic one-shot migration of 0.8.x manifests.** On first connect with 0.9.0, if the legacy `binaryData` map still has entries, the plugin drains them into per-file rooms (live paths into `bin:<path>`, `trash:<uuid>` keys into `bin:trash:<uuid>`) and deletes the legacy keys. A `migratedV09` flag is recorded on the manifest's `meta` map so the migration runs at most once per vault. After the next server-side persistence flush the manifest's stored size collapses from tens of MB back to its real footprint.
+
+### Breaking
+- **Minimum server-accepted client version bumped to 0.9.0.** 0.8.x clients would happily keep writing into the legacy `binaryData` map after a 0.9.0 peer has migrated away from it, re-bloating the manifest and producing inconsistent state. To prevent that the server now refuses any client below 0.9.0 at connect time. All peers must upgrade together. The user is the only operator, so this is acceptable.
+
 ## 0.8.4 — 2026-05-25
 
 ### Changed

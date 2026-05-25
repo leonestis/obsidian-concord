@@ -9,7 +9,7 @@ const DATA_DIR = resolve(process.env.DATA_DIR ?? "./data");
 const DB_PATH = resolve(DATA_DIR, "documents.sqlite");
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 
-const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION ?? "0.6.2";
+const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION ?? "0.9.0";
 
 mkdirSync(DATA_DIR, { recursive: true });
 

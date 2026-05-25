@@ -24,7 +24,7 @@ import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.8.4";
+const PLUGIN_VERSION = "0.9.0";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -131,6 +131,29 @@ interface AtomicTextSession {
 
 type StructuralSession = CanvasSession | AtomicTextSession;
 
+// Lightweight wrapper around one binary file's Y.Doc room. Built by
+// openBinaryRoom, consumed by uploadBinary / fetchBinaryBytes / trash &
+// restore plumbing, torn down by closeBinaryRoom.
+interface BinaryRoom {
+  roomName: string;
+  ydoc: Y.Doc;
+  provider: HocuspocusProvider;
+  persistence: IndexeddbPersistence;
+  // Single key `bytes` — the whole file as a Uint8Array. Pre-existing peers
+  // see one Y.Map operation per upload (a set), which is the smallest
+  // possible CRDT footprint for this design.
+  blob: Y.Map<Uint8Array>;
+  // Refcount: multiple concurrent operations may want the same room open
+  // (e.g. a rename and a remote materialise touching old/new paths). Each
+  // openBinaryRoom call increments; closeBinaryRoom decrements and only
+  // tears down when it hits zero. Without this the second caller's
+  // provider.attach() would race a destroy from the first.
+  refCount: number;
+  // Pending pre-destroy timer so we can cancel it if a new caller arrives
+  // before the flush hold elapses.
+  pendingClose: ReturnType<typeof setTimeout> | null;
+}
+
 // Obsidian Canvas 1.0 JSON shape. We only care about nodes, edges, and any
 // other top-level keys we mirror through `meta`. Field shapes inside nodes
 // and edges are kept loose because the spec is extended frequently and we
@@ -161,7 +184,11 @@ const MAX_BINARY_BYTES = 25 * 1024 * 1024; // 25 MB
 // "text"    = atomic-replace text file (.base today, more later if useful).
 //             Single Y.Map "doc"."content" string. Last writer wins per save,
 //             never produces broken state because each write is one full file.
-// "binary"  = everything else (images, PDFs, audio …) — bytes in manifestBinaries
+// "binary"  = everything else (images, PDFs, audio …) — bytes live in a
+//             per-file Y.Doc room named `bin:<path>` (see openBinaryRoom).
+//             The manifest only carries the existence record; the bytes
+//             are fetched lazily so a new peer doesn't have to download
+//             the whole vault before opening their first markdown file.
 // "folder"  = empty folder marker
 type EntryKind = "file" | "folder" | "binary" | "canvas" | "text";
 
@@ -243,6 +270,23 @@ function pathToRoom(path: string): string {
   return "file:" + path.replace(/\//g, "__");
 }
 
+// Per-file room name for a binary's raw bytes (one Y.Doc per file). Mirrors
+// pathToRoom but lives in its own `bin:` namespace so we never collide with
+// a same-named markdown room. Soft-deleted bytes use `bin:trash:<uuid>`.
+function pathToBinaryRoom(path: string): string {
+  return "bin:" + path.replace(/\//g, "__");
+}
+function trashUuidToBinaryRoom(uuid: string): string {
+  return "bin:trash:" + uuid;
+}
+
+// Persistence-flush nicety: how long after a local Y.Map.set we keep the
+// per-file binary Y.Doc alive before destroying it, to give Hocuspocus time
+// to debounce + persist the update server-side (~2 s in current versions).
+// Conservative buffer; we'd rather hold the doc open a moment longer than
+// drop bytes that never made it past the local outgoing queue.
+const BINARY_FLUSH_HOLD_MS = 4000;
+
 // y-codemirror.next's yCollab() does NOT accept cursorBuilder/selectionBuilder
 // options — only `undoManager`. The default cursor widget renders a <span>
 // containing a hidden `.cm-ySelectionInfo` div with the user's name, which the
@@ -276,29 +320,44 @@ export default class CollabPlugin extends Plugin {
   // Vault manifest — single shared Y.Doc tracking which paths exist in the vault.
   // Holds three maps:
   //   files       — path → {kind, createdAt}     for every file / folder
-  //   binaryData  — path → Uint8Array            bytes for binary files
   //   trash       — uuid → {originalPath, …}     soft-deleted entries (30d retention)
-  // Per-file content for markdown and text files lives in their own Y.Docs.
+  //   meta        — small key/value bag for one-shot migration flags etc.
+  // Per-file content for markdown / canvas / text lives in its own Y.Doc
+  // (rooms `file:<path>`). Binary file BYTES also live in their own per-file
+  // Y.Doc (rooms `bin:<path>` for live binaries, `bin:trash:<uuid>` for
+  // soft-deleted ones). Pre-0.9.0 they were inlined into the manifest under
+  // a `binaryData` Y.Map — that ballooned the manifest to tens of MB even
+  // for small vaults and forced every new peer to download all of it before
+  // they could do anything. We now open each binary room lazily on demand.
+  // The legacy `binaryData` Y.Map is kept open transiently at startup so
+  // we can drain it on first launch (see migrateLegacyBinaries), then
+  // never touched again.
   private manifestYDoc: Y.Doc | null = null;
   private manifestMap: Y.Map<ManifestEntry> | null = null;
-  private manifestBinaries: Y.Map<Uint8Array> | null = null;
   private manifestTrash: Y.Map<TrashEntry> | null = null;
+  private manifestMeta: Y.Map<unknown> | null = null;
+  // Legacy 0.8.x map. Stays null after migration completes for the vault.
+  private manifestLegacyBinaries: Y.Map<Uint8Array> | null = null;
   private manifestProvider: HocuspocusProvider | null = null;
   private manifestPersistence: IndexeddbPersistence | null = null;
-  // Saved observers on the manifest's Y.Maps so stopVaultSync can
-  // unobserve them explicitly before the Y.Doc is destroyed (otherwise
-  // they'd briefly fire on a torn-down doc).
+  // Saved observer on the manifest's Y.Map so stopVaultSync can
+  // unobserve it explicitly before the Y.Doc is destroyed (otherwise
+  // it'd briefly fire on a torn-down doc).
   private manifestMapObserver:
     | ((event: Y.YMapEvent<ManifestEntry>) => void)
-    | null = null;
-  private manifestBinariesObserver:
-    | ((event: Y.YMapEvent<Uint8Array>) => void)
     | null = null;
 
   // Per-file structural sessions for non-markdown content we want fully
   // synced. Canvas uses the structural variant; .base uses the atomic
   // whole-file variant. Both keyed by vault-relative file path.
   private structuralSessions = new Map<string, StructuralSession>();
+
+  // Transient per-binary Y.Doc rooms. Opened on demand for upload/download/
+  // rename/trash, kept alive just long enough for the server to receive the
+  // bytes (or for the reader to consume them), then destroyed. The key is
+  // the room name (bin:<path> or bin:trash:<uuid>), not a vault path, so
+  // both live and trash rooms share the map without collision.
+  private binaryRooms = new Map<string, BinaryRoom>();
 
   // Refcounted suppression of "I just dispatched this change, the
   // resulting event isn't a user edit, ignore it". A plain Set<string>
@@ -959,8 +1018,12 @@ export default class CollabPlugin extends Plugin {
 
     this.manifestYDoc = new Y.Doc();
     this.manifestMap = this.manifestYDoc.getMap<ManifestEntry>("files");
-    this.manifestBinaries = this.manifestYDoc.getMap<Uint8Array>("binaryData");
     this.manifestTrash = this.manifestYDoc.getMap<TrashEntry>("trash");
+    this.manifestMeta = this.manifestYDoc.getMap<unknown>("meta");
+    // Held open transiently so the post-sync migration can drain it. After
+    // migrateLegacyBinaries runs (or detects it ran before) we never write
+    // to it again. The Y.Map handle itself is harmless to keep around.
+    this.manifestLegacyBinaries = this.manifestYDoc.getMap<Uint8Array>("binaryData");
 
     this.manifestProvider = new HocuspocusProvider({
       websocketProvider: this.socket,
@@ -996,9 +1059,10 @@ export default class CollabPlugin extends Plugin {
 
     this.manifestMapObserver = (event) => this.onManifestChange(event);
     this.manifestMap.observe(this.manifestMapObserver);
-    // When the bytes of an existing binary are updated, write to local disk.
-    this.manifestBinariesObserver = (event) => this.onBinaryDataChange(event);
-    this.manifestBinaries.observe(this.manifestBinariesObserver);
+    // Per-binary bytes are no longer in the manifest — there is nothing to
+    // observe at the manifest level for binary updates. Remote binary
+    // changes are picked up either eagerly in onManifestChange (for new
+    // binary entries) or lazily on the next vault read via materialise.
   }
 
   private async stopVaultSync() {
@@ -1015,23 +1079,21 @@ export default class CollabPlugin extends Plugin {
       }
     }
     this.manifestMapObserver = null;
-    if (this.manifestBinaries && this.manifestBinariesObserver) {
-      try {
-        this.manifestBinaries.unobserve(this.manifestBinariesObserver);
-      } catch (err) {
-        console.warn("[collab] manifestBinaries unobserve failed", err);
-      }
-    }
-    this.manifestBinariesObserver = null;
     this.manifestProvider?.destroy();
     this.manifestProvider = null;
     void this.manifestPersistence?.destroy();
     this.manifestPersistence = null;
+    // Tear down any still-open transient binary rooms (uploads/downloads
+    // racing against unload). closeBinaryRoom awaits persistence flush.
+    for (const path of Array.from(this.binaryRooms.keys())) {
+      await this.closeBinaryRoom(path);
+    }
     this.manifestYDoc?.destroy();
     this.manifestYDoc = null;
     this.manifestMap = null;
-    this.manifestBinaries = null;
     this.manifestTrash = null;
+    this.manifestMeta = null;
+    this.manifestLegacyBinaries = null;
     this.remoteApplyPaths.clear();
   }
 
@@ -1041,7 +1103,14 @@ export default class CollabPlugin extends Plugin {
   //   from the bytes stored in the manifest).
   // - Local files/folders missing from manifest → register them.
   private async reconcileManifest() {
-    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestYDoc) return;
+
+    // Drain pre-0.9 inline binaries from the manifest into per-file rooms.
+    // No-op on a fresh vault or on subsequent startups once the flag is
+    // set. We run this BEFORE materialising remote entries so that when
+    // we then go to fetch binary bytes for a manifest entry, the room
+    // already holds them.
+    await this.migrateLegacyBinaries();
 
     const localPaths = new Set<string>();
     const allLocal: TAbstractFile[] = [];
@@ -1104,26 +1173,117 @@ export default class CollabPlugin extends Plugin {
     );
   }
 
+  // One-shot migration from 0.8.x: pre-0.9 the bytes for every binary in
+  // the vault were inlined into `manifestBinaries` (Y.Map<Uint8Array>) on
+  // the shared manifest Y.Doc. That made the manifest 21 MB on the user's
+  // vault. This method drains those bytes into per-file `bin:<path>` rooms
+  // (and `bin:trash:<uuid>` for soft-deleted entries), then deletes the
+  // keys from manifestBinaries. After the next server-side store the
+  // manifest's serialized state collapses back to its real size (~kB).
+  //
+  // Gated by `meta.migratedV09` so it runs at most once per vault. We
+  // also bail if the legacy map is empty — covers fresh installs and
+  // anybody who already ran the migration on another device.
+  private async migrateLegacyBinaries() {
+    if (!this.manifestYDoc || !this.manifestMeta || !this.manifestLegacyBinaries) return;
+    if (this.manifestMeta.get("migratedV09") === true) {
+      console.log("[collab] migrateLegacyBinaries: already done");
+      return;
+    }
+    const legacy = this.manifestLegacyBinaries;
+    const keys = Array.from(legacy.keys());
+    if (keys.length === 0) {
+      // Nothing to migrate — still set the flag so we don't keep checking
+      // the empty map forever.
+      this.manifestMeta.set("migratedV09", true);
+      console.log("[collab] migrateLegacyBinaries: no legacy entries, marking complete");
+      return;
+    }
+    console.log(`[collab] migrateLegacyBinaries: draining ${keys.length} legacy entries`);
+    let migrated = 0;
+    let failed = 0;
+    for (const key of keys) {
+      const bytes = legacy.get(key);
+      if (!bytes) continue;
+      const targetRoom = key.startsWith("trash:")
+        ? "bin:" + key // → bin:trash:<uuid>
+        : pathToBinaryRoom(key);
+      try {
+        const room = await this.openBinaryRoom(targetRoom);
+        try {
+          const existing = room.blob.get("bytes");
+          if (!existing || !bytesEqual(existing, bytes)) {
+            room.blob.set("bytes", bytes);
+            console.log(
+              `[collab] migrateLegacyBinaries: ${key} → ${targetRoom} (${bytes.byteLength} bytes)`,
+            );
+          } else {
+            console.log(
+              `[collab] migrateLegacyBinaries: ${targetRoom} already had identical bytes`,
+            );
+          }
+        } finally {
+          this.releaseBinaryRoom(room);
+        }
+        legacy.delete(key);
+        migrated++;
+      } catch (err) {
+        failed++;
+        console.warn(`[collab] migrateLegacyBinaries: ${key} failed`, err);
+      }
+    }
+    if (failed === 0) {
+      this.manifestMeta.set("migratedV09", true);
+      console.log(
+        `[collab] migrateLegacyBinaries: complete (${migrated} migrated), flag set`,
+      );
+    } else {
+      console.warn(
+        `[collab] migrateLegacyBinaries: ${failed} failed, leaving flag unset for retry on next start`,
+      );
+    }
+  }
+
   private purgeOldTrash() {
-    if (!this.manifestTrash || !this.manifestBinaries || !this.manifestYDoc) return;
+    if (!this.manifestTrash || !this.manifestYDoc) return;
     const now = Date.now();
-    const toDrop: string[] = [];
+    const toDrop: Array<{ uuid: string; kind: EntryKind }> = [];
     for (const [uuid, entry] of this.manifestTrash.entries()) {
-      if (now - entry.deletedAt > TRASH_RETENTION_MS) toDrop.push(uuid);
+      if (now - entry.deletedAt > TRASH_RETENTION_MS) {
+        toDrop.push({ uuid, kind: entry.kind });
+      }
     }
     if (toDrop.length === 0) return;
     this.manifestYDoc.transact(() => {
-      for (const uuid of toDrop) {
+      for (const { uuid } of toDrop) {
         this.manifestTrash!.delete(uuid);
-        this.manifestBinaries!.delete(`trash:${uuid}`);
       }
     });
+    // Clear bytes from each trash binary room. Best-effort — the room's
+    // SQLite blob server-side stays a few bytes for the empty Y.Doc; not
+    // worth the risk of trying to physically delete it from the server.
+    for (const { uuid, kind } of toDrop) {
+      if (kind !== "binary") continue;
+      void (async () => {
+        const roomName = trashUuidToBinaryRoom(uuid);
+        try {
+          const room = await this.openBinaryRoom(roomName);
+          try {
+            room.blob.delete("bytes");
+          } finally {
+            this.releaseBinaryRoom(room);
+          }
+        } catch (err) {
+          console.warn(`[collab] purgeOldTrash: failed to clear ${roomName}`, err);
+        }
+      })();
+    }
     console.log(`[collab] purged ${toDrop.length} expired trash entries`);
   }
 
   // Restore: move a trash entry back into the live manifest.
   private async restoreFromTrash(uuid: string) {
-    if (!this.manifestTrash || !this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
+    if (!this.manifestTrash || !this.manifestMap || !this.manifestYDoc) return;
     const entry = this.manifestTrash.get(uuid);
     if (!entry) return;
     let destPath = entry.originalPath;
@@ -1138,12 +1298,14 @@ export default class CollabPlugin extends Plugin {
     this.manifestYDoc.transact(() => {
       this.manifestTrash!.delete(uuid);
       this.manifestMap!.set(destPath, { kind: entry.kind, createdAt: Date.now() });
-      const bytes = this.manifestBinaries!.get(`trash:${uuid}`);
-      if (bytes) {
-        this.manifestBinaries!.delete(`trash:${uuid}`);
-        this.manifestBinaries!.set(destPath, bytes);
-      }
     });
+    if (entry.kind === "binary") {
+      await this.moveBinaryBytes(
+        trashUuidToBinaryRoom(uuid),
+        pathToBinaryRoom(destPath),
+        `restore trash:${uuid} → ${destPath}`,
+      );
+    }
     new Notice(`Restored ${destPath}`);
     console.log(`[collab] restored ${entry.originalPath} → ${destPath}`);
   }
@@ -1207,17 +1369,31 @@ export default class CollabPlugin extends Plugin {
         this.openStructuralSession(path, entry.kind);
         return;
       }
-      // binary
-      const bytes = this.manifestBinaries?.get(path);
+      // binary: fetch bytes from the per-file binary room. Note this opens
+      // a fresh Y.Doc, waits for sync, reads the single `bytes` key, and
+      // tears down. If the room has no bytes yet (uploading peer is still
+      // mid-flight or offline), we silently bail — when the bytes do
+      // arrive, the uploading peer's manifest entry will already exist;
+      // any subsequent open of the file from this peer will read from
+      // disk via the normal Obsidian path.
+      const bytes = await this.fetchBinaryBytes(path);
       if (!bytes) {
-        // Either not uploaded yet or peer is offline. Skip — we'll catch the
-        // bytes via the binaryData observer once they arrive.
-        this.debug(`[collab] reconcile: binary ${path} has no data yet — waiting`);
+        console.log(`[collab] reconcile: binary ${path} room has no bytes yet — will fill on next access`);
         return;
       }
       if (!this.app.vault.getAbstractFileByPath(path)) {
         await this.app.vault.createBinary(path, toArrayBuffer(bytes));
-        this.debug(`[collab] reconcile: created binary ${path} (${bytes.byteLength} bytes)`);
+        console.log(`[collab] reconcile: created binary ${path} (${bytes.byteLength} bytes)`);
+      } else {
+        // Local file already exists — overwrite only if bytes differ.
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+          const current = new Uint8Array(await this.app.vault.readBinary(existing));
+          if (!bytesEqual(current, bytes)) {
+            await this.app.vault.modifyBinary(existing, toArrayBuffer(bytes));
+            console.log(`[collab] reconcile: updated binary ${path} (${bytes.byteLength} bytes)`);
+          }
+        }
       }
     } catch (err) {
       console.warn("[collab] materialise failed", path, err);
@@ -1612,8 +1788,155 @@ export default class CollabPlugin extends Plugin {
     }
   }
 
+  // ── per-binary rooms (one Y.Doc per file's bytes) ─────────────────────────
+  //
+  // Bytes for binary files no longer ride inside the shared manifest Y.Doc
+  // — that ballooned the manifest to tens of MB and forced every new peer
+  // to download the lot before opening their first markdown file. Each
+  // binary instead lives in its own room (`bin:<path>` for live files,
+  // `bin:trash:<uuid>` for soft-deleted ones), opened lazily on demand
+  // and torn down once the write or read has completed and the local
+  // change has had time to make it to the server.
+
+  // Open (or join) the per-binary Y.Doc room for a path. Refcounted: every
+  // caller MUST pair this with closeBinaryRoom. Resolves once the provider
+  // is synced — readers can then safely read .blob.get("bytes") and writers
+  // can set it. The provider stays alive between openBinaryRoom calls
+  // thanks to refCount; the IndexedDB cache means re-opens are fast.
+  private async openBinaryRoom(roomName: string): Promise<BinaryRoom> {
+    if (!this.socket) {
+      throw new Error(`[collab] openBinaryRoom(${roomName}): no socket`);
+    }
+    const existing = this.binaryRooms.get(roomName);
+    if (existing) {
+      existing.refCount++;
+      // Cancel any pending close — somebody wants this room again.
+      if (existing.pendingClose) {
+        clearTimeout(existing.pendingClose);
+        existing.pendingClose = null;
+      }
+      // Still await sync — in the unlikely case it was queued before the
+      // first sync completed, callers shouldn't read empty bytes.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((existing.provider as any).synced !== true) {
+        await waitForProviderSync(existing.provider, 6000);
+      }
+      return existing;
+    }
+
+    console.log(`[collab] openBinaryRoom: opening ${roomName}`);
+    const ydoc = new Y.Doc();
+    const blob = ydoc.getMap<Uint8Array>("blob");
+    const provider = new HocuspocusProvider({
+      websocketProvider: this.socket,
+      name: roomName,
+      document: ydoc,
+      token: this.settings.authToken || undefined,
+    });
+    provider.attach();
+    const persistence = new IndexeddbPersistence(
+      `obsidian-collab::${this.settings.serverUrl}::${roomName}`,
+      ydoc,
+    );
+    const room: BinaryRoom = {
+      roomName,
+      ydoc,
+      provider,
+      persistence,
+      blob,
+      refCount: 1,
+      pendingClose: null,
+    };
+    this.binaryRooms.set(roomName, room);
+
+    provider.on("authenticationFailed", (data: { reason: string }) => {
+      console.error(`[collab] binary room "${roomName}" auth failed: ${data.reason}`);
+    });
+
+    // Wait for both the local cache load and the first server sync so a
+    // caller reading `blob.get("bytes")` sees authoritative state — not an
+    // empty Y.Map that gets filled half a second later.
+    await Promise.race([
+      Promise.all([persistence.whenSynced, waitForProviderSync(provider, 8000)]),
+      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+    ]);
+    console.log(
+      `[collab] openBinaryRoom: ${roomName} synced, hasBytes=${blob.has("bytes")}`,
+    );
+    return room;
+  }
+
+  // Decrement refcount on a per-binary room and, when nobody else holds it,
+  // schedule a delayed teardown so Hocuspocus has time to flush pending
+  // writes to the server. The hold is non-trivial (~4 s) because Hocuspocus
+  // batches writes server-side; destroying the provider too soon truncates
+  // bytes in transit.
+  private releaseBinaryRoom(room: BinaryRoom) {
+    room.refCount = Math.max(0, room.refCount - 1);
+    if (room.refCount > 0) return;
+    if (room.pendingClose) return;
+    room.pendingClose = setTimeout(() => {
+      // Final guard: somebody re-acquired the room between scheduling
+      // and now. Bail out, leave them to schedule their own close.
+      if (room.refCount > 0) {
+        room.pendingClose = null;
+        return;
+      }
+      void this.closeBinaryRoom(room.roomName);
+    }, BINARY_FLUSH_HOLD_MS);
+  }
+
+  // Immediate teardown (no flush hold). Used by stopVaultSync on unload
+  // and by the release timer above. Persistence destroy is awaited BEFORE
+  // the Y.Doc destroy so the final IndexedDB write isn't writing into a
+  // torn-down doc.
+  private async closeBinaryRoom(roomName: string) {
+    const room = this.binaryRooms.get(roomName);
+    if (!room) return;
+    this.binaryRooms.delete(roomName);
+    if (room.pendingClose) {
+      clearTimeout(room.pendingClose);
+      room.pendingClose = null;
+    }
+    console.log(`[collab] closeBinaryRoom: ${roomName}`);
+    try {
+      await room.persistence.destroy();
+    } catch (err) {
+      console.warn(`[collab] binary persistence destroy failed for ${roomName}`, err);
+    }
+    try {
+      room.provider.destroy();
+    } catch (err) {
+      console.warn(`[collab] binary provider destroy failed for ${roomName}`, err);
+    }
+    try {
+      room.ydoc.destroy();
+    } catch (err) {
+      console.warn(`[collab] binary ydoc destroy failed for ${roomName}`, err);
+    }
+  }
+
+  // Public: fetch the bytes for a binary file by vault path, lazily opening
+  // its room. Returns null if the room exists but has no bytes yet (e.g.
+  // a peer added the manifest entry but hasn't finished uploading).
+  private async fetchBinaryBytes(path: string): Promise<Uint8Array | null> {
+    const roomName = pathToBinaryRoom(path);
+    const room = await this.openBinaryRoom(roomName);
+    try {
+      const bytes = room.blob.get("bytes");
+      return bytes ?? null;
+    } finally {
+      this.releaseBinaryRoom(room);
+    }
+  }
+
+  // Upload (or re-upload) local bytes for a binary file to its per-file
+  // room. Refuses files above the 25 MB cap. Skips no-op writes when the
+  // remote room already holds identical bytes — every Obsidian `modify`
+  // event on a binary fires this, and many of them aren't content changes
+  // (mtime touches from external sync layers).
   private async uploadBinary(file: TFile) {
-    if (!this.manifestBinaries) return;
+    if (!this.socket) return;
     try {
       const buf = await this.app.vault.readBinary(file);
       if (buf.byteLength > MAX_BINARY_BYTES) {
@@ -1622,16 +1945,21 @@ export default class CollabPlugin extends Plugin {
         return;
       }
       const next = new Uint8Array(buf);
-      // Skip the write if the bytes haven't actually changed. Without
-      // this every Obsidian "modify" event on a binary file (e.g. when
-      // a sync layer touches mtime) triggers a fresh full-content
-      // Y.Map.set, which the CRDT then broadcasts to every peer. Same
-      // bytes, but each peer rewrites the file on disk → modify event
-      // → uploadBinary again. Cheap byte-equal check breaks the loop.
-      const prev = this.manifestBinaries.get(file.path);
-      if (prev && bytesEqual(prev, next)) return;
-      this.manifestBinaries.set(file.path, next);
-      this.debug(`[collab] uploaded binary ${file.path} (${buf.byteLength} bytes)`);
+      const roomName = pathToBinaryRoom(file.path);
+      const room = await this.openBinaryRoom(roomName);
+      try {
+        const prev = room.blob.get("bytes");
+        if (prev && bytesEqual(prev, next)) {
+          this.debug(`[collab] uploadBinary: ${file.path} unchanged, skipping`);
+          return;
+        }
+        room.blob.set("bytes", next);
+        console.log(
+          `[collab] uploadBinary: wrote ${buf.byteLength} bytes to ${roomName}`,
+        );
+      } finally {
+        this.releaseBinaryRoom(room);
+      }
     } catch (err) {
       console.warn("[collab] uploadBinary failed", file.path, err);
     }
@@ -1683,20 +2011,18 @@ export default class CollabPlugin extends Plugin {
   }
 
   private onLocalVaultDelete(file: TAbstractFile) {
-    if (!this.manifestMap || !this.manifestBinaries || !this.manifestTrash || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestTrash || !this.manifestYDoc) return;
     if (this.remoteApplyPaths.has(file.path)) return;
     const entry = this.manifestMap.get(file.path);
     if (!entry) return;
     // Tear down any structural session before forgetting the path.
-    // The close is async (awaits IndexedDB destroy), but we don't
-    // need to wait — subsequent code only touches the manifest, not
-    // the structural session.
     if (entry.kind === "canvas" || entry.kind === "text") {
       void this.closeStructuralSession(file.path);
     }
-    // Move into trash with a UUID so the original path can later be reused
-    // for a new file without clobbering the soft-deleted copy.
     const uuid = (globalThis.crypto?.randomUUID?.()) ?? `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // Manifest part stays a single transaction — peers see the delete +
+    // trash add atomically. The bytes move (out of `bin:<path>` and into
+    // `bin:trash:<uuid>`) is a separate async dance below.
     this.manifestYDoc.transact(() => {
       this.manifestMap!.delete(file.path);
       this.manifestTrash!.set(uuid, {
@@ -1705,48 +2031,92 @@ export default class CollabPlugin extends Plugin {
         kind: entry.kind,
         deletedAt: Date.now(),
       });
-      const bytes = this.manifestBinaries!.get(file.path);
-      if (bytes) {
-        this.manifestBinaries!.delete(file.path);
-        this.manifestBinaries!.set(`trash:${uuid}`, bytes);
-      }
     });
+    if (entry.kind === "binary") {
+      void this.moveBinaryBytes(
+        pathToBinaryRoom(file.path),
+        trashUuidToBinaryRoom(uuid),
+        `soft-delete ${file.path} → trash:${uuid}`,
+      );
+    }
     this.debug(`[collab] soft-deleted ${file.path} → trash:${uuid}`);
   }
 
+  // Move the `bytes` key from one binary room to another. Used by
+  // soft-delete, restore, and rename. We MUST not delete from the source
+  // until the destination has confirmed the write to the server (otherwise
+  // a crash mid-move would lose the bytes). Pragmatic ordering: read from
+  // source → write to destination → release destination (which triggers
+  // its delayed flush) → only then delete from source.
+  private async moveBinaryBytes(
+    fromRoomName: string,
+    toRoomName: string,
+    tag: string,
+  ): Promise<void> {
+    if (!this.socket) return;
+    try {
+      const fromRoom = await this.openBinaryRoom(fromRoomName);
+      try {
+        const bytes = fromRoom.blob.get("bytes");
+        if (!bytes) {
+          console.warn(`[collab] moveBinaryBytes(${tag}): source room has no bytes`);
+          return;
+        }
+        const toRoom = await this.openBinaryRoom(toRoomName);
+        try {
+          toRoom.blob.set("bytes", bytes);
+          console.log(`[collab] moveBinaryBytes(${tag}): wrote ${bytes.byteLength} bytes to ${toRoomName}`);
+        } finally {
+          this.releaseBinaryRoom(toRoom);
+        }
+        // Only delete from source AFTER we've handed bytes off. The
+        // releaseBinaryRoom above schedules the destination flush; we
+        // don't need to await that — the local Y.Map.set + IndexedDB
+        // write are synchronous within the Y.Doc, so the bytes are
+        // safely captured before we clear the source.
+        fromRoom.blob.delete("bytes");
+        console.log(`[collab] moveBinaryBytes(${tag}): cleared ${fromRoomName}`);
+      } finally {
+        this.releaseBinaryRoom(fromRoom);
+      }
+    } catch (err) {
+      console.warn(`[collab] moveBinaryBytes(${tag}) failed`, err);
+    }
+  }
+
   private onLocalVaultRename(file: TAbstractFile, oldPath: string) {
-    if (!this.manifestMap || !this.manifestBinaries || !this.manifestYDoc) return;
+    if (!this.manifestMap || !this.manifestYDoc) return;
     if (this.remoteApplyPaths.has(file.path) || this.remoteApplyPaths.has(oldPath)) return;
     const kind = this.classify(file);
     if (!kind) return;
-    // If a structural session was watching the old path, move it.
-    // Close is async; we kick off the new session immediately so the
-    // user doesn't see a sync gap, and rely on closeStructuralSession's
-    // earlier `delete(path)` to make sure we're not handing the same
-    // path to two simultaneous sessions.
     if (kind === "canvas" || kind === "text") {
       void this.closeStructuralSession(oldPath);
       this.openStructuralSession(file.path, kind);
     }
-    // Group delete + set in one transaction so peers can recognise this as
-    // a rename (1 delete + 1 add in the same change event) instead of a
-    // delete-then-create, which would lose content.
+    // Manifest delete+set still atomic so peers see one rename event.
     this.manifestYDoc.transact(() => {
       this.manifestMap!.delete(oldPath);
       this.manifestMap!.set(file.path, { kind, createdAt: Date.now() });
-      const data = this.manifestBinaries!.get(oldPath);
-      if (data) {
-        this.manifestBinaries!.delete(oldPath);
-        this.manifestBinaries!.set(file.path, data);
-      }
     });
+    if (kind === "binary") {
+      // Bytes move between rooms as a separate async dance. Yjs is
+      // eventually-consistent so peers will briefly see the new path with
+      // no bytes — fetchBinaryBytes on the receiving side will short-
+      // circuit and try again on next access. Acceptable for a rename
+      // (no data loss, only a brief absence).
+      void this.moveBinaryBytes(
+        pathToBinaryRoom(oldPath),
+        pathToBinaryRoom(file.path),
+        `rename ${oldPath} → ${file.path}`,
+      );
+    }
   }
 
   private onLocalVaultModify(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
     console.log(`[collab] vault.modify: ${file.path} (.${file.extension})`);
     if (file.extension === "md") return; // markdown content syncs via editor binding
-    if (!this.manifestMap || !this.manifestBinaries) return;
+    if (!this.manifestMap) return;
     if (this.remoteApplyPaths.has(file.path)) {
       console.log(`[collab] vault.modify: suppressed (remote echo) ${file.path}`);
       return;
@@ -1803,41 +2173,11 @@ export default class CollabPlugin extends Plugin {
     for (const a of adds) await this.materialise(a.path, a.entry);
   }
 
-  // When the manifestBinaries map changes — typically because a peer
-  // re-uploaded an existing image — write the new bytes to local disk.
-  private async onBinaryDataChange(event: Y.YMapEvent<Uint8Array>) {
-    if (!this.manifestBinaries) return;
-    for (const [key, change] of event.changes.keys.entries()) {
-      if (change.action === "delete") continue; // delete is handled via manifestMap
-      // The manifestBinaries map is also used to hold raw bytes for
-      // soft-deleted entries under reserved keys like `trash:<uuid>`
-      // (so they can be restored later without losing data). Those
-      // keys are NOT real vault paths and must never reach
-      // createBinary — Obsidian rejects them because `:` is illegal
-      // in path names and the resulting exception used to bubble up
-      // every time the manifest synced, blocking real updates.
-      if (key.startsWith("trash:")) continue;
-      const path = key;
-      const bytes = this.manifestBinaries.get(path);
-      if (!bytes) continue;
-      const local = this.app.vault.getAbstractFileByPath(path);
-      this.remoteApplyPaths.add(path);
-      try {
-        if (local instanceof TFile) {
-          await this.app.vault.modifyBinary(local, toArrayBuffer(bytes));
-          this.debug(`[collab] remote binary update: ${path} (${bytes.byteLength} bytes)`);
-        } else if (!local) {
-          await this.ensureFolderExists(path);
-          await this.app.vault.createBinary(path, toArrayBuffer(bytes));
-          this.debug(`[collab] remote binary create: ${path} (${bytes.byteLength} bytes)`);
-        }
-      } catch (err) {
-        console.warn("[collab] remote binary write failed", path, err);
-      } finally {
-        setTimeout(() => this.remoteApplyPaths.delete(path), SUPPRESS_HOLD_MS);
-      }
-    }
-  }
+  // (Previous versions had onBinaryDataChange here, observing the now-gone
+  // shared manifestBinaries Y.Map. Per-binary rooms make that observer
+  // obsolete: a re-upload from a remote peer touches only their per-file
+  // room, and we fetch on next manifest reconcile / explicit access. The
+  // 0.8.3 trash-key bug class disappears with the removed code path.)
 
   private async applyRemoteRename(oldPath: string, newPath: string, entry: ManifestEntry) {
     const localFile = this.app.vault.getAbstractFileByPath(oldPath);
