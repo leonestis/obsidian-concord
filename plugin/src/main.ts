@@ -53,7 +53,7 @@ interface CollabSettings {
 }
 
 const DEFAULT_SETTINGS: CollabSettings = {
-  serverUrl: "ws://158.255.5.243:1234",
+  serverUrl: "",
   blobServerUrl: "",
   authToken: "",
   userName: "",
@@ -390,7 +390,7 @@ class CollabSettingTab extends PluginSettingTab {
       .setDesc("WebSocket URL of the Hocuspocus server (ws:// or wss://).")
       .addText((text) =>
         text
-          .setPlaceholder("ws://158.255.5.243:1234")
+          .setPlaceholder("ws://your-server.example.com:1234")
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
@@ -405,7 +405,7 @@ class CollabSettingTab extends PluginSettingTab {
       )
       .addText((text) =>
         text
-          .setPlaceholder("http://158.255.5.243:1234")
+          .setPlaceholder("http://your-server.example.com:1234")
           .setValue(this.plugin.settings.blobServerUrl)
           .onChange(async (value) => {
             this.plugin.settings.blobServerUrl = value.trim();

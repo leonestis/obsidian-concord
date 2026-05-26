@@ -20,7 +20,7 @@ export interface BlobProgress {
 
 export class BinaryClient {
   constructor(
-    // e.g. "http://158.255.5.243:1234". No trailing slash.
+    // e.g. "http://your-server.example.com:1234". No trailing slash.
     private readonly baseUrl: string,
     private readonly authToken: string | undefined,
   ) {}

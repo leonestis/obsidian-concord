@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 1.0.1 — 2026-05-27
+
+### Security
+- **Removed the maintainer's reference-deployment server URL from the codebase.** The default `serverUrl` in `DEFAULT_SETTINGS` was hard-coded to a specific IP that an operator (me) was running, and the same IP appeared in two Setting placeholders, a code comment, and an installation doc. Open repo + UNAUTHENTICATED server mode meant anyone reading the source could connect to that deploy and pollute or read its shared CRDT state. Default `serverUrl` is now `""` — the plugin won't connect until the user fills in their own server URL. Placeholders and doc examples now use `your-server.example.com`. Operators must now run their server with `JWT_SECRET` set (the gate exists since 0.4 but was opt-in); the install doc explicitly tells new users to ask their operator for both the URL and the auth token. The IP is still in the git history of older commits — that's a one-way leak we can't undo without rewriting public history, so the real mitigation is the JWT requirement on the server side, which kicks unauthenticated connections at the handshake.
+
 ## 1.0.0 — 2026-05-26
 
 Architectural rewrite of the non-canvas parts of the plugin. Canvas realtime presence (`canvas-cursors.ts`) and the editor↔Y.Text binding (`collab-binding.ts`) are kept byte-identical — both have stabilised through 0.8.x / 0.9.x. Everything else has been redesigned from first principles to kill three classes of bug at the root rather than patching their symptoms one at a time. Existing server state is wiped before deploy; there is no migration path from 0.9.x and the server's `MIN_CLIENT_VERSION` refuses anything below 1.0.0.

@@ -16,13 +16,13 @@ You have two choices. **BRAT** is the painless one — set up once and your plug
    ```
 
 5. Tick *"Enable after installing"* and click **Add Plugin**. BRAT downloads the latest release and turns the plugin on.
-6. Go to **Settings → Community plugins → Installed → Collab (self-hosted realtime)**, click the gear icon, and fill in **Server URL**:
+6. Go to **Settings → Community plugins → Installed → Collab (self-hosted realtime)**, click the gear icon, and fill in **Server URL** with the address of your Hocuspocus server, for example:
 
    ```
-   ws://158.255.5.243:1234
+   ws://your-server.example.com:1234
    ```
 
-   Also set your **Display name** so other people see who you are when collaborating.
+   Ask the operator running your server for the exact URL and the JWT auth token (paste it into **Auth token** — required when the server runs in authenticated mode). Also set your **Display name** so other people see who you are when collaborating.
 
 That's it. When we ship a new version BRAT will install it automatically the next time you open Obsidian.
 

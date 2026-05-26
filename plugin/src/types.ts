@@ -96,4 +96,4 @@ export type AnySession = BaseSession & Record<string, any>;
 // introduces v2 (UUID-keyed rooms, HTTP-stored binaries).
 export const PROTOCOL_VERSION = 2;
 
-export const PLUGIN_VERSION = "1.0.0";
+export const PLUGIN_VERSION = "1.0.1";
