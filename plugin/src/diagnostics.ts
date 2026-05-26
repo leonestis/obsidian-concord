@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Status bar + diagnostics command output. Two responsibilities:
+//   1. Render a small status pill in the bottom-right ("🟢 collab live"
+//      / "🔴 collab offline") with optional progress overlay
+//      ("(uploading 42%)" or "(syncing 3/12 binaries)").
+//   2. Surface "show diagnostics" command — connection state, active
+//      sessions, editor binding sanity, manifest size.
+//
+// Status bar is desktop-only — Obsidian's mobile build doesn't expose
+// addStatusBarItem. We feature-detect and fall back to silently
+// no-oping (the connect/disconnect Notice on mobile is enough signal).
+
+import { App, Notice, Plugin } from "obsidian";
+import type { SessionManager } from "./session-manager";
+
+export class StatusBar {
+  private el: HTMLElement | null = null;
+  private connected = false;
+  private progressLabel: string | null = null;
+  private serverUrl = "";
+
+  constructor(plugin: Plugin) {
+    // addStatusBarItem returns undefined on mobile. Guard.
+    try {
+      const item = plugin.addStatusBarItem?.();
+      if (item) this.el = item;
+    } catch {
+      this.el = null;
+    }
+  }
+
+  setServerUrl(url: string) {
+    this.serverUrl = url;
+    this.render();
+  }
+
+  setConnected(c: boolean) {
+    if (c === this.connected) return;
+    this.connected = c;
+    this.render();
+  }
+
+  setProgress(label: string | null) {
+    this.progressLabel = label;
+    this.render();
+  }
+
+  private render() {
+    if (!this.el) return;
+    const dot = this.connected ? "🟢" : "🔴";
+    const label = this.connected ? "collab live" : "collab offline";
+    const progress = this.progressLabel ? ` (${this.progressLabel})` : "";
+    this.el.setText(`${dot} ${label}${progress}`);
+    this.el.setAttr("title", `Server: ${this.serverUrl}`);
+  }
+}
+
+export function showDiagnostics(
+  app: App,
+  serverUrl: string,
+  connected: boolean,
+  sessionManager: SessionManager,
+  manifestSize: number,
+): void {
+  const lines: string[] = [];
+  lines.push(`Server URL: ${serverUrl}`);
+  lines.push(
+    `Socket: ${connected ? "🟢 connected" : "🔴 disconnected"}`,
+  );
+  lines.push(`Read-only mode: ${sessionManager.isReadOnly() ? "yes" : "no"}`);
+  lines.push(`Manifest entries: ${manifestSize}`);
+  const sessions = sessionManager.describe();
+  lines.push(`Sessions (${sessions.length}):`);
+  for (const s of sessions) {
+    lines.push(`  • ${s.path}  →  ${s.state}${s.docId ? "  [" + s.docId.slice(0, 8) + "…]" : ""}`);
+  }
+  void app; // unused for now but reserved for future leaf-state inspection
+  const msg = lines.join("\n");
+  console.log("[collab] diagnostics:\n" + msg);
+  new Notice(msg, 15_000);
+}
