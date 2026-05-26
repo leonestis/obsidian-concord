@@ -24,7 +24,7 @@ import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 // versions with known data-corruption bugs (the 0.5.x doubling
 // regression) before they get to overwrite anything in the shared
 // CRDT.
-const PLUGIN_VERSION = "0.9.2";
+const PLUGIN_VERSION = "0.9.3";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // settings
@@ -411,6 +411,19 @@ export default class CollabPlugin extends Plugin {
   private nextAttachToken = 1;
   private latestAttachToken = new Map<string, number>();
 
+  // Per-editor-view record of which Y.Text we last installed into the
+  // compartment. Lets attachFile detect a stale binding cheaply: if
+  // `boundYtextByEditor.get(editorView) !== session.ytext`, the editor
+  // is wired to a Y.Text owned by a now-destroyed session (e.g. left
+  // over after a rename or a session recreation) and we MUST
+  // reconfigure the compartment with the fresh binding. Without this
+  // a sequence like rename → destroySession(old) → openCanvas(new) /
+  // recreate-text-session leaves typing into a dead Y.Text — no
+  // updates ever reach the server.
+  //
+  // WeakMap so a destroyed EditorView doesn't keep entries around.
+  private boundYtextByEditor = new WeakMap<EditorView, Y.Text>();
+
   async onload() {
     await this.loadSettings();
     console.log("[collab] plugin loaded");
@@ -440,6 +453,12 @@ export default class CollabPlugin extends Plugin {
       id: "collab-show-trash",
       name: "Show deleted files (trash)",
       callback: () => this.openTrashModal(),
+    });
+
+    this.addCommand({
+      id: "collab-wipe-local-cache",
+      name: "Wipe local cache (IndexedDB)",
+      callback: () => this.openWipeCacheModal(),
     });
 
     // React to the user opening a file in any pane.
@@ -683,6 +702,15 @@ export default class CollabPlugin extends Plugin {
       effects: this.editorCompartment.reconfigure(collabExtension),
     });
 
+    // Record which Y.Text this editor is now wired to. attachFile and
+    // any future rebind decision (e.g. after a rename destroys the
+    // old session) consults this map to spot stale bindings without
+    // having to peek at the ViewPlugin internals.
+    this.boundYtextByEditor.set(editorView, session.ytext);
+
+    console.log(
+      `[collab] compartment.reconfigure → ${file.path} (room=${targetRoom}, ytext.length=${session.ytext.length})`,
+    );
     this.debug(`${tag}: bound collab binding to editor (room=${targetRoom})`);
     return true;
   }
@@ -798,8 +826,19 @@ export default class CollabPlugin extends Plugin {
     }
     for (const editorView of editorViews) {
       if (!isLatest()) {
-        this.debug(`${tag}: superseded mid-dispatch, aborting remaining panes`);
+        console.log(`${tag}: superseded mid-dispatch, aborting remaining panes`);
         return;
+      }
+      // Stale-binding detection: if this editor was already wired to a
+      // *different* Y.Text (e.g. a destroyed session left over from a
+      // rename or a session recreation), shout about it. We rebind
+      // unconditionally below anyway — this log is for the next round
+      // of "why did my editor lose its binding" debugging.
+      const previouslyBound = this.boundYtextByEditor.get(editorView);
+      if (previouslyBound && previouslyBound !== session.ytext) {
+        console.log(
+          `${tag}: stale binding detected (previous ytext is not the current session's), force-rebinding`,
+        );
       }
       this.bindCollabTo(editorView, session, awareness, file, targetRoom);
     }
@@ -957,10 +996,14 @@ export default class CollabPlugin extends Plugin {
     session.observers.push(diskSyncObserver);
 
     this.sessions.set(file.path, session);
+    console.log(`[collab] createSession: new FileSession for ${file.path}`);
     return session;
   }
 
   private async destroySession(session: FileSession) {
+    console.log(
+      `[collab] destroySession: ${session.filePath} (ytext.length=${session.ytext.length})`,
+    );
     // Flip the destroyed flag first so any disk-sync timer that fires
     // between now and clearTimeout below bails out at its first check.
     session.destroyed = true;
@@ -1005,10 +1048,36 @@ export default class CollabPlugin extends Plugin {
 
   private async onRename(file: TAbstractFile, oldPath: string) {
     const session = this.sessions.get(oldPath);
-    if (!session) return;
-    this.sessions.delete(oldPath);
-    await this.destroySession(session);
-    if (file instanceof TFile && file.extension === "md") void this.attachFile(file);
+    if (session) {
+      console.log(`[collab] onRename: tearing down session for ${oldPath}`);
+      this.sessions.delete(oldPath);
+      await this.destroySession(session);
+    }
+    // Drop the latest-attach token for the OLD path — without this a
+    // stale in-flight attachFile keyed on the old path can later
+    // log "newer attach superseded us" against itself and never
+    // bind. The new path mints its own token in attachFile.
+    this.latestAttachToken.delete(oldPath);
+
+    // Markdown re-bind on rename. We re-attach even if there was no
+    // pre-existing session — the file may have been opened mid-rename
+    // or a previous attachFile bailed (token race) and never bound.
+    // attachFile is idempotent and re-uses an existing session when
+    // one already exists for the new path; the stale-binding check
+    // inside attachFile will force a compartment rebind if the
+    // editor was still wired to the now-destroyed old session's
+    // Y.Text.
+    if (file instanceof TFile && file.extension === "md") {
+      // Only re-attach if some pane is actually displaying this file.
+      // Otherwise we'd open a Y.Doc for a file the user isn't editing.
+      const editors = this.editorsForPath(file.path);
+      if (editors.length > 0) {
+        console.log(`[collab] onRename: re-attaching ${file.path} (${editors.length} editor(s))`);
+        void this.attachFile(file);
+      } else {
+        console.log(`[collab] onRename: ${file.path} not currently open in any pane, deferring`);
+      }
+    }
   }
 
   // ── vault structure sync (manifest) ────────────────────────────────────────
@@ -1978,6 +2047,217 @@ export default class CollabPlugin extends Plugin {
     }
   }
 
+  // Open a transient Y.Doc + provider for a room, wait for sync, clear
+  // its content, hold the doc open briefly so the empty-state update
+  // reaches the server's debounced store, then tear it all down. Used
+  // by onLocalVaultDelete for paths that were never opened locally
+  // and therefore have no live session — without wiping the room
+  // server-side, the next create at the same path would be born with
+  // the deleted file's old content (the "file rebirth" bug).
+  //
+  // No IndexedDB persistence — this is a throwaway. Fire-and-forget
+  // from the caller; we never block the delete event handler on it.
+  private async clearAndPersistEmptyRoom(
+    roomName: string,
+    kind: "text" | "canvas" | "atomic",
+  ): Promise<void> {
+    if (!this.socket) {
+      console.warn(
+        `[collab] clearAndPersistEmptyRoom(${roomName}): no socket, skipping`,
+      );
+      return;
+    }
+    console.log(
+      `[collab] clearAndPersistEmptyRoom: opening transient wipe-session for ${roomName} (kind=${kind})`,
+    );
+    const ydoc = new Y.Doc();
+    const provider = new HocuspocusProvider({
+      websocketProvider: this.socket,
+      name: roomName,
+      document: ydoc,
+      token: this.settings.authToken || undefined,
+    });
+    provider.attach();
+    try {
+      // Wait for first server sync so we know we've loaded the current
+      // state before wiping (otherwise we'd just send an empty update
+      // that the server merges with whatever it has, leaving the old
+      // content intact).
+      await Promise.race([
+        waitForProviderSync(provider, 5000),
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ]);
+
+      if (kind === "text") {
+        const ytext = ydoc.getText("content");
+        if (ytext.length > 0) {
+          ydoc.transact(() => {
+            ytext.delete(0, ytext.length);
+          });
+          console.log(
+            `[collab] clearAndPersistEmptyRoom: wiped Y.Text in ${roomName}`,
+          );
+        } else {
+          console.log(
+            `[collab] clearAndPersistEmptyRoom: ${roomName} Y.Text already empty`,
+          );
+        }
+      } else if (kind === "canvas") {
+        const nodes = ydoc.getMap<Y.Map<unknown>>("canvas.nodes");
+        const edges = ydoc.getMap<Y.Map<unknown>>("canvas.edges");
+        const meta = ydoc.getMap<unknown>("canvas.meta");
+        ydoc.transact(() => {
+          for (const id of Array.from(nodes.keys())) nodes.delete(id);
+          for (const id of Array.from(edges.keys())) edges.delete(id);
+          for (const key of Array.from(meta.keys())) meta.delete(key);
+        });
+        console.log(
+          `[collab] clearAndPersistEmptyRoom: wiped canvas maps in ${roomName}`,
+        );
+      } else {
+        const doc = ydoc.getMap<string>("atomic");
+        if (doc.has("content")) {
+          ydoc.transact(() => {
+            doc.delete("content");
+          });
+          console.log(
+            `[collab] clearAndPersistEmptyRoom: wiped atomic map in ${roomName}`,
+          );
+        }
+      }
+
+      // Hold the doc open long enough for the empty-state update to
+      // flush through Hocuspocus's debounced server-side store
+      // (typically ~2 s). Without this hold the provider.destroy()
+      // tears down the socket subscription before the update has
+      // been acknowledged.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    } catch (err) {
+      console.warn(
+        `[collab] clearAndPersistEmptyRoom(${roomName}) failed`,
+        err,
+      );
+    } finally {
+      try {
+        provider.destroy();
+      } catch (err) {
+        console.warn(
+          `[collab] clearAndPersistEmptyRoom: provider destroy failed for ${roomName}`,
+          err,
+        );
+      }
+      try {
+        ydoc.destroy();
+      } catch (err) {
+        console.warn(
+          `[collab] clearAndPersistEmptyRoom: ydoc destroy failed for ${roomName}`,
+          err,
+        );
+      }
+      console.log(
+        `[collab] clearAndPersistEmptyRoom: tore down transient wipe-session for ${roomName}`,
+      );
+    }
+  }
+
+  // ── wipe local cache (IndexedDB) ──────────────────────────────────────────
+  //
+  // Power-user escape hatch: disconnect, delete every IndexedDB database
+  // we've created for the current server URL, then reconnect. After a
+  // session in which the local cache has accumulated stale or corrupt
+  // Y.Doc state (e.g. from a pre-fix release), this gets back to a
+  // clean slate without manually clicking through DevTools.
+
+  private openWipeCacheModal() {
+    new WipeCacheModal(this.app, this.settings.serverUrl, () =>
+      this.performWipeLocalCache(),
+    ).open();
+  }
+
+  private async performWipeLocalCache(): Promise<void> {
+    console.log("[collab] performWipeLocalCache: starting");
+    // Disconnect cleanly so no provider holds a database file open
+    // while we try to drop it (otherwise Chromium would queue the
+    // delete until the connection closes anyway, but disconnecting
+    // first keeps the log readable).
+    await this.stopVaultSync();
+    for (const session of Array.from(this.sessions.values())) {
+      await this.destroySession(session);
+    }
+    this.sessions.clear();
+    this.socket?.destroy();
+    this.socket = null;
+    // Let any pending observer-cleanup microtasks settle. 200 ms is
+    // empirically plenty — IndexedDB transactions started just before
+    // the socket close will have committed by then.
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    const prefix = `obsidian-collab::${this.settings.serverUrl}::`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const idb = indexedDB as unknown as { databases?: () => Promise<Array<{ name?: string }>> };
+    if (typeof idb.databases !== "function") {
+      console.warn(
+        "[collab] performWipeLocalCache: indexedDB.databases() unavailable (Firefox?)",
+      );
+      new Notice(
+        "Collab: cannot enumerate IndexedDB on this browser. Open DevTools → Application → IndexedDB and delete entries starting with " +
+          prefix,
+        15_000,
+      );
+      // Reconnect anyway so the user isn't left disconnected.
+      this.connect();
+      return;
+    }
+
+    let dbs: Array<{ name?: string }>;
+    try {
+      dbs = await idb.databases();
+    } catch (err) {
+      console.warn("[collab] performWipeLocalCache: databases() threw", err);
+      new Notice("Collab: failed to enumerate IndexedDB — see console");
+      this.connect();
+      return;
+    }
+    const targets = dbs
+      .map((d) => d.name)
+      .filter((n): n is string => typeof n === "string" && n.startsWith(prefix));
+    console.log(
+      `[collab] performWipeLocalCache: found ${targets.length} databases to drop`,
+    );
+    let deleted = 0;
+    for (const name of targets) {
+      await new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = () => {
+          deleted++;
+          console.log(`[collab] performWipeLocalCache: deleted ${name}`);
+          resolve();
+        };
+        req.onerror = () => {
+          console.warn(
+            `[collab] performWipeLocalCache: failed to delete ${name}`,
+            req.error,
+          );
+          resolve();
+        };
+        req.onblocked = () => {
+          console.warn(
+            `[collab] performWipeLocalCache: delete blocked for ${name} (another tab holding it open?)`,
+          );
+          resolve();
+        };
+      });
+    }
+    new Notice(
+      `Collab: wiped ${deleted}/${targets.length} local cache database(s). Reconnecting…`,
+      8000,
+    );
+    console.log(
+      `[collab] performWipeLocalCache: complete, ${deleted}/${targets.length} dropped`,
+    );
+    this.connect();
+  }
+
   // ── local → manifest ───────────────────────────────────────────────────────
 
   private onLocalVaultCreate(file: TAbstractFile) {
@@ -2015,6 +2295,63 @@ export default class CollabPlugin extends Plugin {
     if (this.remoteApplyPaths.has(file.path)) return;
     const entry = this.manifestMap.get(file.path);
     if (!entry) return;
+
+    // BUG 1 (file rebirth): wipe content in any active structural
+    // session BEFORE tearing it down. See the long-form comment in
+    // onDelete for the markdown side. Local-only — remote deletes
+    // arrive with their own wipe in flight from the originator.
+    const structural = this.structuralSessions.get(file.path);
+    if (structural) {
+      try {
+        if (structural.kind === "canvas") {
+          structural.ydoc.transact(() => {
+            for (const id of Array.from(structural.nodes.keys())) {
+              structural.nodes.delete(id);
+            }
+            for (const id of Array.from(structural.edges.keys())) {
+              structural.edges.delete(id);
+            }
+            for (const key of Array.from(structural.meta.keys())) {
+              structural.meta.delete(key);
+            }
+          });
+          console.log(
+            `[collab] onLocalVaultDelete: wiped canvas Y.Doc for ${file.path} pre-close`,
+          );
+        } else {
+          structural.ydoc.transact(() => {
+            if (structural.doc.has("content")) {
+              structural.doc.delete("content");
+            }
+          });
+          console.log(
+            `[collab] onLocalVaultDelete: wiped atomic Y.Doc for ${file.path} pre-close`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[collab] onLocalVaultDelete: wipe failed for ${file.path}`,
+          err,
+        );
+      }
+    } else if (entry.kind === "file" || entry.kind === "canvas" || entry.kind === "text") {
+      // No live session for this CRDT-backed path (markdown / canvas /
+      // atomic-text). The file is being deleted without ever having
+      // been opened in this Obsidian — its Y.Doc on the server
+      // probably still holds the old content. Spin up a transient
+      // wipe-session to clear it. Fire-and-forget; the manifest
+      // delete below propagates synchronously.
+      if (!this.sessions.has(file.path)) {
+        const kind: "text" | "canvas" | "atomic" =
+          entry.kind === "file"
+            ? "text"
+            : entry.kind === "canvas"
+              ? "canvas"
+              : "atomic";
+        void this.clearAndPersistEmptyRoom(pathToRoom(file.path), kind);
+      }
+    }
+
     // Tear down any structural session before forgetting the path.
     if (entry.kind === "canvas" || entry.kind === "text") {
       void this.closeStructuralSession(file.path);
@@ -2218,6 +2555,36 @@ export default class CollabPlugin extends Plugin {
   private onDelete(file: TAbstractFile) {
     const session = this.sessions.get(file.path);
     if (!session) return;
+    // BUG 1 (file rebirth): wipe the Y.Text content before tearing
+    // down the session. Without this the deleted markdown file's
+    // Y.Doc state persists server-side; the next time anyone creates
+    // a file at the same path our room reopens, loads that state,
+    // and the "new" file is born with the deleted content.
+    //
+    // ONLY on local delete. If this delete originated remotely
+    // (remoteApplyPaths.has) the other peer has already wiped and is
+    // broadcasting the empty state via this very room — wiping again
+    // here would double-wipe (no-op for correctness, but if local had
+    // any unsaved buffered edits they'd be destroyed before they
+    // could be sent).
+    if (!this.remoteApplyPaths.has(file.path)) {
+      try {
+        session.ydoc.transact(() => {
+          if (session.ytext.length > 0) {
+            session.ytext.delete(0, session.ytext.length);
+          }
+        });
+        console.log(
+          `[collab] onDelete: wiped Y.Text for ${file.path} pre-destroy`,
+        );
+      } catch (err) {
+        console.warn(`[collab] onDelete: wipe failed for ${file.path}`, err);
+      }
+    } else {
+      console.log(
+        `[collab] onDelete: remote-origin delete for ${file.path}, skipping local wipe`,
+      );
+    }
     this.sessions.delete(file.path);
     // destroySession is now async (awaits IndexedDB destroy); we
     // don't need to block the Obsidian event handler on it, so
@@ -2283,6 +2650,52 @@ class TrashModal extends Modal {
         this.close();
       });
     }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wipe-cache modal — confirms before nuking every IndexedDB row for the server
+// ─────────────────────────────────────────────────────────────────────────────
+
+class WipeCacheModal extends Modal {
+  constructor(
+    app: App,
+    private readonly serverUrl: string,
+    private readonly onConfirm: () => Promise<void>,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Wipe local cache?" });
+    contentEl.createEl("p", {
+      text:
+        "This will disconnect, delete all locally cached collab data for " +
+        this.serverUrl +
+        ", and reconnect with a fresh local state. Vault files on disk are not touched. Proceed?",
+    });
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+    cancelBtn.addEventListener("click", () => this.close());
+    const confirmBtn = buttons.createEl("button", {
+      text: "Wipe",
+      cls: "mod-warning",
+    });
+    confirmBtn.addEventListener("click", async () => {
+      confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
+      try {
+        await this.onConfirm();
+      } finally {
+        this.close();
+      }
+    });
   }
 
   onClose() {
