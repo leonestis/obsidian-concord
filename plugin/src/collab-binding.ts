@@ -199,6 +199,78 @@ export function createCollabBinding(
           // we move back.
           awareness.setLocalStateField("cursor", null);
         }
+
+        // ── Parity check (defense in depth) ────────────────────────
+        //
+        // After every update cycle, the editor and ytext lengths
+        // MUST be equal. The 0.8.x doubling loop was caused by them
+        // silently drifting apart and then each side reinterpreting
+        // the divergence as a fresh user edit, ratcheting the
+        // content size up by hundreds of chars per cycle until it
+        // hit tens of KB in a few seconds.
+        //
+        // 0.9.1 fixed the specific RangeError trigger for that
+        // drift. This check catches any OTHER drift trigger — a
+        // future bug in our editor→ytext push, an unexpected
+        // Obsidian-side editor reload, a malformed delta from a
+        // misbehaving peer, anything. As soon as a single update
+        // ends with mismatched lengths, we force-resync the editor
+        // to ytext's content. The loop cannot start.
+        //
+        // Cost is one length comparison per update. We deliberately
+        // DON'T early-return when both are zero — the resync is a
+        // no-op in that case anyway.
+        this.parityCheckAndResync(update);
+      }
+
+      // Compares editor.length to ytext.length and, if they differ,
+      // schedules a full-document replacement that brings the editor
+      // back in line with ytext. Done with setTimeout so we don't
+      // dispatch from inside CodeMirror's own update() — CodeMirror
+      // forbids re-entrant dispatches and would throw.
+      private divergenceLogged = false;
+      private parityCheckAndResync(update: ViewUpdate) {
+        const editorLen = update.state.doc.length;
+        const ytextLen = ytext.length;
+        if (editorLen === ytextLen) {
+          this.divergenceLogged = false;
+          return;
+        }
+        if (!this.divergenceLogged) {
+          // Log once per divergence episode — if the resync fixes it,
+          // the next update will reset the flag, and a recurrence will
+          // log again. Avoids spam when a single divergence causes
+          // multiple update cycles before the resync lands.
+          console.warn(
+            `[collab] editor↔ytext length parity broken: editor=${editorLen}, ytext=${ytextLen}. Force-resyncing.`,
+          );
+          this.divergenceLogged = true;
+        }
+        const view = update.view;
+        setTimeout(() => {
+          if (!view.dom.isConnected) return;
+          // Re-read both sides inside the timeout — they may have
+          // converged on their own in the meantime via an arriving
+          // remote update.
+          const currentEditorLen = view.state.doc.length;
+          const currentYtextStr = ytext.toString();
+          if (currentEditorLen === currentYtextStr.length) return;
+          try {
+            view.dispatch({
+              changes: {
+                from: 0,
+                to: currentEditorLen,
+                insert: currentYtextStr,
+              },
+              annotations: [COLLAB_SYNC.of(true)],
+            });
+            console.log(
+              `[collab] parity resync: editor restored to ytext (length=${currentYtextStr.length})`,
+            );
+          } catch (err) {
+            console.error("[collab] parity resync dispatch failed", err);
+          }
+        }, 0);
       }
 
       destroy() {

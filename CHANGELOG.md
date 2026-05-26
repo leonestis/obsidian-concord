@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 0.9.2 — 2026-05-25
+
+### Added
+- **Editor↔Y.Text length parity check on every update cycle (defense in depth).** 0.9.1 fixed the specific `RangeError` trigger that produced silent editor/ytext divergence and the resulting doubling loop. This release adds a generic check: at the end of every CodeMirror update cycle, the editor's document length must equal `ytext.length`. If they differ — for any reason, known or unknown — we immediately schedule a full-document replacement that brings the editor back in line with ytext. The cost is one length comparison per update; the upside is that any future bug that would otherwise let the two sides drift apart gets caught on the very first cycle, well before exponential growth can take off. Logged once per divergence episode so a transient resync doesn't spam the console.
+
 ## 0.9.1 — 2026-05-25
 
 ### Fixed
