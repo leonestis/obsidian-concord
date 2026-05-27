@@ -12,6 +12,7 @@
 // no-oping (the connect/disconnect Notice on mobile is enough signal).
 
 import { App, Notice, Plugin } from "obsidian";
+import { log } from "./logger";
 import type { SessionManager } from "./session-manager";
 
 export class StatusBar {
@@ -77,6 +78,6 @@ export function showDiagnostics(
   }
   void app; // unused for now but reserved for future leaf-state inspection
   const msg = lines.join("\n");
-  console.log("[collab] diagnostics:\n" + msg);
+  log.info("diag", "diagnostics:\n" + msg);
   new Notice(msg, 15_000);
 }

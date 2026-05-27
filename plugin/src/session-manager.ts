@@ -29,6 +29,7 @@ import { Compartment } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 
+import { log } from "./logger";
 import { TextSession } from "./text-session";
 import { CanvasSession } from "./canvas-session";
 import { AtomicTextSession } from "./atomic-text-session";
@@ -126,8 +127,9 @@ export class SessionManager {
         }
         // Different docId — file was deleted+recreated under same
         // path. Tear down the old, install the new.
-        console.log(
-          `[collab] attach: ${path} bound to ${st.docId}, replacing with ${docId}`,
+        log.info(
+          "session",
+          `attach: ${path} bound to ${st.docId}, replacing with ${docId}`,
         );
         await this.detach(path);
         continue;
@@ -152,7 +154,7 @@ export class SessionManager {
         continue;
       }
     }
-    console.warn(`[collab] attach: gave up after retries for ${path}`);
+    log.warn("session", `attach: gave up after retries for ${path}`);
     return null;
   }
 
@@ -164,7 +166,7 @@ export class SessionManager {
   ): Promise<AnySession | null> {
     const abort = new AbortController();
     this.byPath.set(path, { kind: "attaching", docId, sessionKind: kind, abort });
-    console.log(`[collab] attach: starting ${path} (kind=${kind}, docId=${docId})`);
+    log.info("session", `attach: starting ${path} (kind=${kind}, docId=${docId})`);
 
     try {
       const baseOpts = {
@@ -188,7 +190,7 @@ export class SessionManager {
       }
       if (abort.signal.aborted) {
         // Someone superseded us — tear down what we just built.
-        console.log(`[collab] attach: ${path} aborted post-create, destroying`);
+        log.info("session", `attach: ${path} aborted post-create, destroying`);
         await session.destroy();
         return null;
       }
@@ -198,14 +200,14 @@ export class SessionManager {
         sessionKind: kind,
         session,
       });
-      console.log(`[collab] attach: bound ${path} → ${docId}`);
+      log.info("session", `attach: bound ${path} → ${docId}`);
       // For markdown, bind to any currently-open editor views.
       if (kind === "file") {
         this.bindOpenEditorsFor(path);
       }
       return session;
     } catch (err) {
-      console.warn(`[collab] attach failed for ${path}`, err);
+      log.warn("session", `attach failed for ${path}`, err);
       this.byPath.set(path, { kind: "detached" });
       return null;
     }
@@ -245,7 +247,7 @@ export class SessionManager {
     } finally {
       this.byPath.set(path, { kind: "detached" });
       resolveDone();
-      console.log(`[collab] detach: completed ${path}`);
+      log.info("session", `detach: completed ${path}`);
     }
   }
 
@@ -273,7 +275,7 @@ export class SessionManager {
       // showed oldPath is now showing newPath).
       this.bindOpenEditorsFor(newPath);
     }
-    console.log(`[collab] handleRename: ${oldPath} → ${newPath}`);
+    log.info("session", `handleRename: ${oldPath} → ${newPath}`);
   }
 
   // ── editor binding ────────────────────────────────────────────────
@@ -297,7 +299,7 @@ export class SessionManager {
         effects: this.deps.editorCompartment.reconfigure([]),
       });
     } catch (err) {
-      console.warn("[collab] clearEditorBindingFor dispatch failed", err);
+      log.warn("binding", "clearEditorBindingFor dispatch failed", err);
     }
     this.editorBoundPath.delete(editorView);
   }
@@ -314,7 +316,7 @@ export class SessionManager {
     const session = st.session as TextSession;
     const awareness = session.provider.awareness;
     if (!awareness) {
-      console.warn(`[collab] bindOpenEditorsFor ${path}: no awareness`);
+      log.warn("binding", `bindOpenEditorsFor ${path}: no awareness`);
       return;
     }
     const views = this.editorViewsForPath(path);
@@ -341,7 +343,7 @@ export class SessionManager {
         effects: this.deps.editorCompartment.reconfigure([]),
       });
     } catch (err) {
-      console.warn("[collab] bindOne pre-clear dispatch failed", err);
+      log.warn("binding", "bindOne pre-clear dispatch failed", err);
     }
 
     // Pre-sync editor doc to Y.Text content so the binding's first
@@ -358,7 +360,7 @@ export class SessionManager {
           },
         });
       } catch (err) {
-        console.warn("[collab] bindOne pre-sync dispatch failed", err);
+        log.warn("binding", "bindOne pre-sync dispatch failed", err);
       }
     }
 
@@ -369,13 +371,11 @@ export class SessionManager {
         ]),
       });
     } catch (err) {
-      console.warn("[collab] bindOne reconfigure failed", err);
+      log.warn("binding", "bindOne reconfigure failed", err);
       return;
     }
     this.editorBoundPath.set(view, path);
-    console.log(
-      `[collab] bindOne: ${path} → ytext.length=${session.ytext.length}`,
-    );
+    log.info("binding", `bindOne: ${path} → ytext.length=${session.ytext.length}`);
   }
 
   private editorViewsForPath(path: string): EditorView[] {

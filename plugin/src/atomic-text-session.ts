@@ -12,6 +12,7 @@ import { HocuspocusProvider } from "@hocuspocus/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
+import { log } from "./logger";
 import { docIdToRoom } from "./util";
 import type { BaseSession } from "./types";
 
@@ -86,7 +87,7 @@ export class AtomicTextSession implements BaseSession {
           if (local.length > 0) this.doc.set("content", local);
           this.lastSynced = this.doc.get("content") ?? "";
         } catch (err) {
-          console.warn("[collab] atomic seed failed", this.path, err);
+          log.warn("session", "atomic seed failed", this.path, err);
         }
       } else if (file instanceof TFile) {
         this.lastSynced = remote;
@@ -98,7 +99,7 @@ export class AtomicTextSession implements BaseSession {
             setTimeout(() => opts.remoteApplyPaths.delete(this.path), 1000);
           }
         } catch (err) {
-          console.warn("[collab] atomic initial write failed", this.path, err);
+          log.warn("binding", "atomic initial write failed", this.path, err);
         }
       }
       opts.debug(
@@ -116,7 +117,7 @@ export class AtomicTextSession implements BaseSession {
       this.doc.set("content", content);
       this.lastSynced = content;
     } catch (err) {
-      console.warn("[collab] atomic read-from-disk failed", this.path, err);
+      log.warn("binding", "atomic read-from-disk failed", this.path, err);
     }
   }
 
@@ -132,7 +133,7 @@ export class AtomicTextSession implements BaseSession {
         `[collab] atomic → disk: ${this.path} (${content.length} chars)`,
       );
     } catch (err) {
-      console.warn("[collab] atomic write failed", this.path, err);
+      log.warn("binding", "atomic write failed", this.path, err);
     } finally {
       setTimeout(() => this.opts.remoteApplyPaths.delete(this.path), 1000);
     }
@@ -144,9 +145,9 @@ export class AtomicTextSession implements BaseSession {
       this.ydoc.transact(() => {
         if (this.doc.has("content")) this.doc.delete("content");
       });
-      console.log(`[collab] AtomicTextSession.wipe: cleared ${this.path}`);
+      log.info("session", `AtomicTextSession.wipe: cleared ${this.path}`);
     } catch (err) {
-      console.warn(`[collab] AtomicTextSession.wipe failed`, err);
+      log.warn("session", `AtomicTextSession.wipe failed`, err);
     }
   }
 
@@ -164,10 +165,10 @@ export class AtomicTextSession implements BaseSession {
     try {
       await this.persistence.destroy();
     } catch (err) {
-      console.warn("[collab] atomic persistence destroy failed", err);
+      log.warn("session", "atomic persistence destroy failed", err);
     }
     this.provider.destroy();
     this.ydoc.destroy();
-    console.log(`[collab] AtomicTextSession.destroy: ${this.path}`);
+    log.info("session", `AtomicTextSession.destroy: ${this.path}`);
   }
 }

@@ -33,6 +33,7 @@ import { HocuspocusProvider, type HocuspocusProviderWebsocket } from "@hocuspocu
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
+import { log } from "./logger";
 import { MANIFEST_ROOM, mimeFromExtension, sha256Hex, uuid } from "./util";
 import {
   PROTOCOL_VERSION,
@@ -97,6 +98,14 @@ export class ManifestSync {
   getTrash(): Y.Map<TrashEntry> | null {
     return this.trash;
   }
+  // Lookup helper for main.ts's file-open handler: returns the manifest
+  // entry for a path, or null if the manifest isn't loaded yet or has
+  // no entry. Used to drive auto-attach on file-open for markdown files
+  // that were created by a peer (so their session was never opened
+  // locally by `onLocalCreate`).
+  getEntry(path: string): ManifestEntry | null {
+    return this.map?.get(path) ?? null;
+  }
 
   start(): void {
     const socket = this.deps.getSocket();
@@ -121,15 +130,14 @@ export class ManifestSync {
     );
 
     this.provider.on("synced", () => {
-      console.log(
-        `[collab] manifest synced (${this.map?.size ?? 0} entries)`,
-      );
+      log.info("sync", `manifest synced (${this.map?.size ?? 0} entries)`);
       // Protocol gate
       const serverProtocol =
         (this.meta?.get("protocolVersion") as number | undefined) ?? 0;
       if (serverProtocol > PROTOCOL_VERSION) {
-        console.warn(
-          `[collab] server protocol v${serverProtocol} > ours v${PROTOCOL_VERSION} — entering read-only`,
+        log.warn(
+          "sync",
+          `server protocol v${serverProtocol} > ours v${PROTOCOL_VERSION} — entering read-only`,
         );
         this.deps.sessionManager.setReadOnly(true);
         return;
@@ -137,9 +145,7 @@ export class ManifestSync {
       this.deps.sessionManager.setReadOnly(false);
       if (serverProtocol < PROTOCOL_VERSION) {
         this.meta?.set("protocolVersion", PROTOCOL_VERSION);
-        console.log(
-          `[collab] stamped manifest protocolVersion=${PROTOCOL_VERSION}`,
-        );
+        log.info("sync", `stamped manifest protocolVersion=${PROTOCOL_VERSION}`);
       }
       void this.runReconcile();
     });
@@ -147,7 +153,7 @@ export class ManifestSync {
     this.provider.on(
       "authenticationFailed",
       (d: { reason: string }) => {
-        console.error(`[collab] manifest auth failed: ${d.reason}`);
+        log.error("sync", `manifest auth failed: ${d.reason}`);
         new Notice(
           "Collab: server rejected the manifest connection (auth). Vault structure won't sync until you fix the token.",
         );
@@ -239,7 +245,7 @@ export class ManifestSync {
   private async reconcile(): Promise<void> {
     if (!this.map || !this.ydoc) return;
     if (this.deps.sessionManager.isReadOnly()) {
-      console.log("[collab] reconcile: read-only mode, skipping local writes");
+      log.info("sync", "reconcile: read-only mode, skipping local writes");
     }
 
     // Walk local vault.
@@ -318,11 +324,12 @@ export class ManifestSync {
 
     if (this.trash) {
       const purged = purgeOldTrash(this.ydoc, this.trash);
-      if (purged > 0) console.log(`[collab] purged ${purged} expired trash entries`);
+      if (purged > 0) log.info("trash", `purged ${purged} expired trash entries`);
     }
 
-    console.log(
-      `[collab] reconcile complete: manifest has ${this.map.size} entries, trash ${this.trash?.size ?? 0}`,
+    log.info(
+      "sync",
+      `reconcile complete: manifest has ${this.map.size} entries, trash ${this.trash?.size ?? 0}`,
     );
   }
 
@@ -340,7 +347,7 @@ export class ManifestSync {
   ): Promise<void> {
     const client = this.deps.binaryClient();
     if (!client) {
-      console.warn("[collab] downloadBinaries: no blob client");
+      log.warn("blob", "downloadBinaries: no blob client");
       return;
     }
     const total = items.length;
@@ -355,7 +362,7 @@ export class ManifestSync {
         try {
           await this.materialiseBinary(path, entry, client);
         } catch (err) {
-          console.warn(`[collab] download ${path} failed`, err);
+          log.warn("blob", `download ${path} failed`, err);
         }
         done++;
         this.deps.onDownloadProgress(
@@ -382,7 +389,7 @@ export class ManifestSync {
     client: BinaryClient,
   ): Promise<void> {
     if (!entry.hash) {
-      console.warn(`[collab] materialiseBinary ${path}: no hash on entry`);
+      log.warn("blob", `materialiseBinary ${path}: no hash on entry`);
       return;
     }
     this.deps.remoteApplyPaths.add(path);
@@ -390,8 +397,9 @@ export class ManifestSync {
       await this.ensureFolderExists(path);
       const existing = this.deps.app.vault.getAbstractFileByPath(path);
       if (existing instanceof TFolder) {
-        console.warn(
-          `[collab] materialiseBinary: ${path} is a local folder; manifest says binary — skipping`,
+        log.warn(
+          "sync",
+          `materialiseBinary: ${path} is a local folder; manifest says binary — skipping`,
         );
         return;
       }
@@ -405,7 +413,7 @@ export class ManifestSync {
             return;
           }
         } catch (err) {
-          console.warn(`[collab] materialiseBinary hash check failed for ${path}`, err);
+          log.warn("blob", `materialiseBinary hash check failed for ${path}`, err);
         }
         // Local differs — overwrite with manifest bytes.
         const bytes = await client.download(entry.hash);
@@ -414,7 +422,7 @@ export class ManifestSync {
           bytes.byteOffset + bytes.byteLength,
         ) as ArrayBuffer;
         await this.deps.app.vault.modifyBinary(existing, buf);
-        console.log(`[collab] materialise: binary ${path} updated (${bytes.byteLength}b)`);
+        log.info("sync", `materialise: binary ${path} updated (${bytes.byteLength}b)`);
         return;
       }
       const bytes = await client.download(entry.hash);
@@ -424,7 +432,7 @@ export class ManifestSync {
       ) as ArrayBuffer;
       try {
         await this.deps.app.vault.createBinary(path, buf);
-        console.log(`[collab] materialise: binary ${path} (${bytes.byteLength}b)`);
+        log.info("sync", `materialise: binary ${path} (${bytes.byteLength}b)`);
       } catch (err) {
         if (this.isAlreadyExistsError(err)) {
           this.deps.debug(`[collab] materialiseBinary: ${path} appeared during create — skipping`);
@@ -456,8 +464,9 @@ export class ManifestSync {
   ): Promise<void> {
     const existing = this.deps.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFolder) {
-      console.warn(
-        `[collab] materialise: ${path} is a local folder; manifest says file — skipping create`,
+      log.warn(
+        "sync",
+        `materialise: ${path} is a local folder; manifest says file — skipping create`,
       );
       return;
     }
@@ -488,8 +497,9 @@ export class ManifestSync {
       if (entry.kind === "folder") {
         const existing = this.deps.app.vault.getAbstractFileByPath(path);
         if (existing instanceof TFile) {
-          console.warn(
-            `[collab] materialise: ${path} is a local file; manifest says folder — skipping`,
+          log.warn(
+            "sync",
+            `materialise: ${path} is a local file; manifest says folder — skipping`,
           );
           return;
         }
@@ -518,7 +528,7 @@ export class ManifestSync {
       }
       // binary handled separately by materialiseBinary
     } catch (err) {
-      console.warn(`[collab] materialise failed for ${path}`, err);
+      log.warn("sync", `materialise failed for ${path}`, err);
     } finally {
       setTimeout(
         () => this.deps.remoteApplyPaths.delete(path),
@@ -548,10 +558,10 @@ export class ManifestSync {
     const kind = this.classify(file);
     if (!kind) return;
     if (this.map.has(file.path)) {
-      console.log(`[collab] vault.create: already in manifest ${file.path}`);
+      log.info("sync", `vault.create: already in manifest ${file.path}`);
       return;
     }
-    console.log(`[collab] vault.create: ${file.path} (${kind})`);
+    log.info("sync", `vault.create: ${file.path} (${kind})`);
     if (kind === "binary" && file instanceof TFile) {
       // Mint id now (so we have a stable identity), then upload bytes
       // and register the entry with hash + size only after the upload
@@ -629,7 +639,7 @@ export class ManifestSync {
       this.map!.set(file.path, { ...existing });
     });
     await this.deps.sessionManager.handleRename(oldPath, file.path);
-    console.log(`[collab] vault.rename: ${oldPath} → ${file.path}`);
+    log.info("sync", `vault.rename: ${oldPath} → ${file.path}`);
   }
 
   async onLocalDelete(file: TAbstractFile): Promise<void> {
@@ -638,7 +648,7 @@ export class ManifestSync {
     if (this.deps.remoteApplyPaths.has(file.path)) return;
     const entry = this.map.get(file.path);
     if (!entry) return;
-    console.log(`[collab] vault.delete: ${file.path} (${entry.kind}, id=${entry.id})`);
+    log.info("sync", `vault.delete: ${file.path} (${entry.kind}, id=${entry.id})`);
 
     // Wipe + tear down the session if it has content.
     const sessionKind = this.sessionKindOf(entry.kind);
@@ -695,7 +705,7 @@ export class ManifestSync {
       // through Hocuspocus's debounced server-side store.
       await new Promise<void>((r) => setTimeout(r, 1500));
     } catch (err) {
-      console.warn(`[collab] transientWipe failed for ${docId}`, err);
+      log.warn("session", `transientWipe failed for ${docId}`, err);
     } finally {
       await this.deps.sessionManager.detach(tempPath);
     }
@@ -710,7 +720,7 @@ export class ManifestSync {
     if (!this.map) return;
     const client = this.deps.binaryClient();
     if (!client) {
-      console.warn(`[collab] uploadBinary: no blob client, skipping ${file.path}`);
+      log.warn("blob", `uploadBinary: no blob client, skipping ${file.path}`);
       return;
     }
     try {
@@ -741,11 +751,12 @@ export class ManifestSync {
         mime,
       };
       this.map.set(file.path, entry);
-      console.log(
-        `[collab] uploadBinary: ${file.path} (${buf.byteLength}b, hash=${hash.slice(0, 12)}…)`,
+      log.info(
+        "blob",
+        `uploadBinary: ${file.path} (${buf.byteLength}b, hash=${hash.slice(0, 12)}…)`,
       );
     } catch (err) {
-      console.warn(`[collab] uploadBinary failed for ${file.path}`, err);
+      log.warn("blob", `uploadBinary failed for ${file.path}`, err);
     }
   }
 
@@ -769,8 +780,9 @@ export class ManifestSync {
       }
     });
     if (deletes.length || adds.length || updates.length) {
-      console.log(
-        `[collab] manifestChange: +${adds.length} ~${updates.length} -${deletes.length}`,
+      log.info(
+        "sync",
+        `manifestChange: +${adds.length} ~${updates.length} -${deletes.length}`,
       );
     }
 
@@ -831,7 +843,7 @@ export class ManifestSync {
                 );
               }
             } catch (err) {
-              console.warn(`[collab] update binary ${u.path} failed`, err);
+              log.warn("blob", `update binary ${u.path} failed`, err);
             }
           } else if (!local) {
             await this.materialiseBinary(u.path, u.entry, client);
@@ -857,9 +869,9 @@ export class ManifestSync {
       await this.ensureFolderExists(newPath);
       await this.deps.app.fileManager.renameFile(local, newPath);
       await this.deps.sessionManager.handleRename(oldPath, newPath);
-      console.log(`[collab] remote rename: ${oldPath} → ${newPath}`);
+      log.info("sync", `remote rename: ${oldPath} → ${newPath}`);
     } catch (err) {
-      console.warn("[collab] remote rename failed", oldPath, newPath, err);
+      log.warn("sync", "remote rename failed", oldPath, newPath, err);
     } finally {
       setTimeout(() => {
         this.deps.remoteApplyPaths.delete(oldPath);
@@ -877,9 +889,9 @@ export class ManifestSync {
     this.deps.remoteApplyPaths.add(path);
     try {
       await this.deps.app.vault.delete(local, true);
-      console.log(`[collab] remote delete: ${path}`);
+      log.info("sync", `remote delete: ${path}`);
     } catch (err) {
-      console.warn("[collab] remote delete failed", path, err);
+      log.warn("sync", "remote delete failed", path, err);
     } finally {
       setTimeout(
         () => this.deps.remoteApplyPaths.delete(path),

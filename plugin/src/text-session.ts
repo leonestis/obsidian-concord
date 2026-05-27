@@ -13,6 +13,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import { removeAwarenessStates } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { log } from "./logger";
 import { docIdToRoom, waitForProviderSync } from "./util";
 import type { BaseSession } from "./types";
 
@@ -67,7 +68,7 @@ export class TextSession implements BaseSession {
       opts.debug(`[collab] room ${room} (${this.path}) status: ${e.status}`);
     });
     this.provider.on("authenticationFailed", (d: { reason: string }) => {
-      console.error(`[collab] room ${room} auth failed: ${d.reason}`);
+      log.error("session", `room ${room} auth failed: ${d.reason}`);
     });
 
     this.provider.awareness?.setLocalStateField("user", opts.user);
@@ -105,10 +106,7 @@ export class TextSession implements BaseSession {
             );
           }
         } catch (err) {
-          console.warn(
-            `[collab] TextSession ${opts.path}: disk seed failed`,
-            err,
-          );
+          log.warn("session", `TextSession ${opts.path}: disk seed failed`, err);
         }
       }
     }
@@ -129,10 +127,7 @@ export class TextSession implements BaseSession {
         try {
           content = this.ytext.toString();
         } catch (err) {
-          console.warn(
-            `[collab] disk-sync read failed for ${this.path}`,
-            err,
-          );
+          log.warn("binding", `disk-sync read failed for ${this.path}`, err);
           return;
         }
         try {
@@ -145,7 +140,7 @@ export class TextSession implements BaseSession {
             `[collab] disk-sync ${this.path}: wrote ${content.length} chars`,
           );
         } catch (err) {
-          console.warn(`[collab] disk-sync failed for ${this.path}`, err);
+          log.warn("binding", `disk-sync failed for ${this.path}`, err);
         } finally {
           // Suppression hold matches the legacy SUPPRESS_HOLD_MS (1 s) —
           // long enough for Obsidian's modify event to fire and be
@@ -164,9 +159,9 @@ export class TextSession implements BaseSession {
       this.ydoc.transact(() => {
         if (this.ytext.length > 0) this.ytext.delete(0, this.ytext.length);
       });
-      console.log(`[collab] TextSession.wipe: cleared Y.Text for ${this.path}`);
+      log.info("session", `TextSession.wipe: cleared Y.Text for ${this.path}`);
     } catch (err) {
-      console.warn(`[collab] TextSession.wipe failed for ${this.path}`, err);
+      log.warn("session", `TextSession.wipe failed for ${this.path}`, err);
     }
   }
 
@@ -188,7 +183,7 @@ export class TextSession implements BaseSession {
     try {
       await this.persistence.destroy();
     } catch (err) {
-      console.warn(`[collab] TextSession persistence destroy failed`, err);
+      log.warn("session", `TextSession persistence destroy failed`, err);
     }
     try {
       if (this.provider.awareness) {
@@ -204,6 +199,6 @@ export class TextSession implements BaseSession {
     }
     this.provider.destroy();
     this.ydoc.destroy();
-    console.log(`[collab] TextSession.destroy: ${this.path}`);
+    log.info("session", `TextSession.destroy: ${this.path}`);
   }
 }

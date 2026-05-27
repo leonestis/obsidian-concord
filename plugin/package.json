@@ -1,6 +1,6 @@
 {
   "name": "@obsidian-collab/plugin",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "description": "Obsidian plugin: self-hosted realtime collaboration via Yjs",
   "license": "AGPL-3.0-only",

@@ -29,6 +29,7 @@ import { ManifestSync } from "./manifest-sync";
 import { SessionManager } from "./session-manager";
 import { TrashModal } from "./trash";
 import { StatusBar, showDiagnostics } from "./diagnostics";
+import { log } from "./logger";
 import {
   PLUGIN_VERSION,
 } from "./types";
@@ -96,7 +97,7 @@ export default class CollabPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    console.log(`[collab] plugin v${PLUGIN_VERSION} loaded`);
+    log.info("plugin", `v${PLUGIN_VERSION} loaded`);
 
     this.addSettingTab(new CollabSettingTab(this.app, this));
     this.statusBar = new StatusBar(this);
@@ -160,10 +161,8 @@ export default class CollabPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
-        if (file && file.extension === "md") {
-          void this.sessionManager.bindEditorIfReady(file.path);
-          this.sessionManager.awarenessHandoffTo(file.path);
-        }
+        if (!file || file.extension !== "md") return;
+        void this.handleMarkdownFileOpen(file.path);
       }),
     );
     this.registerEvent(
@@ -193,7 +192,7 @@ export default class CollabPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
-    console.log("[collab] unloading…");
+    log.info("plugin", "unloading…");
     // Optional-chain everything: onunload runs even when onload
     // failed partway, in which case manifestSync / sessionManager
     // may never have been constructed. A throw here cascades into
@@ -202,16 +201,16 @@ export default class CollabPlugin extends Plugin {
     try {
       await this.manifestSync?.stop();
     } catch (err) {
-      console.warn("[collab] manifestSync.stop failed during unload", err);
+      log.warn("plugin", "manifestSync.stop failed during unload", err);
     }
     try {
       await this.sessionManager?.destroyAll();
     } catch (err) {
-      console.warn("[collab] sessionManager.destroyAll failed during unload", err);
+      log.warn("plugin", "sessionManager.destroyAll failed during unload", err);
     }
     this.socket?.destroy();
     this.socket = null;
-    console.log("[collab] unloaded");
+    log.info("plugin", "unloaded");
   }
 
   async loadSettings(): Promise<void> {
@@ -241,6 +240,25 @@ export default class CollabPlugin extends Plugin {
     if (this.settings?.debugLogging) console.log(...args);
   }
 
+  // file-open handler for markdown files. Drives auto-attach for any
+  // .md file whose manifest entry exists locally (e.g. created by a
+  // peer and materialised by the manifest observer) but whose
+  // SessionManager session was never opened — without this we'd leave
+  // the editor unbound and silently swallow every keystroke. The
+  // attach() call is idempotent for already-bound sessions, so calling
+  // it on every open is safe; if no manifest entry exists yet (brand
+  // new file) we bail out and let onLocalCreate (vault.create event)
+  // do the work.
+  private async handleMarkdownFileOpen(path: string): Promise<void> {
+    const entry = this.manifestSync.getEntry(path);
+    if (entry && entry.kind === "file") {
+      log.info("binding", `file-open ${path} → attach(docId=${entry.id})`);
+      await this.sessionManager.attach(path, "file", entry.id);
+    }
+    await this.sessionManager.bindEditorIfReady(path);
+    this.sessionManager.awarenessHandoffTo(path);
+  }
+
   private blobBaseUrl(): string {
     const override = this.settings.blobServerUrl.trim();
     if (override.length > 0) return override.replace(/\/+$/, "");
@@ -263,7 +281,7 @@ export default class CollabPlugin extends Plugin {
     if (!trimmed) {
       // New users with empty serverUrl shouldn't get a connect storm
       // or a cryptic socket error — surface the missing setting once.
-      console.log("[collab] connect skipped: Server URL is empty");
+      log.info("socket", "connect skipped: Server URL is empty");
       new Notice(
         "Collab: Server URL not configured. Open settings to enter your server's WebSocket URL.",
         8000,
@@ -278,19 +296,19 @@ export default class CollabPlugin extends Plugin {
       });
       this.binaryClient = this.makeBinaryClient();
       this.socket.on("status", (event: { status: string }) => {
-        console.log(`[collab] socket status: ${event.status}`);
+        log.info("socket", `status: ${event.status}`);
         this.connected = event.status === "connected";
         this.statusBar.setConnected(this.connected);
       });
       this.socket.on("close", (event: unknown) => {
-        console.log("[collab] socket close", event);
+        log.info("socket", "close", event);
       });
       this.manifestSync.start();
       // If a markdown file is already open, bind it lazily — manifest
       // sync's reconcile will create the session and the editor
       // binding will follow on the next file-open / bindEditorIfReady.
     } catch (err) {
-      console.error("[collab] failed to open socket", err);
+      log.error("socket", "failed to open socket", err);
       new Notice("Collab: failed to connect — see console");
     }
   }
@@ -327,7 +345,7 @@ export default class CollabPlugin extends Plugin {
   }
 
   private async performWipeLocalCache(): Promise<void> {
-    console.log("[collab] performWipeLocalCache: starting");
+    log.info("plugin", "performWipeLocalCache: starting");
     await this.manifestSync.stop();
     await this.sessionManager.destroyAll();
     this.socket?.destroy();
@@ -342,8 +360,9 @@ export default class CollabPlugin extends Plugin {
       databases?: () => Promise<Array<{ name?: string }>>;
     };
     if (typeof idb.databases !== "function") {
-      console.warn(
-        "[collab] performWipeLocalCache: indexedDB.databases() unavailable (Firefox?)",
+      log.warn(
+        "plugin",
+        "performWipeLocalCache: indexedDB.databases() unavailable (Firefox?)",
       );
       new Notice(
         "Collab: cannot enumerate IndexedDB on this browser. Open DevTools → Application → IndexedDB and delete entries starting with " +
@@ -358,7 +377,7 @@ export default class CollabPlugin extends Plugin {
     try {
       dbs = await idb.databases();
     } catch (err) {
-      console.warn("[collab] performWipeLocalCache: databases() threw", err);
+      log.warn("plugin", "performWipeLocalCache: databases() threw", err);
       new Notice("Collab: failed to enumerate IndexedDB — see console");
       this.connect();
       return;
@@ -366,8 +385,9 @@ export default class CollabPlugin extends Plugin {
     const targets = dbs
       .map((d) => d.name)
       .filter((n): n is string => typeof n === "string" && n.startsWith(prefix));
-    console.log(
-      `[collab] performWipeLocalCache: found ${targets.length} databases to drop`,
+    log.info(
+      "plugin",
+      `performWipeLocalCache: found ${targets.length} databases to drop`,
     );
     let deleted = 0;
     for (const name of targets) {
@@ -375,19 +395,21 @@ export default class CollabPlugin extends Plugin {
         const req = indexedDB.deleteDatabase(name);
         req.onsuccess = () => {
           deleted++;
-          console.log(`[collab] performWipeLocalCache: deleted ${name}`);
+          log.info("plugin", `performWipeLocalCache: deleted ${name}`);
           resolve();
         };
         req.onerror = () => {
-          console.warn(
-            `[collab] performWipeLocalCache: failed to delete ${name}`,
+          log.warn(
+            "plugin",
+            `performWipeLocalCache: failed to delete ${name}`,
             req.error,
           );
           resolve();
         };
         req.onblocked = () => {
-          console.warn(
-            `[collab] performWipeLocalCache: delete blocked for ${name}`,
+          log.warn(
+            "plugin",
+            `performWipeLocalCache: delete blocked for ${name}`,
           );
           resolve();
         };
@@ -397,8 +419,9 @@ export default class CollabPlugin extends Plugin {
       `Collab: wiped ${deleted}/${targets.length} local cache database(s). Reconnecting…`,
       8000,
     );
-    console.log(
-      `[collab] performWipeLocalCache: complete (${deleted}/${targets.length})`,
+    log.info(
+      "plugin",
+      `performWipeLocalCache: complete (${deleted}/${targets.length})`,
     );
     this.connect();
   }
