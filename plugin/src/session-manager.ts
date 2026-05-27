@@ -28,6 +28,8 @@ import { App, MarkdownView, Notice, TFile } from "obsidian";
 import { Compartment } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
+import type { Awareness } from "y-protocols/awareness";
+import * as Y from "yjs";
 
 import { log } from "./logger";
 import { TextSession } from "./text-session";
@@ -201,10 +203,18 @@ export class SessionManager {
         session,
       });
       log.info("session", `attach: bound ${path} → ${docId}`);
-      // For markdown, bind to any currently-open editor views.
-      if (kind === "file") {
-        this.bindOpenEditorsFor(path);
-      }
+      // NOTE (v1.0.5): attach() no longer auto-binds open editors for
+      // markdown. The double-bind it produced — once from here, once
+      // from main.ts's file-open handler via bindEditorIfReady — was
+      // tearing down the first ViewPlugin instance's `change` listener
+      // on awareness during the second bind's reconfigure window, and
+      // awareness updates arriving in that window were dropped. The
+      // single caller chain is now: file-open → attach() → bindEditorIfReady.
+      // Other attach() callers (manifest-sync.ts reconcile, onLocalCreate,
+      // onLocalModify, applyRemoteRename → handleRename) are for canvas /
+      // atomic-text sessions or for non-editor-driven workflows; none
+      // need an editor binding. Markdown's editor binding is exclusively
+      // the file-open path's responsibility.
       return session;
     } catch (err) {
       log.warn("session", `attach failed for ${path}`, err);
@@ -272,8 +282,12 @@ export class SessionManager {
     if (st.kind === "bound" && st.sessionKind === "file") {
       // Rebind any editors that are displaying newPath now (Obsidian
       // reuses the EditorView across renames, so the same view that
-      // showed oldPath is now showing newPath).
-      this.bindOpenEditorsFor(newPath);
+      // showed oldPath is now showing newPath). Note: handleRename
+      // crosses the editorBoundPath WeakMap entry from oldPath to
+      // newPath via the bindOne flow below. bindOne's idempotency
+      // check compares to newPath; the stale entry pointing at oldPath
+      // is overwritten on bind.
+      await this.bindOpenEditorsFor(newPath);
     }
     log.info("session", `handleRename: ${oldPath} → ${newPath}`);
   }
@@ -285,7 +299,7 @@ export class SessionManager {
   async bindEditorIfReady(path: string): Promise<void> {
     const st = this.byPath.get(path);
     if (st?.kind !== "bound" || st.sessionKind !== "file") return;
-    this.bindOpenEditorsFor(path);
+    await this.bindOpenEditorsFor(path);
   }
 
   // Detach the compartment of any editor that was previously bound to
@@ -310,7 +324,7 @@ export class SessionManager {
     }
   }
 
-  private bindOpenEditorsFor(path: string): void {
+  private async bindOpenEditorsFor(path: string): Promise<void> {
     const st = this.byPath.get(path);
     if (st?.kind !== "bound" || st.sessionKind !== "file") return;
     const session = st.session as TextSession;
@@ -325,17 +339,38 @@ export class SessionManager {
       return;
     }
     for (const view of views) {
-      this.bindOne(view, session, awareness, path);
+      await this.bindOne(view, session, awareness, path);
     }
   }
 
-  private bindOne(
+  // v1.0.5 — bindOne is the single bind path, called from
+  // bindEditorIfReady (file-open), from handleRename (after rename), and
+  // from onLocalCreate's `.then`. Idempotent against redundant calls:
+  // if the editor is already bound to this path, we only re-publish the
+  // cursor + user fields (Bug 2 — peers must see us return when the
+  // handoff nulled our cursor on this session). The full reconfigure
+  // pipeline (clear → reconcile editor↔ytext → install binding →
+  // publish cursor) only runs on real transitions (different path).
+  //
+  // The reconcile step (Bug 3) is what protects the user's offline
+  // disk-edits from being silently overwritten by ytext via the
+  // binding's parity check. See TextSession.reconcileEditorAndYtext.
+  private async bindOne(
     view: EditorView,
     session: TextSession,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    awareness: any,
+    awareness: Awareness,
     path: string,
-  ): void {
+  ): Promise<void> {
+    if (this.editorBoundPath.get(view) === path) {
+      // Redundant call (Obsidian re-firing file-open on focus shift,
+      // or race between vault.create + workspace.file-open for newly
+      // created local files). Skip the reconfigure to keep ONE
+      // bindOne log line per real transition, but DO re-publish the
+      // cursor so peers still see us if a previous handoff nulled it.
+      this.publishLocalCursor(view, session.ytext, awareness, path);
+      return;
+    }
+
     // Clear any previous binding first so the old syncPlugin's
     // ytext.unobserve runs before the new one installs.
     try {
@@ -346,22 +381,20 @@ export class SessionManager {
       log.warn("binding", "bindOne pre-clear dispatch failed", err);
     }
 
-    // Pre-sync editor doc to Y.Text content so the binding's first
-    // update doesn't double-fire.
-    const ytextContent = session.ytext.toString();
-    const editorContent = view.state.doc.toString();
-    if (ytextContent !== editorContent) {
-      try {
-        view.dispatch({
-          changes: {
-            from: 0,
-            to: view.state.doc.length,
-            insert: ytextContent,
-          },
-        });
-      } catch (err) {
-        log.warn("binding", "bindOne pre-sync dispatch failed", err);
-      }
+    // v1.0.5 Bug 3 — Reconcile editor and ytext content explicitly
+    // BEFORE installing the binding. This replaces the old unconditional
+    // "overwrite editor with ytext" pre-sync which would silently wipe
+    // offline disk-edits when ytext < disk. The reconcile distinguishes:
+    //   - editor === ytext → no-op (the common case)
+    //   - ytext empty, editor has content → seed ytext (first peer)
+    //   - editor empty, ytext has content → let parity check fill it
+    //   - both differ, both non-empty → TRUE CONFLICT: save editor's
+    //     content to a sibling .conflict-<ISO>.md file before letting
+    //     the parity check replace the editor with ytext.
+    try {
+      await session.reconcileEditorAndYtext(view, path);
+    } catch (err) {
+      log.warn("binding", `bindOne reconcile failed for ${path}`, err);
     }
 
     try {
@@ -376,6 +409,45 @@ export class SessionManager {
     }
     this.editorBoundPath.set(view, path);
     log.info("binding", `bindOne: ${path} → ytext.length=${session.ytext.length}`);
+
+    // v1.0.5 Bug 2 — Eagerly publish presence into awareness.
+    // The handoff on the previous file-open call nulled this session's
+    // cursor (and previously the user field too — fixed below). The
+    // collab-binding's own publish path only fires on the next focus /
+    // selection change, which may never arrive if Obsidian's view
+    // recycling kept focus across the file switch. Without this peers
+    // would never see us return to a file we previously left.
+    this.publishLocalCursor(view, session.ytext, awareness, path);
+  }
+
+  // Publish the local user's user info + current cursor selection into
+  // this session's awareness map. Used both by bindOne (on the first
+  // bind for a given path) and on every redundant rebind so the cursor
+  // gets re-broadcast after a handoff nulled it.
+  private publishLocalCursor(
+    view: EditorView,
+    ytext: Y.Text,
+    awareness: Awareness,
+    path: string,
+  ): void {
+    try {
+      awareness.setLocalStateField("user", this.deps.user());
+    } catch (err) {
+      log.warn("binding", `publishLocalCursor user-set failed for ${path}`, err);
+    }
+    try {
+      const sel = view.state.selection.main;
+      // Y.createRelativePositionFromTypeIndex clamps an out-of-range
+      // index to the type's length, so even in the Bug-3 conflict case
+      // (editor still has 63 chars at this point but ytext has 44, with
+      // the parity check about to fire) we publish a position that
+      // remains valid against ytext.
+      const anchor = Y.createRelativePositionFromTypeIndex(ytext, sel.anchor);
+      const head = Y.createRelativePositionFromTypeIndex(ytext, sel.head);
+      awareness.setLocalStateField("cursor", { anchor, head });
+    } catch (err) {
+      log.warn("binding", `publishLocalCursor cursor-set failed for ${path}`, err);
+    }
   }
 
   private editorViewsForPath(path: string): EditorView[] {
@@ -391,8 +463,17 @@ export class SessionManager {
   }
 
   // Awareness handoff: when a user switches between markdown panes,
-  // clear our awareness on every OTHER session so peers stop seeing
-  // a stale cursor frozen inside a file we're no longer editing.
+  // clear our cursor on every OTHER session so peers stop seeing a
+  // stale cursor frozen inside a file we're no longer editing.
+  //
+  // v1.0.5 audit B — previously this did setLocalState(null), which
+  // wiped EVERY field including `user` (name + color). When we returned
+  // to the file later, bindOne would re-publish the cursor against an
+  // awareness state with no user attached, and peers would briefly see
+  // an "anonymous" cursor label until the user field repopulated. Now
+  // we only null the `cursor` field. The user identity persists so
+  // peers can still associate any stray awareness updates from this
+  // session with the right name + color, even between switches.
   awarenessHandoffTo(activePath: string): void {
     const user = this.deps.user();
     for (const [path, st] of this.byPath.entries()) {
@@ -405,7 +486,8 @@ export class SessionManager {
         }
       } else {
         try {
-          st.session.provider.awareness?.setLocalState(null);
+          // Null only the cursor; keep the user identity field.
+          st.session.provider.awareness?.setLocalStateField("cursor", null);
         } catch {
           /* ignore */
         }

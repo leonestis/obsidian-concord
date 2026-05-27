@@ -580,7 +580,23 @@ export class ManifestSync {
     this.map.set(file.path, entry);
     const sk = this.sessionKindOf(kind);
     if (sk && file instanceof TFile) {
-      void this.deps.sessionManager.attach(file.path, sk, id);
+      // v1.0.5: attach() no longer auto-binds editors (Bug 1 fix). For
+      // local markdown creation, vault.on("create") can race with
+      // workspace.on("file-open"); if file-open fires BEFORE this
+      // handler completes the manifest.set+attach, the file-open path's
+      // bindEditorIfReady will be a no-op because the session isn't
+      // bound yet. Schedule an explicit bindEditorIfReady after attach
+      // resolves so the editor never sits unbound. For canvas / atomic
+      // sessions there's no editor binding, so this is a no-op for them
+      // — bindEditorIfReady only acts on `sessionKind === "file"`.
+      const path = file.path;
+      void this.deps.sessionManager
+        .attach(path, sk, id)
+        .then(() => {
+          if (sk === "file") {
+            void this.deps.sessionManager.bindEditorIfReady(path);
+          }
+        });
     }
   }
 

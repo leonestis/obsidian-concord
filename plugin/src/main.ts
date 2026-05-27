@@ -256,7 +256,18 @@ export default class CollabPlugin extends Plugin {
       await this.sessionManager.attach(path, "file", entry.id);
     }
     await this.sessionManager.bindEditorIfReady(path);
-    this.sessionManager.awarenessHandoffTo(path);
+    // v1.0.5 — rapid-switch guard. If the user already moved on to a
+    // different file while we were awaiting attach/bind, calling
+    // awarenessHandoffTo(path) here would null the cursor on the
+    // NEW active file (because handoff nulls cursor on every session
+    // except `path`). Check the workspace's active file first and only
+    // run handoff if we're still the foreground file. If not, the
+    // later handleMarkdownFileOpen call for the truly-active file will
+    // run handoff correctly.
+    const stillActive = this.app.workspace.getActiveFile()?.path === path;
+    if (stillActive) {
+      this.sessionManager.awarenessHandoffTo(path);
+    }
   }
 
   private blobBaseUrl(): string {

@@ -10,6 +10,7 @@ import { App, TFile } from "obsidian";
 import type { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { HocuspocusProvider } from "@hocuspocus/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
+import { removeAwarenessStates } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { log } from "./logger";
@@ -166,6 +167,21 @@ export class AtomicTextSession implements BaseSession {
       await this.persistence.destroy();
     } catch (err) {
       log.warn("session", "atomic persistence destroy failed", err);
+    }
+    // v1.0.5 audit F — explicitly clear awareness state so peers see
+    // our presence on this file disappear when the session is torn
+    // down (file deleted, plugin unloaded). Mirrors TextSession.destroy.
+    try {
+      if (this.provider.awareness) {
+        this.provider.awareness.setLocalState(null);
+        removeAwarenessStates(
+          this.provider.awareness,
+          [this.provider.awareness.clientID],
+          "destroy",
+        );
+      }
+    } catch {
+      /* ignore */
     }
     this.provider.destroy();
     this.ydoc.destroy();
