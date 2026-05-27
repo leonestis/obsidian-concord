@@ -361,22 +361,51 @@ const server = new Server({
     console.log(`← client disconnected from room "${documentName}"`);
   },
 
-  // Mount HTTP blob endpoints on Hocuspocus's own HTTP server. Returning
-  // (no `next()` involved here — Hocuspocus calls every registered
-  // onRequest in order, and a handler that has written to `res` ends
-  // the chain via Node's normal "response finished" semantics). We
-  // call res.end() inside the handler when we accept the request.
-  async onRequest({ request, response }) {
-    const handled = await handleBlobRequest(request, response);
-    if (handled) {
-      // Throw to signal Hocuspocus we've fully handled the request.
-      // Per the Hocuspocus API, throwing inside onRequest short-
-      // circuits further request processing (the documented "stop
-      // handling" pattern). The response has already been ended.
-      throw new Error("__obsidian_collab_blob_handled__");
-    }
-  },
+  // NOTE: We intentionally do NOT use the `onRequest` hook for blob
+  // routes. Hocuspocus's onRequest contract documents "throw to stop
+  // handling", but its requestHandler (Server.ts:116) catches the
+  // throw with `if (error) throw error` which then rethrows out of
+  // the async http listener — Node 22's default unhandled-rejection
+  // behaviour kills the process. We end up in a crash-restart loop
+  // every time a blob request arrives. Instead we patch the http
+  // request listener directly below, after Server construction but
+  // before listen(). That way our blob handler runs first, can fully
+  // respond and return without involving Hocuspocus at all.
 });
+
+// Replace Hocuspocus's request listener with a wrapper that handles
+// blob routes first. If our handler responds to the request, the
+// original Hocuspocus handler never runs (no double-response, no
+// "Welcome to Hocuspocus!" fallback after a real response). If the
+// request isn't a blob route, we delegate to the original handler
+// unchanged so the standard Hocuspocus HTTP behaviour still works.
+{
+  const origListeners = server.httpServer.listeners("request") as Array<
+    (req: any, res: any) => void
+  >;
+  if (origListeners.length !== 1) {
+    console.warn(
+      `expected exactly 1 request listener on Hocuspocus httpServer, found ${origListeners.length}. ` +
+        `Wrapping anyway, but Hocuspocus internals may have changed.`,
+    );
+  }
+  const origHandler = origListeners[0];
+  server.httpServer.removeAllListeners("request");
+  server.httpServer.on("request", async (req, res) => {
+    try {
+      if (await handleBlobRequest(req, res)) return;
+    } catch (err) {
+      console.error("[blob] handler crashed", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+      }
+      if (!res.writableEnded) res.end("internal error");
+      return;
+    }
+    // Not a blob route — let Hocuspocus's default handler run.
+    origHandler(req, res);
+  });
+}
 
 await server.listen();
 console.log(`obsidian-collab server v1.0.0 listening on ws://localhost:${PORT}`);
