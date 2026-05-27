@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 1.0.2 — 2026-05-27
+
+### Fixed
+- **Plugin crashed on first load with `Cannot read properties of undefined (reading 'setServerUrl')`.** Initialization order in `onload` was: `await loadSettings()` (which internally calls `saveSettings()`) THEN construct `statusBar` and `binaryClient`. But `saveSettings()` touches both. On every fresh load the first call to `saveSettings()` threw before either was constructed, the load aborted, then `onunload` ran and threw a second time on `manifestSync.stop()` because that wasn't constructed either. Two stacked TypeErrors and a dead plugin. Fix: `saveSettings()` now optional-chains the statusBar update (`this.statusBar?.setServerUrl(...)`), and `onunload` wraps each teardown call in a try/catch with optional chaining so a partially-initialized plugin can still unload cleanly. The `onload` already does its own `statusBar.setServerUrl(...)` right after constructing the bar, so the missed update from `loadSettings`-time is picked up immediately.
+
 ## 1.0.1 — 2026-05-27
 
 ### Security

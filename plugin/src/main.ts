@@ -194,8 +194,21 @@ export default class CollabPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     console.log("[collab] unloading…");
-    await this.manifestSync.stop();
-    await this.sessionManager.destroyAll();
+    // Optional-chain everything: onunload runs even when onload
+    // failed partway, in which case manifestSync / sessionManager
+    // may never have been constructed. A throw here cascades into
+    // Obsidian's plugin-unload pipeline and surfaces as a second
+    // confusing error stacked on the first.
+    try {
+      await this.manifestSync?.stop();
+    } catch (err) {
+      console.warn("[collab] manifestSync.stop failed during unload", err);
+    }
+    try {
+      await this.sessionManager?.destroyAll();
+    } catch (err) {
+      console.warn("[collab] sessionManager.destroyAll failed during unload", err);
+    }
     this.socket?.destroy();
     this.socket = null;
     console.log("[collab] unloaded");
@@ -212,7 +225,13 @@ export default class CollabPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-    this.statusBar.setServerUrl(this.settings.serverUrl);
+    // Guard: saveSettings is called from loadSettings (during onload,
+    // before statusBar/binaryClient exist) and from the settings tab
+    // (after both exist). Optional-chain so the first-time call
+    // doesn't crash the plugin's whole load. onload's own
+    // statusBar.setServerUrl() right after construction picks up the
+    // server URL when statusBar is finally available.
+    this.statusBar?.setServerUrl(this.settings.serverUrl);
     // Update binary client baseUrl + token in case settings changed
     // mid-session.
     this.binaryClient = this.makeBinaryClient();
