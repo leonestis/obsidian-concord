@@ -18,12 +18,42 @@ export interface BlobProgress {
   total: number;
 }
 
+// Error subclass so callers can distinguish "the server rejected our
+// credentials" from "the server is down" from "the blob isn't there"
+// — handy for surfacing a one-time Notice to the user on auth failure
+// instead of silently retrying forever on every binary in a vault.
+export class BlobAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlobAuthError";
+  }
+}
+
 export class BinaryClient {
+  // Suppress repeated auth-failure Notices — one toast per client
+  // instance is enough; users get tired fast when every binary in a
+  // vault fires its own. Reset on construction (settings save → fresh
+  // client).
+  private authErrorNoticed = false;
+
   constructor(
     // e.g. "http://your-server.example.com:1234". No trailing slash.
     private readonly baseUrl: string,
     private readonly authToken: string | undefined,
+    // Optional Notice surface. Undefined in tests / when we don't have
+    // an Obsidian app handy. The string is shown verbatim.
+    private readonly onAuthError?: (msg: string) => void,
   ) {}
+
+  private signalAuthError(detail: string): void {
+    if (this.authErrorNoticed) return;
+    this.authErrorNoticed = true;
+    try {
+      this.onAuthError?.(detail);
+    } catch {
+      /* never let a notice handler take down a blob op */
+    }
+  }
 
   private url(hash: string): string {
     return `${this.baseUrl.replace(/\/+$/, "")}/blobs/${hash}`;
@@ -46,6 +76,12 @@ export class BinaryClient {
     });
     if (res.status === 200) return true;
     if (res.status === 404) return false;
+    if (res.status === 401 || res.status === 403) {
+      this.signalAuthError(
+        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+      );
+      throw new BlobAuthError(`HEAD /blobs/${hash} → ${res.status}`);
+    }
     throw new Error(`HEAD /blobs/${hash} unexpected ${res.status}`);
   }
 
@@ -68,6 +104,13 @@ export class BinaryClient {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       body: bytes as any,
     });
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text().catch(() => "");
+      this.signalAuthError(
+        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+      );
+      throw new BlobAuthError(`PUT /blobs/${hash} → ${res.status}: ${text}`);
+    }
     if (res.status !== 201 && res.status !== 200) {
       const text = await res.text().catch(() => "");
       throw new Error(`PUT /blobs/${hash} → ${res.status}: ${text}`);
@@ -87,6 +130,12 @@ export class BinaryClient {
       headers: this.headers(),
     });
     if (res.status === 404) throw new Error(`blob ${hash} not found`);
+    if (res.status === 401 || res.status === 403) {
+      this.signalAuthError(
+        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+      );
+      throw new BlobAuthError(`GET /blobs/${hash} → ${res.status}`);
+    }
     if (!res.ok) throw new Error(`GET /blobs/${hash} → ${res.status}`);
     const total = Number(res.headers.get("Content-Length") ?? "0");
     onProgress?.(0);

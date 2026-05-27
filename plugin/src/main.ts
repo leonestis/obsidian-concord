@@ -251,6 +251,7 @@ export default class CollabPlugin extends Plugin {
     return new BinaryClient(
       this.blobBaseUrl(),
       this.settings.authToken || undefined,
+      (msg) => new Notice(msg, 12_000),
     );
   }
 
@@ -258,8 +259,19 @@ export default class CollabPlugin extends Plugin {
 
   private connect(): void {
     if (this.socket) return;
+    const trimmed = this.settings.serverUrl.trim();
+    if (!trimmed) {
+      // New users with empty serverUrl shouldn't get a connect storm
+      // or a cryptic socket error — surface the missing setting once.
+      console.log("[collab] connect skipped: Server URL is empty");
+      new Notice(
+        "Collab: Server URL not configured. Open settings to enter your server's WebSocket URL.",
+        8000,
+      );
+      return;
+    }
     try {
-      const baseUrl = this.settings.serverUrl.replace(/\/+$/, "");
+      const baseUrl = trimmed.replace(/\/+$/, "");
       const sep = baseUrl.includes("?") ? "&" : "?";
       this.socket = new HocuspocusProviderWebsocket({
         url: `${baseUrl}${sep}clientVersion=${encodeURIComponent(PLUGIN_VERSION)}`,

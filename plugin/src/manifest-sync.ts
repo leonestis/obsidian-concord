@@ -82,6 +82,12 @@ export class ManifestSync {
   private mapObserver:
     | ((event: Y.YMapEvent<ManifestEntry>) => void)
     | null = null;
+  // Guard against re-entrant reconcile. The provider can emit `synced`
+  // more than once (initial sync, reconnect, etc), and the manifest
+  // observer can also kick during a reconcile. Serialise via this
+  // promise so the second caller waits for the first to finish before
+  // computing a fresh localPaths snapshot.
+  private reconcileInFlight: Promise<void> | null = null;
 
   constructor(private readonly deps: ManifestSyncDeps) {}
 
@@ -135,7 +141,7 @@ export class ManifestSync {
           `[collab] stamped manifest protocolVersion=${PROTOCOL_VERSION}`,
         );
       }
-      void this.reconcile();
+      void this.runReconcile();
     });
 
     this.provider.on(
@@ -202,6 +208,33 @@ export class ManifestSync {
   }
 
   // ── reconcile ──────────────────────────────────────────────────────
+
+  // Serialised entry point. If a reconcile is already running, the
+  // caller waits for it and then a fresh one starts so any changes the
+  // first pass missed (because they landed mid-walk) get picked up by
+  // the second.
+  private async runReconcile(): Promise<void> {
+    if (this.reconcileInFlight) {
+      // Chain: wait for the current one, then run again.
+      try {
+        await this.reconcileInFlight;
+      } catch {
+        /* the in-flight reconcile logs its own errors */
+      }
+    }
+    let p!: Promise<void>;
+    p = (async () => {
+      try {
+        await this.reconcile();
+      } finally {
+        // Clear before returning so a follow-up runReconcile() schedules
+        // a fresh pass instead of waiting on the resolved promise.
+        if (this.reconcileInFlight === p) this.reconcileInFlight = null;
+      }
+    })();
+    this.reconcileInFlight = p;
+    await p;
+  }
 
   private async reconcile(): Promise<void> {
     if (!this.map || !this.ydoc) return;
@@ -334,6 +367,15 @@ export class ManifestSync {
     await Promise.all(Array.from({ length: workers }, () => next()));
   }
 
+  // True if `err` is Obsidian's "File already exists." rejection. We
+  // can't switch on an error code — Obsidian throws plain `Error`
+  // instances with an English message — so we string-match. Tolerant of
+  // trailing punctuation / casing.
+  private isAlreadyExistsError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /file already exists/i.test(msg);
+  }
+
   private async materialiseBinary(
     path: string,
     entry: ManifestEntry,
@@ -346,14 +388,49 @@ export class ManifestSync {
     this.deps.remoteApplyPaths.add(path);
     try {
       await this.ensureFolderExists(path);
+      const existing = this.deps.app.vault.getAbstractFileByPath(path);
+      if (existing instanceof TFolder) {
+        console.warn(
+          `[collab] materialiseBinary: ${path} is a local folder; manifest says binary — skipping`,
+        );
+        return;
+      }
+      if (existing instanceof TFile) {
+        // Hash check: if local bytes already match, no work to do.
+        try {
+          const local = await this.deps.app.vault.readBinary(existing);
+          const localHash = await sha256Hex(new Uint8Array(local));
+          if (localHash === entry.hash) {
+            this.deps.debug(`[collab] materialiseBinary: ${path} already matches manifest hash`);
+            return;
+          }
+        } catch (err) {
+          console.warn(`[collab] materialiseBinary hash check failed for ${path}`, err);
+        }
+        // Local differs — overwrite with manifest bytes.
+        const bytes = await client.download(entry.hash);
+        const buf = bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ) as ArrayBuffer;
+        await this.deps.app.vault.modifyBinary(existing, buf);
+        console.log(`[collab] materialise: binary ${path} updated (${bytes.byteLength}b)`);
+        return;
+      }
       const bytes = await client.download(entry.hash);
       const buf = bytes.buffer.slice(
         bytes.byteOffset,
         bytes.byteOffset + bytes.byteLength,
       ) as ArrayBuffer;
-      if (!this.deps.app.vault.getAbstractFileByPath(path)) {
+      try {
         await this.deps.app.vault.createBinary(path, buf);
         console.log(`[collab] materialise: binary ${path} (${bytes.byteLength}b)`);
+      } catch (err) {
+        if (this.isAlreadyExistsError(err)) {
+          this.deps.debug(`[collab] materialiseBinary: ${path} appeared during create — skipping`);
+        } else {
+          throw err;
+        }
       }
     } finally {
       setTimeout(
@@ -363,29 +440,78 @@ export class ManifestSync {
     }
   }
 
+  // Create-only-if-missing for non-binary entries. The "File already
+  // exists" log spam in 1.0.2 fired here when `getAbstractFileByPath`
+  // returned null (Obsidian's in-memory cache hadn't picked up the new
+  // file yet) but the underlying disk file genuinely existed — e.g.
+  // case-insensitive filesystem collision, or a peer's manifest add
+  // arriving microseconds after a local vault.create fired but before
+  // its TFile registration completed. The race window is small but real
+  // (one user report per session on macOS). Treat "already exists" as
+  // a no-op with a debug log — anything else still escalates.
+  private async safeCreateIfMissing(
+    path: string,
+    body: string,
+    binary: boolean = false,
+  ): Promise<void> {
+    const existing = this.deps.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFolder) {
+      console.warn(
+        `[collab] materialise: ${path} is a local folder; manifest says file — skipping create`,
+      );
+      return;
+    }
+    if (existing instanceof TFile) {
+      // Already there — nothing to materialise. Session attach happens
+      // separately in the caller.
+      this.deps.debug(`[collab] materialise: ${path} already present locally`);
+      return;
+    }
+    try {
+      if (binary) {
+        // Unused for now — binary path uses createBinary directly.
+        return;
+      }
+      await this.deps.app.vault.create(path, body);
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        this.deps.debug(`[collab] materialise: ${path} already exists on disk — no-op`);
+        return;
+      }
+      throw err;
+    }
+  }
+
   private async materialise(path: string, entry: ManifestEntry): Promise<void> {
     this.deps.remoteApplyPaths.add(path);
     try {
       if (entry.kind === "folder") {
-        if (!this.deps.app.vault.getAbstractFileByPath(path)) {
-          await this.deps.app.vault.createFolder(path);
+        const existing = this.deps.app.vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+          console.warn(
+            `[collab] materialise: ${path} is a local file; manifest says folder — skipping`,
+          );
+          return;
+        }
+        if (!existing) {
+          try {
+            await this.deps.app.vault.createFolder(path);
+          } catch (err) {
+            if (!this.isAlreadyExistsError(err)) throw err;
+          }
         }
         return;
       }
       await this.ensureFolderExists(path);
       if (entry.kind === "file") {
-        if (!this.deps.app.vault.getAbstractFileByPath(path)) {
-          await this.deps.app.vault.create(path, "");
-        }
+        await this.safeCreateIfMissing(path, "");
         return;
       }
       if (entry.kind === "canvas" || entry.kind === "text") {
-        if (!this.deps.app.vault.getAbstractFileByPath(path)) {
-          await this.deps.app.vault.create(
-            path,
-            entry.kind === "canvas" ? "{}" : "",
-          );
-        }
+        await this.safeCreateIfMissing(
+          path,
+          entry.kind === "canvas" ? "{}" : "",
+        );
         const sk = this.sessionKindOf(entry.kind);
         if (sk) await this.deps.sessionManager.attach(path, sk, entry.id);
         return;

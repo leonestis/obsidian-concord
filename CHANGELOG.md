@@ -2,6 +2,27 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 1.0.3 — 2026-05-27
+
+### Fixed
+- **`materialise failed for <file> Error: File already exists.` noise on every reconcile.** When a manifest entry's path is already a real local file, `materialise` is supposed to be a no-op. It did `getAbstractFileByPath` first and only called `vault.create` if that returned null, but the check loses the race in two real scenarios: (1) the manifest's `add` observer fires for entries that arrived through IndexedDB persistence loading microseconds before Obsidian's in-memory file cache catches up to its own disk state, and (2) the underlying filesystem is case-insensitive (macOS by default) so a manifest path `test2.md` finds no TFile while the on-disk `Test2.md` makes the create reject. Either way it was a benign duplicate, logged as a real error at `console.warn`. Fix: materialise now (a) returns early if the existing path is a TFile, (b) returns early on a TFolder collision with a clear "path collision" warn instead of a generic create error, and (c) catches any remaining `File already exists` reject from `vault.create` / `vault.createBinary` and drops it as a debug log. Same treatment for the binary path. The reconcile-time spam is gone.
+- **Binary materialisation when local file exists but hash differs.** Previously `materialiseBinary` did `if (!exists) createBinary` — meaning if a peer updated a binary while we had the old version cached locally, we'd silently keep the stale bytes. Now we hash the local file; if it matches the manifest hash we no-op, otherwise we `modifyBinary` with the freshly downloaded bytes. Closes the obvious "binary changed but never propagated" hole.
+- **Folder vs file path collisions across peers.** If the manifest says a path is a file but the local vault has a folder there (or vice versa), `materialise` used to throw a generic error and log it as a warn. Now it detects the kind mismatch, logs a clear "path collision" message, and skips — no crash, no spurious "File already exists" stack.
+- **Connect attempts with empty `serverUrl` produced cryptic socket errors instead of useful UX.** Fresh installs that never opened the settings tab would hit `connect()` on layoutReady and Hocuspocus would try to open `ws://?clientVersion=…`, blowing up in the WebSocket constructor. Now `connect()` short-circuits with a Notice telling the user to set the server URL in settings; no socket is opened until they do.
+- **Reconcile is now serialised against itself.** The provider's `synced` event can fire more than once (initial sync, reconnect after dropout); a second `reconcile()` running in parallel with the first would build its `localPaths` snapshot mid-write and pick up false negatives. Calls now chain via a single in-flight promise — the second pass starts only after the first finishes, so its snapshot reflects everything the first one created.
+
+### Changed
+- **Binary client surfaces 401 / 403 as a one-shot `Notice` instead of silent retries.** New `BlobAuthError` subclass; on the first auth failure per client instance we toast "Collab blob server rejected the auth token (401). Binary file sync is paused — refresh your Auth token, then reconnect." Subsequent failures in the same session are throw-only — one Notice is enough, ten is spam. Token refresh via the settings tab automatically constructs a fresh client and resets the suppression.
+
+### Notes
+- **Things audited but left alone in this pass:** the editor↔Y.Text parity check + RangeError force-resync (0.9.1 / 0.9.2) are still active in `collab-binding.ts`; the file is byte-identical to the 0.9.x version per the 1.0.0 rewrite contract. `purgeOldTrash` is still called from `reconcile`, which now runs at least once per `synced`. `SessionManager` per-path serialization via the `byPath` state machine plus the abort-controller-driven `attaching → tearing-down` transitions remain the source of truth. Canvas presence (`canvas-cursors.ts` / `canvas-session.ts`) is untouched per the task brief.
+- **Deferred to v1.1:**
+  - Exponential-backoff retry in `BinaryClient` for transient network failures. Currently one failure → manifest entry stays without bytes locally until the next reconcile.
+  - Chunked / streaming binary upload from the plugin side. We still buffer the whole file in renderer memory via `vault.readBinary`. Multi-hundred-MB files will pressure RAM but won't OOM the server (the server side streams via `pipeline()`).
+  - Download hash verification (sha256 the bytes off the wire, reject on mismatch). Defended on the server side (PUT-time hashing); MITM / disk-corruption defense on read is nice-to-have, not urgent for a self-hosted single-tenant deploy.
+  - Orphaned per-file Y.Doc room cleanup when two peers create different UUIDs at the same path while disconnected (the "losing" UUID's room sits on the server forever as ghost data). Same v1.1 GC walker that handles binary blobs will sweep these.
+- **Server is unchanged** beyond the post-1.0.0 blob-handler hotfix (3151d3d). `MIN_CLIENT_VERSION` stays at 1.0.0 so the 1.0.2 client keeps working alongside 1.0.3 during rolling upgrades. The httpServer-listener wrapper warns if Hocuspocus internals ever start attaching more than one listener; the warn is still a one-liner — no defensive multi-listener handling needed until that warning actually fires somewhere.
+
 ## 1.0.2 — 2026-05-27
 
 ### Fixed
