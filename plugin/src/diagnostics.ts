@@ -14,6 +14,8 @@
 import { App, Notice, Plugin } from "obsidian";
 import { log } from "./logger";
 import type { SessionManager } from "./session-manager";
+import type { LiveViewManager } from "./live-view-manager";
+import type { LocalPresenceController } from "./local-presence";
 
 export class StatusBar {
   private el: HTMLElement | null = null;
@@ -63,6 +65,8 @@ export function showDiagnostics(
   connected: boolean,
   sessionManager: SessionManager,
   manifestSize: number,
+  liveViewManager?: LiveViewManager | null,
+  presence?: LocalPresenceController | null,
 ): void {
   const lines: string[] = [];
   lines.push(`Server URL: ${serverUrl}`);
@@ -71,12 +75,22 @@ export function showDiagnostics(
   );
   lines.push(`Read-only mode: ${sessionManager.isReadOnly() ? "yes" : "no"}`);
   lines.push(`Manifest entries: ${manifestSize}`);
+  if (presence) {
+    lines.push(`Presence: ${presence.describe()}`);
+  }
   const sessions = sessionManager.describe();
   lines.push(`Sessions (${sessions.length}):`);
   for (const s of sessions) {
     lines.push(`  • ${s.path}  →  ${s.state}${s.docId ? "  [" + s.docId.slice(0, 8) + "…]" : ""}`);
   }
-  void app; // unused for now but reserved for future leaf-state inspection
+  if (liveViewManager) {
+    const views = liveViewManager.describe();
+    lines.push(`Live views (${views.length}):`);
+    for (const v of views) {
+      lines.push(`  • ${v.path}  →  bound=${v.bound}`);
+    }
+  }
+  void app;
   const msg = lines.join("\n");
   log.info("diag", "diagnostics:\n" + msg);
   new Notice(msg, 15_000);

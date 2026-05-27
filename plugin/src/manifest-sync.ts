@@ -90,7 +90,46 @@ export class ManifestSync {
   // computing a fresh localPaths snapshot.
   private reconcileInFlight: Promise<void> | null = null;
 
+  // v2.0.0 event emitter: fires `sessionReady(path)` whenever a session
+  // transitions into the bound state. LiveViewManager subscribes via
+  // onSessionReady() and queues a refresh — that's how the editor
+  // binding lifecycle catches up when a session finishes attaching
+  // AFTER the file's leaf is already open.
+  //
+  // ManifestSync is the natural place to host the emitter because it
+  // already orchestrates session attach calls and there's a single
+  // SessionManager → ManifestSync → main.ts → LiveViewManager wire we
+  // can route the event through. The emitter wraps SessionManager's
+  // setSessionReadyEmitter — we register a forwarder on construction
+  // (see main.ts), and SessionManager fires it on every successful
+  // attach.
+  private sessionReadyListeners: Array<(path: string) => void> = [];
+
   constructor(private readonly deps: ManifestSyncDeps) {}
+
+  // Subscribe to "this session is now bound" events. Returns an
+  // unsubscribe function. Used by LiveViewManager.
+  onSessionReady(cb: (path: string) => void): () => void {
+    this.sessionReadyListeners.push(cb);
+    return () => {
+      const i = this.sessionReadyListeners.indexOf(cb);
+      if (i >= 0) this.sessionReadyListeners.splice(i, 1);
+    };
+  }
+
+  // Called from main.ts's wire-up — passed to SessionManager so it can
+  // fire sessionReady from inside attach() when the bound state is
+  // reached. We don't filter by kind here; the listeners themselves
+  // decide what to do (LiveViewManager only cares about markdown).
+  emitSessionReady(path: string): void {
+    for (const cb of this.sessionReadyListeners) {
+      try {
+        cb(path);
+      } catch (err) {
+        log.warn("sync", "sessionReady listener threw", err);
+      }
+    }
+  }
 
   isReady(): boolean {
     return this.map !== null;
@@ -580,23 +619,14 @@ export class ManifestSync {
     this.map.set(file.path, entry);
     const sk = this.sessionKindOf(kind);
     if (sk && file instanceof TFile) {
-      // v1.0.5: attach() no longer auto-binds editors (Bug 1 fix). For
-      // local markdown creation, vault.on("create") can race with
-      // workspace.on("file-open"); if file-open fires BEFORE this
-      // handler completes the manifest.set+attach, the file-open path's
-      // bindEditorIfReady will be a no-op because the session isn't
-      // bound yet. Schedule an explicit bindEditorIfReady after attach
-      // resolves so the editor never sits unbound. For canvas / atomic
-      // sessions there's no editor binding, so this is a no-op for them
-      // — bindEditorIfReady only acts on `sessionKind === "file"`.
-      const path = file.path;
-      void this.deps.sessionManager
-        .attach(path, sk, id)
-        .then(() => {
-          if (sk === "file") {
-            void this.deps.sessionManager.bindEditorIfReady(path);
-          }
-        });
+      // v2.0.0: just kick attach(). When it reaches `bound`, SessionManager
+      // fires sessionReady via emitSessionReady (wired in main.ts);
+      // LiveViewManager hears it and re-runs its refresh, which picks
+      // up the new session and installs the binding into whatever leaf
+      // is already showing this file. No need for an explicit chained
+      // bindEditorIfReady — LiveViewManager replaces that entire
+      // pipeline.
+      void this.deps.sessionManager.attach(file.path, sk, id);
     }
   }
 

@@ -46,11 +46,14 @@ const DB_PATH = resolve(DATA_DIR, "documents.sqlite");
 const BLOB_DIR = resolve(process.env.BLOB_DIR ?? join(DATA_DIR, "blobs"));
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 
-// v1.0.0 is a clean break. 0.9.x clients used CRDT-wrapped binary
-// rooms (`bin:<path>`) which no longer exist on the server, so mixing
-// them with this build would just produce silent failures. Reject
-// outright.
-const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION ?? "1.0.0";
+// v2.0.0 is the next major break: the plugin rewrote markdown editor
+// binding around vendored y-codemirror.next + a single-flight
+// LiveViewManager. Pre-v2.0.0 plugins still bind editors with the
+// freshly-minted ViewPlugin trick that drops awareness updates for one
+// tick on every rebind; mixing them with this server build would let
+// peers see "ghost cursors" coming from clients with the same identity
+// but different editor binding lifetimes. Hard-reject < 2.0.0.
+const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION ?? "2.0.0";
 
 const HASH_RE = /^[a-f0-9]{64}$/;
 

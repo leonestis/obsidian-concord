@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// obsidian-collab plugin, v1.0.0.
+// obsidian-collab plugin, v2.0.0.
 //
 // This file is the orchestrator: settings, command palette, vault
-// event wiring, socket lifecycle. Per-file CRDT logic lives in
-// session-manager.ts + text/canvas/atomic-text-session.ts; manifest
-// sync lives in manifest-sync.ts; HTTP blob client lives in
-// binary-client.ts. The canvas presence layer (canvas-cursors.ts)
-// and the editor↔Y.Text binding (collab-binding.ts) are unchanged
-// from 0.9.x — both are solid and the task brief explicitly forbids
-// touching them.
+// event wiring, socket lifecycle. v2.0.0 collapsed editor binding into
+// three new modules — yedit/ (vendored y-codemirror.next), local-
+// presence.ts (single source of truth for awareness state) and live-
+// view-manager.ts (one LiveView per markdown leaf, single-flight
+// refresh queue). The Compartment that v1.x mounted as an editor
+// extension is gone; each LiveView holds its own per-leaf compartment.
+//
+// Per-file CRDT logic still lives in session-manager.ts +
+// text/canvas/atomic-text-session.ts; manifest sync in manifest-sync.ts;
+// HTTP blob client in binary-client.ts. Canvas presence
+// (canvas-cursors.ts + canvas-session.ts) is unchanged from 0.9.x and
+// remains outside the v2.0.0 surface.
 
 import {
   App,
@@ -21,12 +26,13 @@ import {
   TAbstractFile,
   TFile,
 } from "obsidian";
-import { Compartment } from "@codemirror/state";
 import { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 
 import { BinaryClient } from "./binary-client";
 import { ManifestSync } from "./manifest-sync";
 import { SessionManager } from "./session-manager";
+import { LocalPresenceController } from "./local-presence";
+import { LiveViewManager } from "./live-view-manager";
 import { TrashModal } from "./trash";
 import { StatusBar, showDiagnostics } from "./diagnostics";
 import { log } from "./logger";
@@ -71,8 +77,9 @@ export default class CollabPlugin extends Plugin {
   private statusBar!: StatusBar;
   private manifestSync!: ManifestSync;
   private sessionManager!: SessionManager;
+  private presence!: LocalPresenceController;
+  private liveViewManager!: LiveViewManager;
   private binaryClient: BinaryClient | null = null;
-  private readonly editorCompartment = new Compartment();
 
   // Refcounted suppression — see the long-form comment in 0.9.x main.ts.
   // Each `add(path)` MUST be paired with one `delete(path)`. Internally
@@ -103,11 +110,16 @@ export default class CollabPlugin extends Plugin {
     this.statusBar = new StatusBar(this);
     this.statusBar.setServerUrl(this.settings.serverUrl);
 
-    this.registerEditorExtension(this.editorCompartment.of([]));
+    // v2.0.0 construction order: SessionManager → ManifestSync → wire
+    // sessionReady event → LocalPresenceController (needs SessionManager
+    // for boundMarkdownSessions iterator) → LiveViewManager (needs
+    // everything else). The plugin no longer mounts a global editor
+    // extension via registerEditorExtension; each LiveView owns its own
+    // per-leaf Compartment and reconfigures only the editor it's
+    // attached to.
 
     this.sessionManager = new SessionManager({
       app: this.app,
-      editorCompartment: this.editorCompartment,
       getSocket: () => this.socket,
       serverUrl: () => this.settings.serverUrl,
       authToken: () => this.settings.authToken || undefined,
@@ -131,6 +143,32 @@ export default class CollabPlugin extends Plugin {
       debug: (...a) => this.debug(...a),
     });
 
+    // Wire SessionManager → ManifestSync's emitter so every successful
+    // attach() fires sessionReady for the listeners (LiveViewManager).
+    this.sessionManager.setSessionReadyEmitter((path) => {
+      this.manifestSync.emitSessionReady(path);
+    });
+
+    this.presence = new LocalPresenceController(this.sessionManager, {
+      name: this.settings.userName,
+      color: this.settings.userColor,
+    });
+
+    this.liveViewManager = new LiveViewManager({
+      app: this.app,
+      sessionManager: this.sessionManager,
+      manifestSync: this.manifestSync,
+      presence: this.presence,
+    });
+
+    // Install the global editor extension. Applied to every CodeMirror
+    // editor Obsidian opens, including markdown views opened later in
+    // the session. The extension is stable across file switches — the
+    // SAME ViewPlugin instances handle every editor, and they resolve
+    // ytext + awareness dynamically per-view via the Facet's
+    // resolveContext function (which routes to LiveViewManager).
+    this.registerEditorExtension(this.liveViewManager.editorExtension());
+
     this.addCommand({
       id: "collab-reconnect",
       name: "Reconnect to server",
@@ -146,6 +184,8 @@ export default class CollabPlugin extends Plugin {
           this.connected,
           this.sessionManager,
           this.manifestSync.isReady() ? -1 : 0,
+          this.liveViewManager,
+          this.presence,
         ),
     });
     this.addCommand({
@@ -159,12 +199,13 @@ export default class CollabPlugin extends Plugin {
       callback: () => this.openWipeCacheModal(),
     });
 
-    this.registerEvent(
-      this.app.workspace.on("file-open", (file) => {
-        if (!file || file.extension !== "md") return;
-        void this.handleMarkdownFileOpen(file.path);
-      }),
-    );
+    // v2.0.0: LiveViewManager subscribes to workspace 'file-open' /
+    // 'active-leaf-change' / 'layout-change' itself in its constructor.
+    // The old handleMarkdownFileOpen pipeline (attach + bindEditorIfReady
+    // + awarenessHandoffTo) was the source of every double-bind and
+    // awareness-drop bug from v1.0.0 through v1.0.5. It's gone. The
+    // event subscriptions below cover everything else (rename / delete
+    // / create / modify dispatched into manifest-sync).
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) =>
         void this.manifestSync.onLocalRename(file, oldPath),
@@ -194,10 +235,21 @@ export default class CollabPlugin extends Plugin {
   async onunload(): Promise<void> {
     log.info("plugin", "unloading…");
     // Optional-chain everything: onunload runs even when onload
-    // failed partway, in which case manifestSync / sessionManager
-    // may never have been constructed. A throw here cascades into
-    // Obsidian's plugin-unload pipeline and surfaces as a second
-    // confusing error stacked on the first.
+    // failed partway, in which case constructed objects may never have
+    // been assigned. A throw here cascades into Obsidian's plugin-
+    // unload pipeline and surfaces as a second confusing error stacked
+    // on the first.
+    //
+    // Order: LiveViewManager first (detaches every leaf's compartment
+    // so editors stop dispatching into a destroying Y.Text), then
+    // ManifestSync.stop (idempotent), then SessionManager.destroyAll
+    // (which removes our awareness state from every room so peers
+    // see us go offline immediately, not after a 30s heartbeat).
+    try {
+      this.liveViewManager?.destroy();
+    } catch (err) {
+      log.warn("plugin", "liveViewManager.destroy failed during unload", err);
+    }
     try {
       await this.manifestSync?.stop();
     } catch (err) {
@@ -234,40 +286,18 @@ export default class CollabPlugin extends Plugin {
     // Update binary client baseUrl + token in case settings changed
     // mid-session.
     this.binaryClient = this.makeBinaryClient();
+    // v2.0.0: presence is the single source of truth for user identity
+    // across every bound session. Push the latest values whenever
+    // settings change so peers see name / color updates without a
+    // reconnect.
+    this.presence?.setUser({
+      name: this.settings.userName,
+      color: this.settings.userColor,
+    });
   }
 
   private debug(...args: unknown[]): void {
     if (this.settings?.debugLogging) console.log(...args);
-  }
-
-  // file-open handler for markdown files. Drives auto-attach for any
-  // .md file whose manifest entry exists locally (e.g. created by a
-  // peer and materialised by the manifest observer) but whose
-  // SessionManager session was never opened — without this we'd leave
-  // the editor unbound and silently swallow every keystroke. The
-  // attach() call is idempotent for already-bound sessions, so calling
-  // it on every open is safe; if no manifest entry exists yet (brand
-  // new file) we bail out and let onLocalCreate (vault.create event)
-  // do the work.
-  private async handleMarkdownFileOpen(path: string): Promise<void> {
-    const entry = this.manifestSync.getEntry(path);
-    if (entry && entry.kind === "file") {
-      log.info("binding", `file-open ${path} → attach(docId=${entry.id})`);
-      await this.sessionManager.attach(path, "file", entry.id);
-    }
-    await this.sessionManager.bindEditorIfReady(path);
-    // v1.0.5 — rapid-switch guard. If the user already moved on to a
-    // different file while we were awaiting attach/bind, calling
-    // awarenessHandoffTo(path) here would null the cursor on the
-    // NEW active file (because handoff nulls cursor on every session
-    // except `path`). Check the workspace's active file first and only
-    // run handoff if we're still the foreground file. If not, the
-    // later handleMarkdownFileOpen call for the truly-active file will
-    // run handoff correctly.
-    const stillActive = this.app.workspace.getActiveFile()?.path === path;
-    if (stillActive) {
-      this.sessionManager.awarenessHandoffTo(path);
-    }
   }
 
   private blobBaseUrl(): string {
@@ -332,6 +362,13 @@ export default class CollabPlugin extends Plugin {
     this.binaryClient = null;
     this.connected = false;
     this.statusBar.setConnected(false);
+    // v2.0.0: after destroyAll, every LiveView's resolveContext returns
+    // null (no bound sessions). Queue a refresh so each LiveView
+    // transitions to release()/inert immediately and yedit's
+    // unobserve runs before connect() rebuilds the sessions. Without
+    // this, leftover ytext observers from the destroyed sessions can
+    // fire one more event before unobserve takes effect.
+    this.liveViewManager?.queueRefresh("reconnect");
     this.connect();
     new Notice("Collab: reconnected");
   }
@@ -364,6 +401,7 @@ export default class CollabPlugin extends Plugin {
     this.binaryClient = null;
     this.connected = false;
     this.statusBar.setConnected(false);
+    this.liveViewManager?.queueRefresh("performWipeLocalCache");
     await new Promise<void>((r) => setTimeout(r, 200));
 
     const prefix = `obsidian-collab::${this.settings.serverUrl}::`;

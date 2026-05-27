@@ -1,13 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Per-file markdown session. Owns one Y.Doc + Y.Text + provider +
-// IndexedDB persistence. The editor binding is created lazily by
-// SessionManager when an EditorView becomes available for this path —
-// we expose `ytext` and `provider.awareness` for that wiring, and
-// otherwise know nothing about CodeMirror.
+// IndexedDB persistence.
+//
+// In v2.0.0 this class knows NOTHING about CodeMirror or editor views.
+// LiveViewManager (live-view-manager.ts) handles editor binding via the
+// vendored yedit/ extensions, which resolve their Y.Text + Awareness
+// dynamically from a Facet — there's no per-session "bound editor"
+// state to track here. We just expose `ytext` and `provider.awareness`
+// and trust the upstream wiring.
+//
+// The conflict-file path that v1.0.5 lived in (reconcileEditorAndYtext
+// → save .conflict-<ISO>.md before letting the editor be overwritten)
+// was removed in v2.0.0. The replacement: yedit/y-sync.ts seeds an
+// empty ytext from the editor when binding to a fresh-zero session
+// (the "first peer" case), and on a TRUE ytext-vs-editor divergence it
+// runs a minimal diff-based push from ytext to editor (so caret + undo
+// state survive). Phase 3 will add disk-mediated 3-way merge; until
+// then we explicitly accept the v0.9.2 "ytext wins on divergence"
+// trade-off rather than the v1.0.5 false-positive .conflict files.
 
-import { App, Notice, TFile } from "obsidian";
-import { EditorView } from "@codemirror/view";
+import { App, TFile } from "obsidian";
 import type { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { HocuspocusProvider } from "@hocuspocus/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
@@ -72,7 +85,13 @@ export class TextSession implements BaseSession {
       log.error("session", `room ${room} auth failed: ${d.reason}`);
     });
 
-    this.provider.awareness?.setLocalStateField("user", opts.user);
+    // NOTE (v2.0.0): we no longer seed `user` here. LocalPresenceController
+    // owns every awareness state write — it iterates bound markdown
+    // sessions and broadcasts `{ user, cursor: null }` whenever a new
+    // session enters the bound state (triggered by sessionReady). The
+    // motivation is in local-presence.ts's header; the short version
+    // is "scattered awareness writes were the source of every 'peer
+    // invisible' bug from v0.9.x onward".
 
     this.persistence = new IndexeddbPersistence(
       `obsidian-collab::${opts.serverUrl}::${room}`,
@@ -165,115 +184,15 @@ export class TextSession implements BaseSession {
     this.observers.push(observer);
   }
 
-  // v1.0.5 Bug 3 — called by SessionManager.bindOne BEFORE the editor
-  // compartment is reconfigured with the collab-binding. Reconciles the
-  // editor's current document content against this session's ytext
-  // content WITHOUT relying on the parity check (which is destructive
-  // — it always replaces editor content with ytext content). The cases:
-  //
-  //   1. editor === ytext  → no-op. The common path.
-  //   2. ytext is empty, editor has content → seed ytext from editor.
-  //      This is the "first peer on this file" path; without this,
-  //      the parity check would do nothing (editor.length === 0 and
-  //      ytext.length === 0 would never differ once binding installs)
-  //      and the user's content would never reach peers. Note: the
-  //      seed-from-disk hook in `create()` already covers the case
-  //      where the editor is closed and disk is the source; this
-  //      branch covers the case where Obsidian opened the file (so
-  //      its editor has the disk content) BEFORE we connected, and
-  //      ytext was created fresh.
-  //   3. editor is empty, ytext has content → no-op here; the binding's
-  //      parity check on the first update cycle will dispatch the
-  //      ytext content into the editor, which is the correct direction.
-  //   4. both differ, both non-empty → TRUE CONFLICT. ytext was synced
-  //      to some earlier state, then the user edited the disk file
-  //      offline / with the plugin disabled / via another tool, and
-  //      now we're reconnecting. The legacy code path silently replaced
-  //      the editor with ytext, destroying the user's offline edits.
-  //      v1.0.5 saves the editor's content to a sibling
-  //      `<path>.conflict-<ISO timestamp>.md` BEFORE letting the parity
-  //      check replace the editor. The conflict file goes through the
-  //      normal manifest-sync path (it's a fresh `vault.create`), so
-  //      peers also receive a copy of the unsynced edits.
-  //
-  // Reentrancy: this is called from bindOne in the SessionManager. The
-  // method awaits vault.create / Notice / log calls, so the bindOne
-  // caller path is async. Concurrent calls (two bindOne for the same
-  // session in different views) interleave through the awaits; both
-  // can run safely — the seed-into-ytext insert is conditional on
-  // ytext.length === 0, and the conflict-file path uses a unique
-  // timestamp per call so two simultaneous saves get distinct paths.
-  async reconcileEditorAndYtext(
-    view: EditorView,
-    path: string,
-  ): Promise<void> {
-    if (this.destroyed) return;
-    const editorContent = view.state.doc.toString();
-    const ytextContent = this.ytext.toString();
-    if (editorContent === ytextContent) return;
-
-    if (this.ytext.length === 0) {
-      // First peer on this file — push editor content into ytext.
-      // Single-insert transaction; the disk-sync observer will fire,
-      // but at this point editor === post-insert ytext so no echo loop.
-      try {
-        this.ytext.insert(0, editorContent);
-        log.info(
-          "binding",
-          `reconcile seed ytext from editor: ${path} (${editorContent.length} chars)`,
-        );
-      } catch (err) {
-        log.warn("binding", `reconcile seed failed for ${path}`, err);
-      }
-      return;
-    }
-
-    if (editorContent.length === 0) {
-      // Editor empty, ytext non-empty. The collab-binding's parity
-      // check will dispatch the ytext content into the editor on the
-      // first update. Nothing to do here.
-      return;
-    }
-
-    // True conflict: save editor's version as a sibling .conflict file
-    // BEFORE the parity check replaces the editor. The conflict file is
-    // a real vault file, so manifest-sync will propagate it to peers
-    // (they get a copy of the unsynced edits and can compare). It's
-    // also a markdown file (.md extension preserved via the dotted
-    // suffix), so all normal markdown handling still applies — but
-    // because it has a brand-new path, manifest-sync will mint a fresh
-    // UUID for it and the collab room is separate; no chance of
-    // re-conflicting with the original.
-    const tsIso = new Date().toISOString().replace(/[:.]/g, "-");
-    const conflictPath = `${path}.conflict-${tsIso}.md`;
-    try {
-      await this.opts.app.vault.create(conflictPath, editorContent);
-      new Notice(
-        `Collab: unsynced local edits on "${path}" saved to "${conflictPath}". Server version loaded.`,
-        8000,
-      );
-      log.warn(
-        "binding",
-        `reconcile conflict: saved ${path}'s editor content (${editorContent.length} chars, ytext was ${ytextContent.length}) to ${conflictPath}`,
-      );
-    } catch (err) {
-      log.error(
-        "binding",
-        `reconcile conflict: failed to save conflict file for ${path}`,
-        err,
-      );
-      new Notice(
-        `Collab: COULD NOT save local edits for "${path}" before overwriting. Check the console — your version is still in this editor for one update cycle, copy it now.`,
-        12_000,
-      );
-    }
-    // Don't touch the editor here. The compartment.reconfigure that
-    // follows in bindOne installs the collab-binding; its first update
-    // cycle's parity check sees editor.length !== ytext.length and
-    // schedules a setTimeout(0) full-document replace with ytext's
-    // content. That replace IS the "load server version" step the
-    // Notice promised the user.
-  }
+  // v1.0.5's reconcileEditorAndYtext is GONE in v2.0.0. The "seed
+  // ytext from editor when ytext is empty" branch moved into
+  // yedit/y-sync.ts's rebind path (case b in that file). The
+  // .conflict-*.md generation is dropped on purpose — it was a
+  // false-positive factory under view recycling (the editor briefly
+  // held disk content while ytext arrived with the synced state, and
+  // the diff was misread as user-vs-server conflict). Phase 3 will
+  // bring back conflict detection backed by a real disk buffer +
+  // 3-way merge.
 
   wipe(): void {
     if (this.destroyed) return;
