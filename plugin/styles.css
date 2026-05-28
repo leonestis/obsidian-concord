@@ -30,6 +30,18 @@
   opacity: 1 !important;
   transition: none !important;
   z-index: 50;
+  /* iOS WebView (and to a lesser extent Android WebView) leaves stale
+   * paint behind when an absolutely-positioned descendant of a
+   * contenteditable element is removed from the DOM — the actual node
+   * is gone but the painted pixels stay until the surrounding area
+   * is forced to repaint. Forcing a GPU compositor layer via a
+   * translateZ trick puts this label onto its own layer, which gets
+   * cleanly disposed when the widget DOM is removed. Same effect as
+   * `will-change: transform` but with broader WebView support. */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
 }
 
 /* The caret bar itself: a thin 2px vertical line in the user's color.
@@ -45,6 +57,10 @@
   margin-left: -1px;
   pointer-events: none;
   /* Force the inlined background-color into the border via inherit hack. */
+  /* Same GPU-layer trick as the label below — covers the caret bar
+   * itself in case iOS leaves THAT painted too after removal. */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
 }
 
 /* Small dot at the top of the caret — keep but make subtle. */

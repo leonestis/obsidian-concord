@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.0.3 — 2026-05-27
+
+### Fixed
+- **Mobile WebView ghost-cursor labels: real fix this time.** v2.0.2's `eq() → false` change forced CodeMirror to recreate the widget DOM on every decoration update, but iOS/Android WebView still left the old paint behind. Cause is at the rendering layer, not the DOM layer: when an `absolutely-positioned` descendant of a `contenteditable` element gets removed from the DOM, mobile WebView frequently leaves the painted pixels on screen until the surrounding region is forced to repaint. The DOM truly is gone; only the cached rasterization sticks. Fix: force a GPU compositor layer on both `.cm-ySelectionInfo` and `.cm-ySelectionCaret` via `transform: translateZ(0)` (plus `-webkit-` prefix and `backface-visibility: hidden` for the label). Composited layers get cleanly disposed when their backing DOM is removed, so the stale paint can't survive. This is a well-known workaround for iOS Safari contenteditable artefacts.
+
 ## 2.0.2 — 2026-05-27
 
 ### Fixed
