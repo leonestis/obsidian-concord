@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.1.1 — 2026-05-28
+
+### Fixed
+- **iOS WebView ghost caret bars — fixed properly by moving remote cursors to an overlay.** The CSS GPU-layer workarounds in 2.0.2–2.0.4 fixed the name labels but the thin caret bars kept leaving stale paint on iOS when a peer moved fast. Root cause is structural: any DOM injected into the editor's `contenteditable` is subject to iOS WebView's repaint quirks on removal/reposition. Following the same approach that makes canvas cursors rock-solid, remote peers' caret bars and name labels are no longer CodeMirror `Decoration.widget` DOM inside the text — they're rendered as an absolutely-positioned overlay appended to the editor's scroll container, completely outside the contenteditable text flow. Positions come from `view.coordsAtPos()` and are recomputed on edit / scroll / viewport / awareness changes, anchored to content coordinates so each caret stays glued to its character while scrolling. The selection-highlight backgrounds stay as decorations (they're a style on real text, never ghosted). The old caret-widget code, its CSS, and the GPU-layer hacks are removed entirely.
+
 ## 2.1.0 — 2026-05-28
 
 Stabilization release driven by a two-agent forensic review. Four high-impact correctness fixes; no protocol change (fully compatible with 2.0.x peers, though all peers should upgrade to get the fixes). Canvas untouched.
