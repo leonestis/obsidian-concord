@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.0.2 — 2026-05-27
+
+### Fixed
+- **Peer cursor labels left as ghost copies on iOS / Android WebView when the peer moved fast.** Caused by `YRemoteCaretWidget.eq()` returning true when color + name matched — which is always, for the same peer. CodeMirror treats two `eq`-equal widgets across decoration rebuilds as "same widget, just reposition the existing DOM", and on mobile WebView the reposition of an `absolute`-positioned label inside a `transform`-ed parent leaves the previous render painted at the old coordinates. User report shows two `leonestis` labels visible at positions the peer occupied seconds earlier, while the actual caret is somewhere else. Fix: `eq()` now returns `false` unconditionally, forcing CodeMirror to tear down the old widget DOM and create a fresh one on every decoration rebuild. Costs a few extra DOM operations per cursor move — imperceptible compared to the ghosting. Desktop unaffected (it handles the reposition correctly either way, but the recreate path is fine there too).
+
 ## 2.0.1 — 2026-05-27
 
 ### Fixed

@@ -130,11 +130,24 @@ class YRemoteCaretWidget extends WidgetType {
     return span;
   }
 
-  eq(other: YRemoteCaretWidget): boolean {
-    return this.color === other.color && this.name === other.name;
+  eq(_other: YRemoteCaretWidget): boolean {
+    // Always return false so CodeMirror tears down the old widget DOM
+    // and creates a fresh one on every decoration update. The "natural"
+    // implementation here would compare color + name and return true
+    // (same identity → reuse DOM, just reposition). On desktop that
+    // works fine. On iOS WebView (and to a lesser extent Android
+    // WebView) the reposition of an absolutely-positioned label
+    // inside a transformed parent leaves rendering ghosts — the old
+    // label stays painted at the previous position while the parent
+    // moves. Forcing recreate eliminates the issue entirely. The cost
+    // is a few extra DOM operations per peer-cursor move, which is
+    // imperceptible compared to the ghosting artefact.
+    return false;
   }
 
   updateDOM(): boolean {
+    // Pair with eq() returning false: tell CodeMirror our widget can't
+    // be in-place updated, always recreate via toDOM().
     return false;
   }
 
