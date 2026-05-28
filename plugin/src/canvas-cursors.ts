@@ -356,13 +356,14 @@ function attachToLeafIfCanvas(
     }
   >();
   let rafHandle = 0;
-  const tick = () => {
-    renderRemote(view, wrapper, overlay, awareness, cursorState);
-    rafHandle = requestAnimationFrame(tick);
-  };
-  rafHandle = requestAnimationFrame(tick);
 
-  cleanups.push(() => {
+  // Single idempotent teardown for THIS wrapper attachment. Called
+  // either globally (hook.destroy → cleanups) or self-triggered from
+  // the render loop when the wrapper detaches (see below).
+  let torn = false;
+  const teardown = () => {
+    if (torn) return;
+    torn = true;
     wrapper.removeEventListener("mousemove", onMove);
     wrapper.removeEventListener("mouseleave", onLeave);
     wrapper.removeEventListener("mousedown", onDown);
@@ -379,7 +380,31 @@ function attachToLeafIfCanvas(
     awareness.setLocalStateField("drag", null);
     awareness.setLocalStateField("marquee", null);
     awareness.setLocalStateField("action", "idle");
-  });
+  };
+
+  const tick = () => {
+    // Self-clean when Obsidian rebuilds the canvas view. On file
+    // switch (and some layout changes) Obsidian destroys the old
+    // canvas DOM and builds a fresh `.canvas-wrapper`. Our captured
+    // `wrapper` / `view` / `canvas` references then point at detached,
+    // stale elements: `getBoundingClientRect()` on a detached node
+    // returns zeros/stale values, so the probed world→screen transform
+    // goes garbage and peer cursors/selections render at wildly wrong
+    // positions (the "positioning breaks until I restart Obsidian"
+    // bug — restart wipes the accumulated stale attachments). A fresh
+    // attachment to the new wrapper is created by the layout-change
+    // listener; this teardown disposes the stale one so only the live
+    // attachment (correct transform) survives.
+    if (!wrapper.isConnected) {
+      teardown();
+      return;
+    }
+    renderRemote(view, wrapper, overlay, awareness, cursorState);
+    rafHandle = requestAnimationFrame(tick);
+  };
+  rafHandle = requestAnimationFrame(tick);
+
+  cleanups.push(teardown);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────

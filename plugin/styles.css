@@ -145,7 +145,13 @@
   border: 2px solid;
   border-radius: 6px;
   will-change: transform;
-  transition: transform 80ms linear, width 80ms linear, height 80ms linear;
+  /* No CSS transition: the overlay is re-projected every animation
+   * frame from the live node positions. A transition here would fight
+   * the per-frame redraw — each frame sets a new transform and the
+   * browser tries to animate toward it over 80ms, never arriving,
+   * producing visible jitter during pan/zoom. Node positions are local
+   * and exact (no network jitter), so we want the box to snap to them
+   * each frame, like the cursor does. */
   box-sizing: border-box;
 }
 
@@ -160,7 +166,7 @@
   border: 2px dashed;
   border-radius: 6px;
   will-change: transform;
-  transition: transform 50ms linear;
+  /* No CSS transition — re-projected every frame; see .collab-canvas-selection. */
   box-sizing: border-box;
 }
 

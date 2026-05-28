@@ -2,6 +2,12 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.1.3 — 2026-05-28
+
+### Fixed
+- **Canvas peer cursors/selections positioned wildly wrong after switching files (fixed by restart until now).** The canvas presence overlay captured references to the canvas's `.canvas-wrapper` / view / `canvas` object when it first attached. On a file switch Obsidian destroys the old canvas DOM and builds a fresh wrapper, but the old attachment's animation loop kept running against the now-detached element — `getBoundingClientRect()` on a detached node returns stale/zero values, so the probed world→screen transform produced garbage and peers' cursors/outlines landed in the wrong place. Stale attachments accumulated across switches (only a restart cleared them). Now each attachment self-disposes the moment its wrapper leaves the DOM (`wrapper.isConnected` check in the render loop), so only the live canvas's attachment — with a correct transform — survives. This bug has existed latently since the canvas presence layer shipped (0.8.x); it surfaced now because v1.0.0's session model keeps canvas sessions alive across switches.
+- **Canvas selection outlines / drag ghosts jittered during pan/zoom.** They carried a CSS `transition: transform 80ms` while the overlay re-projects them every animation frame — the transition fought the per-frame redraw (always animating toward a target it never reached). Removed the transitions so these elements snap to the live node positions each frame, exactly like the cursor. Node positions are local and exact (no network jitter), so frame-accurate projection is already smooth.
+
 ## 2.1.2 — 2026-05-28
 
 ### Reverted
