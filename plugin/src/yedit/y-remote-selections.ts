@@ -42,6 +42,7 @@ import {
   EditorView,
   ViewPlugin,
   type ViewUpdate,
+  WidgetType,
 } from "@codemirror/view";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
@@ -54,20 +55,117 @@ import { resolveContextFacet, type ResolveContext } from "./y-sync";
 // rebuild against fresh awareness state.
 const remoteSelectionsRefresh = Annotation.define<true>();
 
-// Only the selection-highlight (Decoration.mark) classes live in the
-// baseTheme now. The caret bar + name label used to be a
-// Decoration.widget injected INSIDE the contenteditable — that is what
-// ghosted on iOS WebView when repositioned. They are now rendered as an
-// absolutely-positioned overlay OUTSIDE the text flow (see
-// CaretOverlay below + the `.cm-collab-cursor-*` rules in styles.css),
-// so there is no contenteditable repaint quirk to fight.
 export const yRemoteSelectionsTheme = EditorView.baseTheme({
   ".cm-ySelection": {},
   ".cm-yLineSelection": {
     padding: 0,
     margin: "0px 2px 0px 4px",
   },
+  ".cm-ySelectionCaret": {
+    position: "relative",
+    borderLeft: "1px solid black",
+    borderRight: "1px solid black",
+    marginLeft: "-1px",
+    marginRight: "-1px",
+    boxSizing: "border-box",
+    display: "inline",
+  },
+  ".cm-ySelectionCaretDot": {
+    borderRadius: "50%",
+    position: "absolute",
+    width: ".4em",
+    height: ".4em",
+    top: "-.2em",
+    left: "-.2em",
+    backgroundColor: "inherit",
+    transition: "transform .3s ease-in-out",
+    boxSizing: "border-box",
+  },
+  ".cm-ySelectionCaret:hover > .cm-ySelectionCaretDot": {
+    transformOrigin: "bottom center",
+    transform: "scale(0)",
+  },
+  ".cm-ySelectionInfo": {
+    position: "absolute",
+    top: "-1.05em",
+    left: "-1px",
+    fontSize: ".75em",
+    fontFamily: "serif",
+    fontStyle: "normal",
+    fontWeight: "normal",
+    lineHeight: "normal",
+    userSelect: "none",
+    color: "white",
+    paddingLeft: "2px",
+    paddingRight: "2px",
+    zIndex: 101,
+    transition: "opacity .3s ease-in-out",
+    backgroundColor: "inherit",
+    opacity: 0,
+    transitionDelay: "0s",
+    whiteSpace: "nowrap",
+  },
+  ".cm-ySelectionCaret:hover > .cm-ySelectionInfo": {
+    opacity: 1,
+    transitionDelay: "0s",
+  },
 });
+
+class YRemoteCaretWidget extends WidgetType {
+  constructor(
+    private readonly color: string,
+    private readonly name: string,
+  ) {
+    super();
+  }
+
+  toDOM(): HTMLElement {
+    const span = document.createElement("span");
+    span.className = "cm-ySelectionCaret";
+    span.style.backgroundColor = this.color;
+    span.style.borderColor = this.color;
+    span.append(document.createTextNode("⁠"));
+    const dot = document.createElement("div");
+    dot.className = "cm-ySelectionCaretDot";
+    span.append(dot);
+    span.append(document.createTextNode("⁠"));
+    const info = document.createElement("div");
+    info.className = "cm-ySelectionInfo";
+    info.textContent = this.name;
+    span.append(info);
+    span.append(document.createTextNode("⁠"));
+    return span;
+  }
+
+  eq(_other: YRemoteCaretWidget): boolean {
+    // Always return false so CodeMirror tears down the old widget DOM
+    // and creates a fresh one on every decoration update. The "natural"
+    // implementation here would compare color + name and return true
+    // (same identity → reuse DOM, just reposition). On desktop that
+    // works fine. On iOS WebView (and to a lesser extent Android
+    // WebView) the reposition of an absolutely-positioned label
+    // inside a transformed parent leaves rendering ghosts — the old
+    // label stays painted at the previous position while the parent
+    // moves. Forcing recreate eliminates the issue entirely. The cost
+    // is a few extra DOM operations per peer-cursor move, which is
+    // imperceptible compared to the ghosting artefact.
+    return false;
+  }
+
+  updateDOM(): boolean {
+    // Pair with eq() returning false: tell CodeMirror our widget can't
+    // be in-place updated, always recreate via toDOM().
+    return false;
+  }
+
+  get estimatedHeight(): number {
+    return -1;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
 
 interface RemoteUser {
   name?: string;
@@ -86,159 +184,6 @@ interface RemoteCursor {
 interface RemoteAwarenessState {
   user?: RemoteUser;
   cursor?: RemoteCursor | null;
-}
-
-// One peer's caret, resolved to an absolute char offset in OUR doc plus
-// presentation. Produced by build(); consumed by CaretOverlay to place
-// (or hide) the DOM element for that peer this frame.
-interface PeerCaret {
-  clientId: number;
-  headPos: number;
-  color: string;
-  name: string;
-}
-
-// ─── Caret overlay ────────────────────────────────────────────────────
-//
-// Remote carets (the thin vertical bar) and name labels are rendered as
-// an absolutely-positioned overlay appended to the editor's scroller
-// (`view.scrollDOM`), NOT as CodeMirror widgets inside the
-// contenteditable. This is the whole fix for the iOS WebView ghost-caret
-// bug: when caret/label DOM lives inside the contenteditable and is
-// removed/repositioned as a peer moves, iOS leaves stale painted pixels
-// behind. An overlay outside the text flow has none of that — same
-// approach proven solid by canvas-cursors.ts.
-//
-// Coordinate space. The overlay container is
-// `position:absolute; top/left:0` inside `view.scrollDOM`, which is the
-// scroll *container* (its own bounding box does not move when content
-// scrolls; only its scrollTop/scrollLeft change). We position each caret
-// with `view.coordsAtPos(pos)`, which returns viewport (client) rects.
-// To convert a client rect into a coordinate inside scrollDOM's content
-// box we do:
-//
-//     localX = clientX - scrollDOM.clientLeft - scrollRect.left + scrollLeft
-//     localY = clientY - scrollDOM.clientTop  - scrollRect.top  + scrollTop
-//
-// Because the offset is anchored to the *content* (we add scrollLeft/
-// scrollTop), the caret stays glued to its character as the user
-// scrolls. CodeMirror calls our plugin update() on viewportChanged /
-// geometryChanged during scroll, which re-runs reposition(); a scroll
-// listener on scrollDOM is added as a belt-and-suspenders for momentum
-// scrolling where update() may lag a frame.
-class CaretOverlay {
-  private readonly view: EditorView;
-  private readonly container: HTMLDivElement;
-  private readonly els = new Map<number, HTMLDivElement>();
-  private readonly onScroll: () => void;
-  // Last computed carets, kept so the scroll listener can reposition
-  // without rebuilding from awareness.
-  private carets: PeerCaret[] = [];
-
-  constructor(view: EditorView) {
-    this.view = view;
-    this.container = document.createElement("div");
-    this.container.className = "cm-collab-cursor-overlay";
-    view.scrollDOM.appendChild(this.container);
-    this.onScroll = () => this.reposition();
-    // passive: we never preventDefault; just reposition.
-    view.scrollDOM.addEventListener("scroll", this.onScroll, { passive: true });
-  }
-
-  // Replace the set of peers and immediately lay them out.
-  setCarets(carets: PeerCaret[]): void {
-    this.carets = carets;
-    const seen = new Set<number>();
-    for (const c of carets) {
-      seen.add(c.clientId);
-      let el = this.els.get(c.clientId);
-      if (!el) {
-        el = this.createEl();
-        this.els.set(c.clientId, el);
-        this.container.appendChild(el);
-      }
-      el.style.color = c.color;
-      const bar = el.firstElementChild as HTMLElement | null;
-      if (bar) bar.style.backgroundColor = c.color;
-      const label = el.lastElementChild as HTMLElement | null;
-      if (label) {
-        if (label.textContent !== c.name) label.textContent = c.name;
-        label.style.backgroundColor = c.color;
-      }
-    }
-    // GC peers no longer present (left, cursor null, or not in our ytext).
-    for (const [id, el] of this.els) {
-      if (!seen.has(id)) {
-        el.remove();
-        this.els.delete(id);
-      }
-    }
-    this.reposition();
-  }
-
-  // Re-place every tracked caret against the current layout. Cheap; no
-  // awareness reads. Hides any caret whose position is not currently
-  // rendered (coordsAtPos returns null when folded / outside viewport).
-  reposition(): void {
-    if (this.carets.length === 0) return;
-    const scrollRect = this.view.scrollDOM.getBoundingClientRect();
-    const scrollLeft = this.view.scrollDOM.scrollLeft;
-    const scrollTop = this.view.scrollDOM.scrollTop;
-    const clientLeft = this.view.scrollDOM.clientLeft;
-    const clientTop = this.view.scrollDOM.clientTop;
-    for (const c of this.carets) {
-      const el = this.els.get(c.clientId);
-      if (!el) continue;
-      let coords: { left: number; right: number; top: number; bottom: number } | null =
-        null;
-      try {
-        coords = this.view.coordsAtPos(c.headPos);
-      } catch {
-        coords = null;
-      }
-      if (!coords) {
-        // Scrolled out of view / folded / not rendered — hide rather
-        // than draw at a bogus position.
-        el.style.display = "none";
-        continue;
-      }
-      const x = coords.left - clientLeft - scrollRect.left + scrollLeft;
-      const y = coords.top - clientTop - scrollRect.top + scrollTop;
-      const height = coords.bottom - coords.top;
-      el.style.display = "";
-      el.style.transform = `translate(${x}px, ${y}px)`;
-      el.style.height = `${height}px`;
-    }
-  }
-
-  private createEl(): HTMLDivElement {
-    const el = document.createElement("div");
-    el.className = "cm-collab-cursor";
-    const bar = document.createElement("div");
-    bar.className = "cm-collab-cursor-bar";
-    el.appendChild(bar);
-    const label = document.createElement("div");
-    label.className = "cm-collab-cursor-label";
-    el.appendChild(label);
-    return el;
-  }
-
-  // Hide all carets without tearing down the elements — used when the
-  // collab context goes inactive/null. setCarets([]) on the next active
-  // build will GC them.
-  clear(): void {
-    this.carets = [];
-    for (const [id, el] of this.els) {
-      el.remove();
-      this.els.delete(id);
-    }
-  }
-
-  destroy(): void {
-    this.clear();
-    this.view.scrollDOM.removeEventListener("scroll", this.onScroll);
-    this.container.remove();
-  }
 }
 
 class YRemoteSelectionsPluginValue {
@@ -260,15 +205,11 @@ class YRemoteSelectionsPluginValue {
   // dispatch. CodeMirror forbids re-entrant dispatches; even if it
   // didn't, we'd queue an avalanche of redraws otherwise.
   private dispatchPending = false;
-  // Overlay for remote carets + labels, lives OUTSIDE the
-  // contenteditable (see CaretOverlay). Created per-EditorView.
-  private readonly overlay: CaretOverlay;
 
   constructor(view: EditorView) {
     this.view = view;
     this.resolve = view.state.facet(resolveContextFacet);
     this.decorations = RangeSet.of([]);
-    this.overlay = new CaretOverlay(view);
     // First subscribe happens lazily on the first update() so we don't
     // dispatch from inside CodeMirror's plugin construction.
   }
@@ -316,13 +257,11 @@ class YRemoteSelectionsPluginValue {
   update(update: ViewUpdate): void {
     const ctx = this.resolve(this.view);
     if (!ctx || !ctx.active) {
-      // Released — drop any existing subscription, decorations and
-      // overlay carets.
+      // Released — drop any existing subscription and decorations.
       this.rebindAwareness(null, null);
       if (this.decorations.size > 0) {
         this.decorations = RangeSet.of([]);
       }
-      this.overlay.clear();
       return;
     }
 
@@ -337,25 +276,8 @@ class YRemoteSelectionsPluginValue {
     // null state).
     this.publishLocalCursor(update, ctx.ytext, ctx.awareness, ctx.user);
 
-    // Rebuild decorations (selection-highlight marks) AND collect the
-    // remote carets, which go to the overlay rather than into the doc.
-    const carets: PeerCaret[] = [];
-    this.decorations = this.build(ctx.ytext, ctx.awareness, carets);
-    this.overlay.setCarets(carets);
-
-    // Reposition the overlay carets whenever layout could have moved
-    // them: typing/doc edits, scroll (viewport), resize/layout
-    // (geometry), or selection. setCarets() above already repositioned
-    // for the awareness-driven rebuild; this covers the cases where the
-    // awareness state is unchanged but the geometry isn't.
-    if (
-      update.docChanged ||
-      update.viewportChanged ||
-      update.geometryChanged ||
-      update.selectionSet
-    ) {
-      this.overlay.reposition();
-    }
+    // Rebuild decorations against the current awareness state.
+    this.decorations = this.build(ctx.ytext, ctx.awareness);
   }
 
   private publishLocalCursor(
@@ -435,11 +357,7 @@ class YRemoteSelectionsPluginValue {
     }
   }
 
-  private build(
-    ytext: Y.Text,
-    awareness: Awareness,
-    carets: PeerCaret[],
-  ): DecorationSet {
+  private build(ytext: Y.Text, awareness: Awareness): DecorationSet {
     const ydoc = ytext.doc;
     if (!ydoc) return RangeSet.of([]);
     const local = awareness.clientID;
@@ -448,15 +366,7 @@ class YRemoteSelectionsPluginValue {
 
     awareness.getStates().forEach((rawState, clientId) => {
       try {
-        this.buildOnePeer(
-          rawState,
-          clientId,
-          local,
-          ytext,
-          docLen,
-          decorations,
-          carets,
-        );
+        this.buildOnePeer(rawState, clientId, local, ytext, docLen, decorations);
       } catch (err) {
         // One bad peer state must not crash the entire decoration
         // build — that would freeze every other peer's cursor on
@@ -483,7 +393,6 @@ class YRemoteSelectionsPluginValue {
     ytext: Y.Text,
     docLen: number,
     decorations: Range<Decoration>[],
-    carets: PeerCaret[],
   ): void {
     const ydoc = ytext.doc;
     if (!ydoc) return;
@@ -583,10 +492,12 @@ class YRemoteSelectionsPluginValue {
         }
       }
 
-    // The caret bar + name label are NOT a decoration. They go to the
-    // overlay (CaretOverlay) which positions them via coordsAtPos
-    // outside the contenteditable, dodging the iOS ghost-paint bug.
-    carets.push({ clientId, headPos: hPos, color, name });
+    decorations.push(
+      Decoration.widget({
+        widget: new YRemoteCaretWidget(color, name),
+        side: hPos - aPos > 0 ? -1 : 1,
+      }).range(hPos),
+    );
   }
 
   destroy(): void {
@@ -601,7 +512,6 @@ class YRemoteSelectionsPluginValue {
     this.boundAwareness = null;
     this.boundDocId = null;
     this.decorations = RangeSet.of([]);
-    this.overlay.destroy();
   }
 }
 

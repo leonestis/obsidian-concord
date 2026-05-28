@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.1.2 — 2026-05-28
+
+### Reverted
+- **Rolled back the v2.1.1 remote-caret overlay — it regressed markdown cursor rendering.** The overlay (carets drawn as an absolute layer via `coordsAtPos` instead of in-content widgets) was the right idea for killing iOS ghost carets, but the coordinate/scroll math was wrong and shipped without a live iOS test: remote cursors and selections stopped rendering / rendered in the wrong place. Reverted `y-remote-selections.ts` + the caret CSS to the v2.1.0 widget rendering, which renders correctly (the iOS ghost-caret artefact returns for now). The overlay will be redone properly using CodeMirror 6's purpose-built `layer()` API (which owns coordinate + scroll handling) and only after on-device iOS verification, rather than guessing. All of v2.1.0's other fixes (3-way merge / no text loss, single awareness writer / friend-visible, auth-storm stop, binary retry + integrity) are untouched and remain in effect.
+
 ## 2.1.1 — 2026-05-28
 
 ### Fixed

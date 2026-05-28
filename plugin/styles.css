@@ -1,65 +1,85 @@
-/* ─── Remote caret overlay (editor) ───────────────────────────────────
+/* y-codemirror.next ships its remote cursor + name label with the name hidden
+ * by default (only shown on hover via the lib's base theme). We override that
+ * styling so the name is always visible above the caret — matching the UX of
+ * Figma / Google Docs. The lib's class names are:
  *
- * Remote peers' caret bars + name labels used to be CodeMirror
- * Decoration.widget DOM injected INSIDE the editor's contenteditable.
- * On iOS WebView that left stale painted pixels ("ghost carets") behind
- * whenever the widget was repositioned as a peer moved. They are now
- * rendered as an absolutely-positioned overlay appended to
- * `view.scrollDOM`, completely outside the text flow — no
- * contenteditable repaint quirk. See CaretOverlay in
- * src/yedit/y-remote-selections.ts.
+ *   .cm-ySelectionCaret      → the caret bar element
+ *   .cm-ySelectionCaretDot   → the dot at the top of the caret
+ *   .cm-ySelectionInfo       → the name label
  *
- * The container is a zero-size anchor at the scroller's top-left; each
- * caret element is translated to a content-relative coordinate so it
- * stays glued to its character as the editor scrolls. Colour is set
- * inline (peer colour) on both the element (via `color`) and the bar/
- * label backgrounds.
+ * Color is inlined onto the caret element by the widget, so we use
+ * `background-color: inherit` on the label to match.
  */
-.cm-collab-cursor-overlay {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-  z-index: 50;
-}
 
-.cm-collab-cursor {
+.cm-ySelectionInfo {
   position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-  will-change: transform;
-}
-
-/* The caret bar: a thin 2px vertical line in the peer's colour. Height
- * is set inline per-line from coordsAtPos so it matches the line box. */
-.cm-collab-cursor-bar {
-  position: absolute;
+  top: -1.05em;
   left: -1px;
-  top: 0;
-  width: 2px;
-  height: 100%;
-  background-color: currentColor;
-}
-
-/* Name label sitting just above-left of the caret, peer colour
- * background, white text — same look as the old widget label. */
-.cm-collab-cursor-label {
-  position: absolute;
-  left: -1px;
-  top: -1.15em;
   padding: 1px 5px;
   font-size: 11px;
   line-height: 1.2;
   font-family: var(--font-interface, sans-serif);
   font-weight: 500;
   color: #ffffff;
+  background-color: inherit; /* inherits the caret's bg, which is the user's color */
   border-radius: 3px 3px 3px 0;
   white-space: nowrap;
   user-select: none;
   pointer-events: none;
+  /* Override the library's hover-only opacity behaviour. */
+  opacity: 1 !important;
+  transition: none !important;
+  z-index: 50;
+  /* iOS WebView (and to a lesser extent Android WebView) leaves stale
+   * paint behind when an absolutely-positioned descendant of a
+   * contenteditable element is removed from the DOM — the actual node
+   * is gone but the painted pixels stay until the surrounding area
+   * is forced to repaint. Forcing a GPU compositor layer via a
+   * translateZ trick puts this label onto its own layer, which gets
+   * cleanly disposed when the widget DOM is removed. Same effect as
+   * `will-change: transform` but with broader WebView support. */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  will-change: transform;
+  contain: layout style paint;
+}
+
+/* The caret bar itself: a thin 2px vertical line in the user's color.
+ * The lib gives it a background-color on inline style; we shape it. */
+.cm-ySelectionCaret {
+  position: relative;
+  display: inline-block;
+  border-left: 2px solid;
+  border-color: inherit;
+  width: 0 !important;
+  height: 1em;
+  margin-right: -1px;
+  margin-left: -1px;
+  pointer-events: none;
+  /* Force the inlined background-color into the border via inherit hack. */
+  /* Same GPU-layer trick as the label below. translateZ(0) alone
+   * isn't enough for iOS WebView when the caret is rendered via
+   * border-left (no real fill area). Stack four mechanisms:
+   *   - transform: translateZ(0) — request GPU layer
+   *   - will-change: transform — explicit hint, broader UA support
+   *   - isolation: isolate — new stacking context so paint can't
+   *     bleed outside this element
+   *   - contain: layout style paint — strongest browser hint that
+   *     this element manages its own paint, repaints stay scoped
+   * Together this reliably extracts the caret bar onto its own
+   * compositor layer that disposes with the DOM node. */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  will-change: transform;
+  isolation: isolate;
+  contain: layout style paint;
+}
+
+/* Small dot at the top of the caret — keep but make subtle. */
+.cm-ySelectionCaretDot {
+  display: none; /* the always-visible label is enough of a marker */
 }
 
 /* ─── Canvas cursor overlay ───────────────────────────────────────── */
