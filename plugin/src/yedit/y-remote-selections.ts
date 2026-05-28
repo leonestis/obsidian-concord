@@ -18,10 +18,17 @@
 //     bound sessions; this plugin only writes `cursor`.)
 //
 // On a context switch (different docId than last seen), we subscribe to
-// the new awareness's `change` events and unsubscribe from the old. The
-// removeAwarenessStates of our own state from the previous session is
-// done by y-sync.ts on its rebind, not here, so there's exactly one
-// caller doing that per switch.
+// the new awareness's `change` events and unsubscribe from the old.
+//
+// We NEVER remove or null the local awareness state from here — that is
+// owned exclusively by LocalPresenceController (active/inactive +
+// identity) and TextSession.destroy() (final teardown). This plugin's
+// only write to the local state is the live cursor coordinate, and it
+// does so in a way that can't wipe the identity: if the local state is
+// somehow still null when we go to publish (presence's broadcast hasn't
+// landed yet), we write a FULL { user, cursor } object using the `user`
+// threaded through YeditContext, rather than a setLocalStateField that
+// would silently no-op on a null state.
 
 import {
   Annotation,
@@ -262,9 +269,12 @@ class YRemoteSelectionsPluginValue {
     this.rebindAwareness(ctx.awareness, ctx.docId);
 
     // Publish OUR cursor on selection / focus / doc changes. The `user`
-    // field is owned by LocalPresenceController; this writes only the
-    // cursor coordinates.
-    this.publishLocalCursor(update, ctx.ytext, ctx.awareness);
+    // field is owned by LocalPresenceController; this normally writes
+    // only the cursor coordinate, but falls back to a full
+    // { user, cursor } write if the local awareness state is null (so we
+    // never advertise a cursor with no identity, and never no-op on a
+    // null state).
+    this.publishLocalCursor(update, ctx.ytext, ctx.awareness, ctx.user);
 
     // Rebuild decorations against the current awareness state.
     this.decorations = this.build(ctx.ytext, ctx.awareness);
@@ -274,6 +284,7 @@ class YRemoteSelectionsPluginValue {
     update: ViewUpdate,
     ytext: Y.Text,
     awareness: Awareness,
+    user: { name: string; color: string },
   ): void {
     if (
       !update.selectionSet &&
@@ -300,22 +311,49 @@ class YRemoteSelectionsPluginValue {
       const anchor = Y.createRelativePositionFromTypeIndex(ytext, sel.anchor);
       const head = Y.createRelativePositionFromTypeIndex(ytext, sel.head);
       if (
-        local?.cursor == null ||
+        local == null ||
+        local.cursor == null ||
         !Y.compareRelativePositions(currentAnchor, anchor) ||
         !Y.compareRelativePositions(currentHead, head)
       ) {
-        try {
-          awareness.setLocalStateField("cursor", { anchor, head });
-        } catch (err) {
-          console.warn("[yedit] publish cursor failed", err);
-        }
+        this.writeCursor(awareness, local, user, { anchor, head });
       }
-    } else if (local?.cursor != null && hasFocus) {
-      try {
-        awareness.setLocalStateField("cursor", null);
-      } catch {
-        /* ignore */
+    } else if (hasFocus && (local == null || local.cursor != null)) {
+      // Focused but no live selection to advertise (e.g. editor focused
+      // with caret not yet placed, or selection cleared). Clear our
+      // cursor — but if local state is null, still establish identity so
+      // peers don't see us as gone. We only do this when local is null
+      // OR a cursor was previously set, to avoid pointless rewrites.
+      this.writeCursor(awareness, local, user, null);
+    }
+  }
+
+  // Null-safe cursor write. y-protocols' setLocalStateField is a no-op
+  // when the local state object is null (it has nothing to add a field
+  // to). That null window is real: presence's broadcastAll may not have
+  // run yet for a freshly-bound session when the editor first publishes
+  // a cursor. In that window we must write the FULL { user, cursor }
+  // object via setLocalState, using the identity threaded through the
+  // context, so the peer never advertises a cursor with no name — or,
+  // worse, advertises nothing at all. Once a state object exists, we
+  // update just the cursor field and leave presence's `user` untouched.
+  private writeCursor(
+    awareness: Awareness,
+    local: RemoteAwarenessState | null,
+    user: { name: string; color: string },
+    cursor: RemoteCursor | null,
+  ): void {
+    try {
+      if (local == null) {
+        awareness.setLocalState({ user, cursor } as unknown as Record<
+          string,
+          unknown
+        >);
+      } else {
+        awareness.setLocalStateField("cursor", cursor);
       }
+    } catch (err) {
+      console.warn("[yedit] publish cursor failed", err);
     }
   }
 

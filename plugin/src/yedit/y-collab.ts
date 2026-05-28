@@ -24,10 +24,10 @@
 //   // resolveContext now returns { active: false } for this view; the
 //   // plugins go inert without losing their identity.
 //
-// Phase 3 (next release) will add disk-buffer / 3-way merge between
-// ytext, editor doc, and on-disk content. The yedit/ surface is stable
-// in v2.0.0 — if Phase 3 needs a new extension, append it without
-// re-shaping the resolver contract.
+// Phase 3 added the DiskBuffer-mediated 3-way merge between ytext,
+// editor doc, and on-disk content — it lives inside ySync's reconcile-
+// on-bind path (see y-sync.ts reconcileBinding / runDiskMerge) and
+// needed no new extension here, so the resolver contract is unchanged.
 
 import { Annotation, type Extension } from "@codemirror/state";
 
@@ -51,8 +51,9 @@ import {
 } from "./y-remote-selections";
 
 export interface YCollabOptions {
-  // Future-proofing. v2.0.0 has nothing to put here; Phase 3 will add
-  // disk-buffer-related hooks.
+  // Future-proofing. Nothing to put here yet — the Phase 3 disk-buffer
+  // wiring is internal to ySync and the DiskBuffer singleton, so it
+  // needed no option surface.
   // eslint-disable-next-line @typescript-eslint/no-empty-interface
 }
 

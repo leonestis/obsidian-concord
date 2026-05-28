@@ -74,6 +74,17 @@ export default class CollabPlugin extends Plugin {
 
   private socket: HocuspocusProviderWebsocket | null = null;
   private connected = false;
+  // FIX A — set when the server rejects our auth handshake. While true,
+  // we stop the websocket's reconnect loop (storm) and refuse to
+  // auto-connect; only an explicit token change or the "Reconnect"
+  // command clears it and tries a fresh socket. Persisted only in
+  // memory — a plugin reload re-attempts the connection from scratch.
+  private authFailed = false;
+  // Last auth token we've seen in saveSettings. Used to detect "the
+  // user edited the token" so an auth-failed session can auto-recover
+  // the moment a new token is typed (FIX A recovery), without making
+  // every unrelated settings change kick a reconnect.
+  private lastAuthToken = "";
   private statusBar!: StatusBar;
   private manifestSync!: ManifestSync;
   private sessionManager!: SessionManager;
@@ -140,6 +151,7 @@ export default class CollabPlugin extends Plugin {
       binaryClient: () => this.binaryClient,
       remoteApplyPaths: this.remoteApplyPaths,
       onDownloadProgress: (label) => this.statusBar.setProgress(label),
+      onAuthFailed: (reason) => this.handleAuthFailure(reason),
       debug: (...a) => this.debug(...a),
     });
 
@@ -271,6 +283,11 @@ export default class CollabPlugin extends Plugin {
     if (!this.settings.userColor) {
       this.settings.userColor = colorFromName(this.settings.userName);
     }
+    // Seed the token tracker BEFORE the saveSettings() below, so the
+    // first save (during onload, when we haven't even connected yet)
+    // doesn't read as a "token changed" event and trigger a spurious
+    // reconnect. FIX A recovery only fires on genuine later edits.
+    this.lastAuthToken = this.settings.authToken;
     await this.saveSettings();
   }
 
@@ -294,6 +311,19 @@ export default class CollabPlugin extends Plugin {
       name: this.settings.userName,
       color: this.settings.userColor,
     });
+    // FIX A recovery — if the user edited the auth token while we were
+    // in the auth-failed state, treat it as "I fixed it": clear the
+    // gate and rebuild the socket. We guard on authFailed so a token
+    // edit during a healthy session doesn't yank the connection; such
+    // a change still takes effect on the next manual reconnect (the
+    // documented behaviour). Only act once statusBar exists (i.e. not
+    // during the onload-time loadSettings call).
+    const tokenChanged = this.settings.authToken !== this.lastAuthToken;
+    this.lastAuthToken = this.settings.authToken;
+    if (tokenChanged && this.authFailed && this.statusBar) {
+      log.info("socket", "auth token changed while auth-failed — attempting recovery");
+      void this.reconnect();
+    }
   }
 
   private debug(...args: unknown[]): void {
@@ -316,8 +346,42 @@ export default class CollabPlugin extends Plugin {
 
   // ── connection lifecycle ────────────────────────────────────────────
 
+  // True when `this.socket` exists but its WebSocket will never recover
+  // on its own — i.e. reconnection has been turned off (shouldConnect
+  // === false, set by our disconnect() on auth failure, or by the
+  // provider after maxAttempts) and it's sitting disconnected. FIX C:
+  // such a socket is "dead" and connect() must rebuild it rather than
+  // early-returning on its mere existence.
+  private socketIsDead(): boolean {
+    const s = this.socket as
+      | (HocuspocusProviderWebsocket & {
+          shouldConnect?: boolean;
+          status?: string;
+        })
+      | null;
+    if (!s) return false;
+    return s.shouldConnect === false && s.status !== "connected";
+  }
+
   private connect(): void {
-    if (this.socket) return;
+    // FIX A — never auto-reconnect into a server that's rejecting our
+    // token; that's exactly the storm we're killing. Recovery only
+    // happens via the token-change path in saveSettings or the explicit
+    // Reconnect command — both call clearAuthFailure() first.
+    if (this.authFailed) {
+      log.info("socket", "connect skipped: auth previously failed — fix the token, then reconnect");
+      return;
+    }
+    // FIX C — connect() is idempotent and self-heals a dead socket.
+    // A live (or still-retrying) socket → no-op. A dead socket
+    // (shouldConnect=false, disconnected) → tear it down and rebuild,
+    // instead of the old `if (this.socket) return` that stranded the
+    // user offline forever after a terminal close.
+    if (this.socket) {
+      if (!this.socketIsDead()) return;
+      log.info("socket", "connect: existing socket is dead — rebuilding");
+      this.teardownSocket();
+    }
     const trimmed = this.settings.serverUrl.trim();
     if (!trimmed) {
       // New users with empty serverUrl shouldn't get a connect storm
@@ -332,14 +396,28 @@ export default class CollabPlugin extends Plugin {
     try {
       const baseUrl = trimmed.replace(/\/+$/, "");
       const sep = baseUrl.includes("?") ? "&" : "?";
-      this.socket = new HocuspocusProviderWebsocket({
+      const sock = new HocuspocusProviderWebsocket({
         url: `${baseUrl}${sep}clientVersion=${encodeURIComponent(PLUGIN_VERSION)}`,
       });
+      this.socket = sock;
       this.binaryClient = this.makeBinaryClient();
       this.socket.on("status", (event: { status: string }) => {
         log.info("socket", `status: ${event.status}`);
         this.connected = event.status === "connected";
         this.statusBar.setConnected(this.connected);
+        // FIX C — when this socket goes to a disconnected state that it
+        // won't climb out of on its own (reconnection disabled), null
+        // it so the next connect()/autoconnect rebuilds a fresh one.
+        // Compare identity: a status callback from a stale socket must
+        // never clobber a socket we've already rebuilt.
+        if (
+          event.status === "disconnected" &&
+          this.socket === sock &&
+          this.socketIsDead()
+        ) {
+          log.info("socket", "status: terminal disconnect — clearing dead socket");
+          this.teardownSocket();
+        }
       });
       this.socket.on("close", (event: unknown) => {
         log.info("socket", "close", event);
@@ -354,14 +432,67 @@ export default class CollabPlugin extends Plugin {
     }
   }
 
-  private async reconnect(): Promise<void> {
-    await this.manifestSync.stop();
-    await this.sessionManager.destroyAll();
+  // FIX A — the server rejected our auth handshake (surfaced by the
+  // manifest provider's authenticationFailed event). Stop the websocket's
+  // reconnect loop and put the plugin into a persistent, recoverable
+  // "auth failed" state instead of letting the socket hammer the server
+  // forever behind a one-shot Notice.
+  private handleAuthFailure(reason: string): void {
+    if (this.authFailed) return; // already handled this episode
+    this.authFailed = true;
+    log.error("socket", `auth failed — stopping reconnect loop: ${reason}`);
+    // disconnect() sets shouldConnect=false and closes the WS, so the
+    // provider's onClose does NOT schedule another connect — the storm
+    // stops. We then null the socket so the recovery path rebuilds
+    // cleanly (rather than reusing a socket whose shouldConnect we'd
+    // have to flip back manually).
+    try {
+      this.socket?.disconnect();
+    } catch (err) {
+      log.warn("socket", "disconnect during auth-failure handling threw", err);
+    }
+    this.teardownSocket();
+    this.connected = false;
+    this.statusBar.setConnected(false);
+    // Persistent indicator (not a disappearing toast). One Notice is
+    // fine on top for immediacy, but the status bar carries the state.
+    this.statusBar.setAuthFailed(true);
+    new Notice(
+      "Collab: server rejected the auth token. Sync is paused — update your Auth token in settings (or run “Reconnect to server”) to resume.",
+      12_000,
+    );
+  }
+
+  // Tear down the websocket object + its dependents WITHOUT touching the
+  // authFailed flag. Used by connect() (dead-socket rebuild), the
+  // auth-failure handler, and reconnect(). Does NOT destroyAll sessions
+  // — callers that need that (reconnect) do it explicitly.
+  private teardownSocket(): void {
     this.socket?.destroy();
     this.socket = null;
     this.binaryClient = null;
+  }
+
+  // FIX A recovery — clear the auth-failed state and attempt a fresh
+  // connection. Invoked from the "Reconnect" command and from
+  // saveSettings when the user edits the auth token.
+  private clearAuthFailure(): void {
+    if (!this.authFailed) return;
+    log.info("socket", "clearing auth-failed state — will attempt a fresh connect");
+    this.authFailed = false;
+    this.statusBar.setAuthFailed(false);
+  }
+
+  private async reconnect(): Promise<void> {
+    await this.manifestSync.stop();
+    await this.sessionManager.destroyAll();
+    this.teardownSocket();
     this.connected = false;
     this.statusBar.setConnected(false);
+    // FIX A — an explicit Reconnect is the user's "I fixed the token"
+    // signal. Clear the auth-failed gate so connect() actually rebuilds
+    // the socket instead of refusing.
+    this.clearAuthFailure();
     // v2.0.0: after destroyAll, every LiveView's resolveContext returns
     // null (no bound sessions). Queue a refresh so each LiveView
     // transitions to release()/inert immediately and yedit's
@@ -396,9 +527,7 @@ export default class CollabPlugin extends Plugin {
     log.info("plugin", "performWipeLocalCache: starting");
     await this.manifestSync.stop();
     await this.sessionManager.destroyAll();
-    this.socket?.destroy();
-    this.socket = null;
-    this.binaryClient = null;
+    this.teardownSocket();
     this.connected = false;
     this.statusBar.setConnected(false);
     this.liveViewManager?.queueRefresh("performWipeLocalCache");

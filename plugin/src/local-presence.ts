@@ -35,12 +35,18 @@
 // editor's selection if we have one, or null otherwise); non-current
 // sessions get `{ user, cursor: null }`.
 //
-// Crucially: setLocalState (not setLocalStateField) ALWAYS fires the
-// awareness 'change' observer — every full-object write is broadcast,
-// even when the new state is equal to the old. That's the structural
-// fix for "B doesn't see A return to a file when A had been away":
-// every focus-change unconditionally re-broadcasts A's identity into
-// the room.
+// Note on broadcast semantics: y-protocols' awareness fires its
+// 'change' / 'update' observer whenever setLocalState is called AND the
+// new state is not deep-equal to the prior one (it does NOT fire on a
+// byte-for-byte identical re-write — an earlier comment here claimed it
+// "ALWAYS fires"; that was wrong). We don't rely on identical-state
+// rebroadcasts. On a return-to-file the active session's state
+// genuinely differs from its prior `{user, cursor:null}` (cursor is
+// re-established by the editor's next publish, and the path-change path
+// here resets lastCursor), so a real change is emitted and peers redraw.
+// The durable invariant that fixes the "friend invisible" class of bugs
+// is simpler: this controller is the SOLE writer of local awareness
+// state. No other module nulls or removes it mid-life anymore.
 
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
@@ -150,9 +156,13 @@ export class LocalPresenceController {
         cursor: isCurrent ? this.lastCursor : null,
       };
       try {
-        // setLocalState (not setLocalStateField) — guarantees the
-        // awareness observer fires on every call, even when value
-        // didn't change. That's the broadcast we depend on for W6.
+        // setLocalState (not setLocalStateField) — writes the full
+        // { user, cursor } object so identity and cursor are always set
+        // together as one atomic state. y-protocols fires the awareness
+        // observer when this differs from the prior state (it does not
+        // fire on an identical re-write — see the file header). On the
+        // paths that call broadcastAll (user change, path change) the
+        // state genuinely differs, so the redraw we want is emitted.
         awareness.setLocalState(state as unknown as Record<string, unknown>);
       } catch (err) {
         log.warn(

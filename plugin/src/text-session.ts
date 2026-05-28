@@ -12,13 +12,14 @@
 //
 // The conflict-file path that v1.0.5 lived in (reconcileEditorAndYtext
 // → save .conflict-<ISO>.md before letting the editor be overwritten)
-// was removed in v2.0.0. The replacement: yedit/y-sync.ts seeds an
-// empty ytext from the editor when binding to a fresh-zero session
-// (the "first peer" case), and on a TRUE ytext-vs-editor divergence it
-// runs a minimal diff-based push from ytext to editor (so caret + undo
-// state survive). Phase 3 will add disk-mediated 3-way merge; until
-// then we explicitly accept the v0.9.2 "ytext wins on divergence"
-// trade-off rather than the v1.0.5 false-positive .conflict files.
+// was removed in v2.0.0. Phase 3 replaces it (and the interim "ytext
+// wins on divergence" trade-off) with a DiskBuffer-mediated three-way
+// merge: yedit/y-sync.ts's reconcileBinding diffs the editor (THEIRS)
+// against the Y.Text (OURS) using the DiskBuffer (BASE = last known
+// consistent disk content, keyed by docId) and replays the local edits
+// onto the CRDT so neither side's text is lost. This session's job in
+// that scheme is to keep the BASE accurate: every successful disk-sync
+// write (below) records the content it wrote as the new base.
 
 import { App, TFile } from "obsidian";
 import type { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
@@ -29,6 +30,7 @@ import * as Y from "yjs";
 
 import { log } from "./logger";
 import { docIdToRoom, waitForProviderSync } from "./util";
+import { DiskBuffer } from "./disk-buffer";
 import type { BaseSession } from "./types";
 
 export interface TextSessionOptions {
@@ -60,6 +62,11 @@ export class TextSession implements BaseSession {
   private destroyed = false;
   private observers: Array<(e: Y.YTextEvent, t: Y.Transaction) => void> = [];
   private diskWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  // Shared BASE store for the Phase 3 three-way merge. Every time the
+  // disk-sync writer confirms disk == ytext (whether it just wrote it or
+  // disk already matched), that content is the new "last known
+  // consistent" snapshot — so we record it here as the merge base.
+  private readonly diskBuffer = DiskBuffer.shared();
 
   private constructor(private readonly opts: TextSessionOptions) {
     this.docId = opts.docId;
@@ -164,9 +171,18 @@ export class TextSession implements BaseSession {
         try {
           const current = await this.opts.app.vault.read(tfile);
           if (this.destroyed) return;
-          if (current === content) return;
+          if (current === content) {
+            // Disk already matches ytext — they're consistent. This IS a
+            // valid merge base; record it so a later offline divergence
+            // has an accurate ancestor to diff against.
+            void this.diskBuffer.set(this.docId, content);
+            return;
+          }
           this.opts.remoteApplyPaths.add(this.path);
           await this.opts.app.vault.modify(tfile, content);
+          // The content we just wrote to disk is now the known-consistent
+          // snapshot (disk == ytext). Update the merge base.
+          void this.diskBuffer.set(this.docId, content);
           this.opts.debug(
             `[collab] disk-sync ${this.path}: wrote ${content.length} chars`,
           );
@@ -184,15 +200,13 @@ export class TextSession implements BaseSession {
     this.observers.push(observer);
   }
 
-  // v1.0.5's reconcileEditorAndYtext is GONE in v2.0.0. The "seed
-  // ytext from editor when ytext is empty" branch moved into
-  // yedit/y-sync.ts's rebind path (case b in that file). The
-  // .conflict-*.md generation is dropped on purpose — it was a
-  // false-positive factory under view recycling (the editor briefly
-  // held disk content while ytext arrived with the synced state, and
-  // the diff was misread as user-vs-server conflict). Phase 3 will
-  // bring back conflict detection backed by a real disk buffer +
-  // 3-way merge.
+  // v1.0.5's reconcileEditorAndYtext is GONE in v2.0.0. The reconcile
+  // now lives in yedit/y-sync.ts's reconcileBinding (cases 1–4): seed,
+  // adopt, in-sync, or — when editor and ytext both have content and
+  // differ — a DiskBuffer-mediated three-way merge that preserves BOTH
+  // the local offline edits and the remote edits. The .conflict-*.md
+  // generation stays dropped; the merge replaces it without the
+  // false-positive files v1.x created under view recycling.
 
   wipe(): void {
     if (this.destroyed) return;

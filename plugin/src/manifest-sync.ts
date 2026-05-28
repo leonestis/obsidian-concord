@@ -34,6 +34,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
 import { log } from "./logger";
+import { DiskBuffer } from "./disk-buffer";
 import { MANIFEST_ROOM, mimeFromExtension, sha256Hex, uuid } from "./util";
 import {
   PROTOCOL_VERSION,
@@ -44,6 +45,7 @@ import {
 } from "./types";
 import type { SessionManager } from "./session-manager";
 import type { BinaryClient } from "./binary-client";
+import { BlobHashMismatchError } from "./binary-client";
 import { purgeOldTrash } from "./trash";
 
 const CANVAS_EXTENSIONS = new Set(["canvas"]);
@@ -56,6 +58,25 @@ export const LARGE_FILE_WARN_BYTES = 50 * 1024 * 1024;
 // Cap parallel binary downloads during reconcile so a vault with 50
 // PDFs doesn't serialize and doesn't open 50 fetches at once.
 const MAX_PARALLEL_DOWNLOADS = 4;
+
+// FIX B — bounded retry for binary downloads. A peer's manifest entry
+// (tiny Yjs update) routinely arrives before their blob PUT finishes,
+// so the first GET 404s; a transient network blip / 5xx does the same.
+// Both are retryable. We back off geometrically and cap the wait so a
+// genuinely-missing blob doesn't hammer the server.
+//
+// Delays between attempts: 1s, 2s, 4s, 8s (capped). With 5 attempts
+// that's ~15s of patience inside a single materialise call before the
+// path is parked in `pendingDownloads` for the slow-path retry loop.
+const DOWNLOAD_RETRY_ATTEMPTS = 5;
+const DOWNLOAD_RETRY_BASE_MS = 1000;
+const DOWNLOAD_RETRY_MAX_MS = 8000;
+
+// Slow-path sweep: while any binaries are still stranded (all in-call
+// retries exhausted), re-attempt them on this cadence so a blob that
+// lands late eventually materialises without a manual reconnect. The
+// sweep also runs on every `synced` (reconnect) event.
+const PENDING_SWEEP_MS = 30_000;
 
 export interface ManifestSyncDeps {
   app: App;
@@ -70,6 +91,14 @@ export interface ManifestSyncDeps {
     has: (p: string) => boolean;
   };
   onDownloadProgress: (label: string | null) => void;
+  // FIX A — fired when the manifest provider's WebSocket handshake is
+  // rejected by the server for auth reasons. main.ts owns the socket
+  // lifecycle, so it (not ManifestSync) decides to disconnect() the
+  // shared websocket, flip the persistent "auth failed" state, and
+  // surface the status-bar indicator. The manifest provider is the
+  // canonical auth signal because it's the always-on room that's open
+  // the moment the socket connects.
+  onAuthFailed: (reason: string) => void;
   debug: (...args: unknown[]) => void;
 }
 
@@ -89,6 +118,19 @@ export class ManifestSync {
   // promise so the second caller waits for the first to finish before
   // computing a fresh localPaths snapshot.
   private reconcileInFlight: Promise<void> | null = null;
+
+  // FIX B — paths whose blob download failed every in-call retry (blob
+  // not on the server yet, or a stubborn transient error). Keyed by
+  // path → the manifest entry to re-materialise. The slow-path sweep
+  // (interval + every `synced`) drains this so a stranded image
+  // resolves once the uploader's PUT finally lands, with no manual
+  // reconnect. Hash-mismatch (poison) entries are NEVER parked here —
+  // re-downloading the same content hash can't fix corrupted bytes.
+  private pendingDownloads = new Map<string, ManifestEntry>();
+  private pendingSweepTimer: ReturnType<typeof setInterval> | null = null;
+  // Single-flight guard so overlapping triggers (interval fires while a
+  // `synced`-driven sweep is still running) don't double-download.
+  private pendingSweepInFlight = false;
 
   // v2.0.0 event emitter: fires `sessionReady(path)` whenever a session
   // transitions into the bound state. LiveViewManager subscribes via
@@ -187,23 +229,48 @@ export class ManifestSync {
         log.info("sync", `stamped manifest protocolVersion=${PROTOCOL_VERSION}`);
       }
       void this.runReconcile();
+      // FIX B — a (re)sync is the best moment to retry stranded blobs:
+      // the peer's PUT very likely completed while we were disconnected.
+      void this.sweepPendingDownloads("synced");
     });
 
     this.provider.on(
       "authenticationFailed",
       (d: { reason: string }) => {
         log.error("sync", `manifest auth failed: ${d.reason}`);
-        new Notice(
-          "Collab: server rejected the manifest connection (auth). Vault structure won't sync until you fix the token.",
-        );
+        // FIX A — hand off to main.ts, which disconnects the shared
+        // websocket (stopping the reconnect storm), sets the persistent
+        // authFailed state and updates the status bar. We deliberately
+        // do NOT new Notice() here anymore: the one-shot toast was the
+        // old behaviour that let the storm run silently. main.ts now
+        // owns the persistent indicator + recovery path.
+        this.deps.onAuthFailed(d.reason);
       },
     );
 
     this.mapObserver = (event) => void this.onManifestChange(event);
     this.map.observe(this.mapObserver);
+
+    // FIX B — slow-path retry loop for stranded binaries. Runs only
+    // while `pendingDownloads` is non-empty (the sweep is a cheap no-op
+    // otherwise), so an idle vault pays nothing.
+    if (!this.pendingSweepTimer) {
+      this.pendingSweepTimer = setInterval(() => {
+        if (this.pendingDownloads.size === 0) return;
+        void this.sweepPendingDownloads("timer");
+      }, PENDING_SWEEP_MS);
+    }
   }
 
   async stop(): Promise<void> {
+    if (this.pendingSweepTimer) {
+      clearInterval(this.pendingSweepTimer);
+      this.pendingSweepTimer = null;
+    }
+    // Drop parked retries — a fresh start()/reconcile re-derives what's
+    // missing, and the entries reference a doc we're about to destroy.
+    this.pendingDownloads.clear();
+    this.pendingSweepInFlight = false;
     if (this.map && this.mapObserver) {
       try {
         this.map.unobserve(this.mapObserver);
@@ -404,13 +471,173 @@ export class ManifestSync {
           log.warn("blob", `download ${path} failed`, err);
         }
         done++;
-        this.deps.onDownloadProgress(
-          done < total ? `syncing ${done}/${total} binaries` : null,
-        );
+        // While the batch runs, show progress; when it finishes, fall
+        // through to a "pending" label if any blob parked (FIX B), else
+        // clear.
+        if (done < total) {
+          this.deps.onDownloadProgress(`syncing ${done}/${total} binaries`);
+        } else {
+          this.deps.onDownloadProgress(
+            this.pendingDownloads.size > 0
+              ? `${this.pendingDownloads.size} binaries pending`
+              : null,
+          );
+        }
       }
     };
     const workers = Math.min(MAX_PARALLEL_DOWNLOADS, items.length);
     await Promise.all(Array.from({ length: workers }, () => next()));
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise<void>((r) => setTimeout(r, ms));
+  }
+
+  // FIX B + D — download a blob with bounded retry and integrity check.
+  // Returns the verified bytes, or null if every attempt was exhausted
+  // (the path has been parked in `pendingDownloads` for the slow-path
+  // sweep) OR the blob is poison (hash mismatch — logged, not parked).
+  //
+  // `attempts` controls the in-call retry budget. The fast path (initial
+  // reconcile / live manifest change) uses the full backoff ladder so a
+  // freshly-added image that's mid-upload resolves within ~15s without
+  // ever touching the slow path. The slow-path sweep passes attempts=1:
+  // the 30s sweep interval already provides the retry cadence, so we
+  // don't want each parked blob to re-burn the full backoff on every
+  // sweep (which would serialise into minutes).
+  //
+  // Retry policy per error:
+  //   BlobNotFoundError (404)  → retry: uploader's PUT is in flight
+  //   network error / 5xx      → retry: transient
+  //   BlobHashMismatchError    → POISON: bail immediately, do NOT park
+  //                              (re-GETting the same hash can't help)
+  //   BlobAuthError            → park but don't spin: the socket-level
+  //                              auth handler (FIX A) owns recovery
+  private async downloadWithRetry(
+    path: string,
+    entry: ManifestEntry,
+    client: BinaryClient,
+    attempts: number = DOWNLOAD_RETRY_ATTEMPTS,
+  ): Promise<Uint8Array | null> {
+    if (!entry.hash) return null;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        // download() verifies sha256(bytes) === entry.hash internally.
+        const bytes = await client.download(entry.hash);
+        // Success — clear any prior parked retry for this path.
+        if (this.pendingDownloads.delete(path)) {
+          this.deps.onDownloadProgress(
+            this.pendingDownloads.size > 0
+              ? `${this.pendingDownloads.size} binaries pending`
+              : null,
+          );
+        }
+        if (attempt > 0) {
+          log.info("blob", `download ${path} succeeded on attempt ${attempt + 1}`);
+        }
+        return bytes;
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof BlobHashMismatchError) {
+          // Poison: corrupted/wrong bytes for this content hash. More
+          // GETs return the same wrong object. Give up; don't park.
+          log.error(
+            "blob",
+            `download ${path} POISON (hash mismatch) — not retrying`,
+            err,
+          );
+          this.pendingDownloads.delete(path);
+          return null;
+        }
+        const name = err instanceof Error ? err.name : "";
+        if (name === "BlobAuthError") {
+          // Socket-level auth handler (FIX A) owns recovery; per-blob
+          // retry would just spin against a paused token. Park (so a
+          // post-recovery sweep re-tries it) but stop looping now.
+          log.warn("blob", `download ${path} blocked by auth — deferring`, err);
+          this.parkPending(path, entry);
+          return null;
+        }
+        // Retryable (404 / network / 5xx). Back off, then loop —
+        // unless that was the last attempt.
+        if (attempt < attempts - 1) {
+          const delay = Math.min(
+            DOWNLOAD_RETRY_BASE_MS * 2 ** attempt,
+            DOWNLOAD_RETRY_MAX_MS,
+          );
+          this.deps.debug(
+            `[collab] download ${path} attempt ${attempt + 1} failed; retry in ${delay}ms`,
+            err,
+          );
+          await this.sleep(delay);
+        }
+      }
+    }
+    // Attempts exhausted — park for the slow-path sweep.
+    log.warn(
+      "blob",
+      `download ${path} failed after ${attempts} attempt(s) — parking for retry`,
+      lastErr,
+    );
+    this.parkPending(path, entry);
+    return null;
+  }
+
+  // Add a path to the pending-retry set and refresh the status-bar
+  // pending count.
+  private parkPending(path: string, entry: ManifestEntry): void {
+    this.pendingDownloads.set(path, entry);
+    this.deps.onDownloadProgress(
+      this.pendingDownloads.size > 0
+        ? `${this.pendingDownloads.size} binaries pending`
+        : null,
+    );
+  }
+
+  // FIX B — slow-path drain of `pendingDownloads`. Serialised (one blob
+  // at a time, lower priority than the initial reconcile fan-out) and
+  // single-flighted so the interval and a `synced` event don't race.
+  // Re-runs materialiseBinary, which re-enters downloadWithRetry; a
+  // success removes the path from the set, a continued failure re-parks
+  // it for the next sweep.
+  private async sweepPendingDownloads(trigger: string): Promise<void> {
+    if (this.pendingSweepInFlight) return;
+    if (this.pendingDownloads.size === 0) return;
+    const client = this.deps.binaryClient();
+    if (!client) return;
+    this.pendingSweepInFlight = true;
+    try {
+      // Snapshot: materialiseBinary mutates pendingDownloads as it goes.
+      const snapshot = Array.from(this.pendingDownloads.entries());
+      log.info(
+        "blob",
+        `pending sweep (${trigger}): retrying ${snapshot.length} stranded binaries`,
+      );
+      for (const [path, entry] of snapshot) {
+        // The manifest may have moved on (deleted / re-hashed) while the
+        // blob was stranded. Re-check before spending a download.
+        const current = this.map?.get(path);
+        if (!current || current.kind !== "binary" || current.hash !== entry.hash) {
+          this.pendingDownloads.delete(path);
+          continue;
+        }
+        try {
+          // attempts=1: the sweep cadence IS the retry interval; don't
+          // re-burn the full backoff ladder per parked blob per tick.
+          await this.materialiseBinary(path, entry, client, 1);
+        } catch (err) {
+          log.warn("blob", `pending sweep: ${path} still failing`, err);
+        }
+      }
+      this.deps.onDownloadProgress(
+        this.pendingDownloads.size > 0
+          ? `${this.pendingDownloads.size} binaries pending`
+          : null,
+      );
+    } finally {
+      this.pendingSweepInFlight = false;
+    }
   }
 
   // True if `err` is Obsidian's "File already exists." rejection. We
@@ -426,6 +653,10 @@ export class ManifestSync {
     path: string,
     entry: ManifestEntry,
     client: BinaryClient,
+    // Retry budget for the download. Default = full backoff ladder
+    // (fast path). The slow-path sweep passes 1 so a parked blob does a
+    // single probe per sweep tick instead of re-burning the full ladder.
+    attempts: number = DOWNLOAD_RETRY_ATTEMPTS,
   ): Promise<void> {
     if (!entry.hash) {
       log.warn("blob", `materialiseBinary ${path}: no hash on entry`);
@@ -449,13 +680,23 @@ export class ManifestSync {
           const localHash = await sha256Hex(new Uint8Array(local));
           if (localHash === entry.hash) {
             this.deps.debug(`[collab] materialiseBinary: ${path} already matches manifest hash`);
+            if (this.pendingDownloads.delete(path)) {
+              this.deps.onDownloadProgress(
+                this.pendingDownloads.size > 0
+                  ? `${this.pendingDownloads.size} binaries pending`
+                  : null,
+              );
+            }
             return;
           }
         } catch (err) {
           log.warn("blob", `materialiseBinary hash check failed for ${path}`, err);
         }
-        // Local differs — overwrite with manifest bytes.
-        const bytes = await client.download(entry.hash);
+        // Local differs — overwrite with manifest bytes. Retry-wrapped
+        // + hash-verified; null means parked/poison, so leave the
+        // existing (stale) file untouched rather than half-writing.
+        const bytes = await this.downloadWithRetry(path, entry, client, attempts);
+        if (!bytes) return;
         const buf = bytes.buffer.slice(
           bytes.byteOffset,
           bytes.byteOffset + bytes.byteLength,
@@ -464,7 +705,8 @@ export class ManifestSync {
         log.info("sync", `materialise: binary ${path} updated (${bytes.byteLength}b)`);
         return;
       }
-      const bytes = await client.download(entry.hash);
+      const bytes = await this.downloadWithRetry(path, entry, client, attempts);
+      if (!bytes) return;
       const buf = bytes.buffer.slice(
         bytes.byteOffset,
         bytes.byteOffset + bytes.byteLength,
@@ -729,6 +971,13 @@ export class ManifestSync {
       };
       this.trash!.set(entry.id, trashEntry);
     });
+
+    // Drop the merge-base snapshot for this file so deleting + recreating
+    // a file at the same path (which mints a fresh docId anyway) never
+    // resurrects a stale base. Keyed by docId; fire-and-forget.
+    if (this.sessionKindOf(entry.kind) === "file") {
+      void DiskBuffer.shared().delete(entry.id);
+    }
   }
 
   // Spin up a session just long enough to wipe its room, then destroy.
@@ -862,38 +1111,17 @@ export class ManifestSync {
       }
     }
     // Updates: a binary's hash may have changed (re-upload by a peer),
-    // or a manifest entry was modified in place. Redownload binary.
+    // or a manifest entry was modified in place. materialiseBinary
+    // handles both the "local exists but differs → overwrite" and the
+    // "missing locally → create" cases, with the in-call retry +
+    // hash-verify wrapper (FIX B/D). Routing through it means a peer's
+    // re-upload that 404s briefly (their PUT still in flight) is parked
+    // and retried instead of stranding the stale local copy.
     for (const u of updates) {
       if (u.entry.kind === "binary") {
         const client = this.deps.binaryClient();
         if (client) {
-          // Force re-download by deleting local first then materialising.
-          const local = this.deps.app.vault.getAbstractFileByPath(u.path);
-          if (local instanceof TFile && u.entry.hash) {
-            try {
-              const cur = await this.deps.app.vault.readBinary(local);
-              const curHash = await sha256Hex(new Uint8Array(cur));
-              if (curHash === u.entry.hash) continue;
-              const bytes = await client.download(u.entry.hash);
-              const buf = bytes.buffer.slice(
-                bytes.byteOffset,
-                bytes.byteOffset + bytes.byteLength,
-              ) as ArrayBuffer;
-              this.deps.remoteApplyPaths.add(u.path);
-              try {
-                await this.deps.app.vault.modifyBinary(local, buf);
-              } finally {
-                setTimeout(
-                  () => this.deps.remoteApplyPaths.delete(u.path),
-                  SUPPRESS_HOLD_MS,
-                );
-              }
-            } catch (err) {
-              log.warn("blob", `update binary ${u.path} failed`, err);
-            }
-          } else if (!local) {
-            await this.materialiseBinary(u.path, u.entry, client);
-          }
+          await this.materialiseBinary(u.path, u.entry, client);
         }
       }
     }

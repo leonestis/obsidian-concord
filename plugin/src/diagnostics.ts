@@ -22,6 +22,10 @@ export class StatusBar {
   private connected = false;
   private progressLabel: string | null = null;
   private serverUrl = "";
+  // FIX A — persistent auth-failure indicator. When true it overrides
+  // the connected/offline pill (a one-shot Notice disappears; the user
+  // needs a standing reminder that sync is paused on a bad token).
+  private authFailed = false;
 
   constructor(plugin: Plugin) {
     // addStatusBarItem returns undefined on mobile. Guard.
@@ -49,8 +53,27 @@ export class StatusBar {
     this.render();
   }
 
+  // FIX A — flip the persistent auth-failed indicator. Set true when
+  // the server rejects the token, cleared on a recovery attempt
+  // (token edit or explicit reconnect).
+  setAuthFailed(failed: boolean) {
+    if (failed === this.authFailed) return;
+    this.authFailed = failed;
+    this.render();
+  }
+
   private render() {
     if (!this.el) return;
+    if (this.authFailed) {
+      // Persistent, unmissable state — no progress overlay, it's moot
+      // while sync is paused.
+      this.el.setText("⚠ collab auth failed — update token");
+      this.el.setAttr(
+        "title",
+        `Server rejected the auth token. Open Collab settings and update your Auth token, or run “Reconnect to server”.\nServer: ${this.serverUrl}`,
+      );
+      return;
+    }
     const dot = this.connected ? "🟢" : "🔴";
     const label = this.connected ? "collab live" : "collab offline";
     const progress = this.progressLabel ? ` (${this.progressLabel})` : "";

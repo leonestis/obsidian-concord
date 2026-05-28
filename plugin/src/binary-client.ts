@@ -13,6 +13,8 @@
 //   2. HEAD method support (some older Obsidian builds rewrote HEAD
 //      to GET via requestUrl).
 
+import { sha256Hex } from "./util";
+
 export interface BlobProgress {
   loaded: number;
   total: number;
@@ -26,6 +28,36 @@ export class BlobAuthError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "BlobAuthError";
+  }
+}
+
+// 404 — the blob isn't on the server yet. This is the common race: a
+// peer's manifest entry (tiny Yjs update) arrives before their PUT of
+// the bytes finishes. RETRYABLE: the bytes are very likely on their
+// way. Distinguished from a generic Error so the download-retry logic
+// in manifest-sync can back off and re-attempt rather than stranding
+// the file.
+export class BlobNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlobNotFoundError";
+  }
+}
+
+// The downloaded bytes don't hash to the value the manifest promised.
+// POISON: retrying the same content-addressed URL can only ever return
+// the same wrong bytes, so the caller must NOT loop — log and give up.
+// Either the server is serving a corrupted/wrong object for this hash
+// or the manifest entry is bad; either way more GETs won't fix it.
+export class BlobHashMismatchError extends Error {
+  constructor(
+    readonly expected: string,
+    readonly actual: string,
+  ) {
+    super(
+      `blob hash mismatch: expected ${expected.slice(0, 12)}…, got ${actual.slice(0, 12)}…`,
+    );
+    this.name = "BlobHashMismatchError";
   }
 }
 
@@ -121,15 +153,30 @@ export class BinaryClient {
   // Download bytes. Uses the streaming Response.body when available
   // so we can fire progress callbacks; otherwise falls back to
   // arrayBuffer() in one shot.
+  //
+  // Error contract (so callers can decide whether to retry):
+  //   404               → BlobNotFoundError   (retryable: PUT in flight)
+  //   401 / 403         → BlobAuthError       (not retryable here)
+  //   other !ok / fetch → Error               (retryable: transient net/5xx)
+  //   hash mismatch     → BlobHashMismatchError (POISON: never retry)
+  //
+  // FIX D — content integrity: the download is content-addressed, so
+  // the `hash` argument IS the expected SHA-256 of the bytes. We verify
+  // sha256(bytes) === hash before returning. A corrupted or wrong blob
+  // is rejected rather than written to the vault as the "correct" file,
+  // completing the integrity guarantee the upload path already enforces
+  // server-side. Pass verify=false only when bytes will be re-hashed by
+  // the caller anyway (currently nobody does).
   async download(
     hash: string,
     onProgress?: (frac: number) => void,
+    verify: boolean = true,
   ): Promise<Uint8Array> {
     const res = await fetch(this.url(hash), {
       method: "GET",
       headers: this.headers(),
     });
-    if (res.status === 404) throw new Error(`blob ${hash} not found`);
+    if (res.status === 404) throw new BlobNotFoundError(`blob ${hash} not found`);
     if (res.status === 401 || res.status === 403) {
       this.signalAuthError(
         `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
@@ -139,30 +186,34 @@ export class BinaryClient {
     if (!res.ok) throw new Error(`GET /blobs/${hash} → ${res.status}`);
     const total = Number(res.headers.get("Content-Length") ?? "0");
     onProgress?.(0);
+    let out: Uint8Array;
     if (!res.body || typeof res.body.getReader !== "function") {
-      const buf = new Uint8Array(await res.arrayBuffer());
-      onProgress?.(1);
-      return buf;
-    }
-    const reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let loaded = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        chunks.push(value);
-        loaded += value.byteLength;
-        if (total > 0) onProgress?.(loaded / total);
+      out = new Uint8Array(await res.arrayBuffer());
+    } else {
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let loaded = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          loaded += value.byteLength;
+          if (total > 0) onProgress?.(loaded / total);
+        }
+      }
+      out = new Uint8Array(loaded);
+      let off = 0;
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.byteLength;
       }
     }
-    const out = new Uint8Array(loaded);
-    let off = 0;
-    for (const c of chunks) {
-      out.set(c, off);
-      off += c.byteLength;
-    }
     onProgress?.(1);
+    if (verify) {
+      const actual = await sha256Hex(out);
+      if (actual !== hash) throw new BlobHashMismatchError(hash, actual);
+    }
     return out;
   }
 }

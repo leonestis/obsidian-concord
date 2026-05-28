@@ -38,9 +38,18 @@
 //   - If the editor is showing a file with no manifest entry, the
 //     resolver returns null → plugin no-ops.
 //   - If the leaf is destroyed, the editor itself is destroyed; the
-//     yedit destroy() runs; subscriptions go away.
-//   - On file switch within a leaf, Obsidian destroys the old editor
-//     and constructs a new one. yedit installs fresh in the new editor.
+//     yedit destroy() runs; the Y.Text subscription goes away.
+//   - On file switch WITHIN a leaf, Obsidian REUSES the same
+//     EditorView (it does NOT destroy + recreate it). The same yedit
+//     ViewPlugin instances survive the switch; only the file backing
+//     the view's editorInfoField changes. That's exactly why yedit
+//     resolves its context dynamically (resolveContext, below) on every
+//     update() instead of capturing ytext/awareness in its constructor:
+//     there's no construction event on a switch to re-capture at. (An
+//     earlier comment here wrongly claimed Obsidian destroys the editor
+//     on switch; it does not, and that false assumption is what made
+//     the old removeAwarenessStates-on-switch logic in y-sync wipe the
+//     local awareness mid-life — the "friend invisible" bug.)
 //
 // This is simpler than Relay's CSS-class allowlist because Obsidian's
 // editor lifecycle already gives us a clean teardown.
@@ -319,6 +328,12 @@ export class LiveViewManager {
       awareness,
       docId: text.docId,
       active: true,
+      // Read-only copy of the local identity so y-remote-selections can
+      // write a full { user, cursor } awareness state if it ever finds
+      // the local state null. LocalPresenceController remains the owner
+      // of identity; this is just a fallback so the editor's cursor
+      // write can't advertise a nameless (or empty) state.
+      user: this.presence.getUser(),
     };
   }
 
