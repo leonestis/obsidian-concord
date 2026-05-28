@@ -314,10 +314,41 @@ class YRemoteSelectionsPluginValue {
     const decorations: Range<Decoration>[] = [];
 
     awareness.getStates().forEach((rawState, clientId) => {
-      if (clientId === local) return;
-      const state = rawState as RemoteAwarenessState;
-      const cursor = state.cursor;
-      if (!cursor || cursor.anchor == null || cursor.head == null) return;
+      try {
+        this.buildOnePeer(rawState, clientId, local, ytext, docLen, decorations);
+      } catch (err) {
+        // One bad peer state must not crash the entire decoration
+        // build — that would freeze every other peer's cursor on
+        // screen (visible as ghost cursors / lingering CSS especially
+        // on mobile WebView). Log and continue.
+        console.warn("[collab] buildOnePeer threw", clientId, err);
+      }
+    });
+
+    // Sorting in Decoration.set(..., true) requires consistent order;
+    // any inconsistencies would also throw the same way. Defensive.
+    try {
+      return Decoration.set(decorations, true);
+    } catch (err) {
+      console.warn("[collab] Decoration.set threw on build, returning empty set", err);
+      return Decoration.set([], true);
+    }
+  }
+
+  private buildOnePeer(
+    rawState: unknown,
+    clientId: number,
+    local: number,
+    ytext: Y.Text,
+    docLen: number,
+    decorations: Range<Decoration>[],
+  ): void {
+    const ydoc = ytext.doc;
+    if (!ydoc) return;
+    if (clientId === local) return;
+    const state = rawState as RemoteAwarenessState;
+    const cursor = state.cursor;
+    if (!cursor || cursor.anchor == null || cursor.head == null) return;
 
       let anchor: ReturnType<
         typeof Y.createAbsolutePositionFromRelativePosition
@@ -370,18 +401,32 @@ class YRemoteSelectionsPluginValue {
             }).range(start, end),
           );
         } else {
-          decorations.push(
-            Decoration.mark({
-              attributes: { style: `background-color: ${colorLight}` },
-              class: "cm-ySelection",
-            }).range(start, startLine.from + startLine.length),
-          );
-          decorations.push(
-            Decoration.mark({
-              attributes: { style: `background-color: ${colorLight}` },
-              class: "cm-ySelection",
-            }).range(endLine.from, end),
-          );
+          // Multi-line selection. The first-line mark goes from `start`
+          // to end-of-line; the last-line mark goes from start-of-line
+          // to `end`. CodeMirror throws "Mark decorations may not be
+          // empty" if either pair coincides — happens when the peer's
+          // selection starts exactly at end-of-line (start === EOL) or
+          // ends exactly at start-of-line (end === BOL). Guard both,
+          // otherwise the throw aborts the whole decoration build and
+          // every peer's cursor freezes on screen until the next clean
+          // build (visible CSS leftovers on mobile especially).
+          const startLineEnd = startLine.from + startLine.length;
+          if (start !== startLineEnd) {
+            decorations.push(
+              Decoration.mark({
+                attributes: { style: `background-color: ${colorLight}` },
+                class: "cm-ySelection",
+              }).range(start, startLineEnd),
+            );
+          }
+          if (endLine.from !== end) {
+            decorations.push(
+              Decoration.mark({
+                attributes: { style: `background-color: ${colorLight}` },
+                class: "cm-ySelection",
+              }).range(endLine.from, end),
+            );
+          }
           for (let i = startLine.number + 1; i < endLine.number; i++) {
             const linePos = this.view.state.doc.line(i).from;
             decorations.push(
@@ -396,15 +441,12 @@ class YRemoteSelectionsPluginValue {
         }
       }
 
-      decorations.push(
-        Decoration.widget({
-          widget: new YRemoteCaretWidget(color, name),
-          side: hPos - aPos > 0 ? -1 : 1,
-        }).range(hPos),
-      );
-    });
-
-    return Decoration.set(decorations, true);
+    decorations.push(
+      Decoration.widget({
+        widget: new YRemoteCaretWidget(color, name),
+        side: hPos - aPos > 0 ? -1 : 1,
+      }).range(hPos),
+    );
   }
 
   destroy(): void {

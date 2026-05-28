@@ -139,7 +139,14 @@ export class SessionManager {
       return null;
     }
 
-    for (let iter = 0; iter < 4; iter++) {
+    // Promise-based serialisation: each state transition either
+    // resolves immediately (detached → start) or returns the in-flight
+    // promise that a concurrent attach can await. No polling loops,
+    // no fixed retry budget — concurrent calls converge naturally.
+    // Bounded re-entries (max 8) guard against true logic bugs where
+    // the state flips forever; in practice we transition at most 3
+    // times per call (e.g. attaching → tearing-down → detached → start).
+    for (let iter = 0; iter < 8; iter++) {
       const st = this.byPath.get(path);
       if (!st || st.kind === "detached") {
         return await this.startAttach(path, kind, docId, socket);
@@ -156,11 +163,20 @@ export class SessionManager {
       }
       if (st.kind === "attaching") {
         if (st.docId === docId) {
-          await new Promise<void>((r) => setTimeout(r, 25));
-          continue;
+          // Concurrent attach for the same docId — share the in-flight
+          // promise. This is the common path when LiveViewManager
+          // fires multiple refreshes back-to-back (file-open +
+          // layout-change + active-leaf-change all trigger).
+          return await st.promise;
         }
+        // Different docId — abort the in-flight attempt and wait for
+        // it to settle into detached before starting our own.
         st.abort.abort();
-        await new Promise<void>((r) => setTimeout(r, 25));
+        try {
+          await st.promise;
+        } catch {
+          /* the aborted attach is expected to throw / return null */
+        }
         continue;
       }
       if (st.kind === "tearing-down") {
@@ -168,20 +184,42 @@ export class SessionManager {
         continue;
       }
     }
-    log.warn("session", `attach: gave up after retries for ${path}`);
+    // If we got here something is very wrong — the state is flipping
+    // between attaching / tearing-down without ever settling. Log and
+    // bail rather than spin forever.
+    log.warn("session", `attach: state did not stabilise after 8 iterations for ${path}`);
     return null;
   }
 
-  private async startAttach(
+  private startAttach(
     path: string,
     kind: SessionKind,
     docId: string,
     socket: HocuspocusProviderWebsocket,
   ): Promise<AnySession | null> {
     const abort = new AbortController();
-    this.byPath.set(path, { kind: "attaching", docId, sessionKind: kind, abort });
+    // Build the work-promise FIRST, then publish it into state alongside
+    // abort. Concurrent attach() callers for the same docId will await
+    // this exact promise (see attach() loop) instead of spin-polling.
+    const promise = this.startAttachWork(path, kind, docId, socket, abort);
+    this.byPath.set(path, {
+      kind: "attaching",
+      docId,
+      sessionKind: kind,
+      abort,
+      promise,
+    });
     log.info("session", `attach: starting ${path} (kind=${kind}, docId=${docId})`);
+    return promise;
+  }
 
+  private async startAttachWork(
+    path: string,
+    kind: SessionKind,
+    docId: string,
+    socket: HocuspocusProviderWebsocket,
+    abort: AbortController,
+  ): Promise<AnySession | null> {
     try {
       const baseOpts = {
         app: this.deps.app,

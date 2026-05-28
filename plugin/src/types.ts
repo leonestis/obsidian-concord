@@ -64,7 +64,19 @@ export type SessionKind = "file" | "canvas" | "text";
 //                    donePromise before proceeding.
 export type SessionState =
   | { kind: "detached" }
-  | { kind: "attaching"; docId: string; sessionKind: SessionKind; abort: AbortController }
+  | {
+      kind: "attaching";
+      docId: string;
+      sessionKind: SessionKind;
+      abort: AbortController;
+      // The in-flight attach promise. Concurrent attach() callers
+      // await this directly instead of polling — fixes the
+      // "session attach: gave up after retries" failure that bit us
+      // in v2.0.0 when TextSession.create took longer than the
+      // 100 ms polling budget (which is most of the time on real
+      // networks).
+      promise: Promise<AnySession | null>;
+    }
   | { kind: "bound"; docId: string; sessionKind: SessionKind; session: AnySession }
   | { kind: "tearing-down"; docId: string; done: Promise<void> };
 
@@ -96,4 +108,4 @@ export type AnySession = BaseSession & Record<string, any>;
 // introduces v2 (UUID-keyed rooms, HTTP-stored binaries).
 export const PROTOCOL_VERSION = 2;
 
-export const PLUGIN_VERSION = "2.0.0";
+export const PLUGIN_VERSION = "2.0.1";
