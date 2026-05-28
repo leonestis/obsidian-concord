@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.0.4 — 2026-05-27
+
+### Fixed
+- **Mobile WebView ghost caret bars (the vertical lines), follow-up to v2.0.3.** v2.0.3's GPU-layer trick on `.cm-ySelectionInfo` stopped the label ghosts but caret-bar ghosts (the thin coloured vertical stripe) survived because the caret span is rendered via `border-left: 2px solid` with no actual fill area — iOS WebView promotes only filled elements onto compositor layers by default, and a border-only element wasn't strong enough a hint. Stacked four containment mechanisms on `.cm-ySelectionCaret`: `transform: translateZ(0)`, `will-change: transform`, `isolation: isolate` (new stacking context), and `contain: layout style paint` (strongest browser hint that the element's paint is self-contained). Same containment additions on `.cm-ySelectionInfo` belt-and-braces. Layered together this reliably forces the caret onto its own compositor layer that disposes with the DOM node.
+
 ## 2.0.3 — 2026-05-27
 
 ### Fixed

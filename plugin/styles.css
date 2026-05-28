@@ -42,6 +42,8 @@
   -webkit-transform: translateZ(0);
   -webkit-backface-visibility: hidden;
   backface-visibility: hidden;
+  will-change: transform;
+  contain: layout style paint;
 }
 
 /* The caret bar itself: a thin 2px vertical line in the user's color.
@@ -57,10 +59,22 @@
   margin-left: -1px;
   pointer-events: none;
   /* Force the inlined background-color into the border via inherit hack. */
-  /* Same GPU-layer trick as the label below — covers the caret bar
-   * itself in case iOS leaves THAT painted too after removal. */
+  /* Same GPU-layer trick as the label below. translateZ(0) alone
+   * isn't enough for iOS WebView when the caret is rendered via
+   * border-left (no real fill area). Stack four mechanisms:
+   *   - transform: translateZ(0) — request GPU layer
+   *   - will-change: transform — explicit hint, broader UA support
+   *   - isolation: isolate — new stacking context so paint can't
+   *     bleed outside this element
+   *   - contain: layout style paint — strongest browser hint that
+   *     this element manages its own paint, repaints stay scoped
+   * Together this reliably extracts the caret bar onto its own
+   * compositor layer that disposes with the DOM node. */
   transform: translateZ(0);
   -webkit-transform: translateZ(0);
+  will-change: transform;
+  isolation: isolate;
+  contain: layout style paint;
 }
 
 /* Small dot at the top of the caret — keep but make subtle. */
