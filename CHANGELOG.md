@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.3.1 — 2026-05-28
+
+### Fixed (data integrity)
+- **File-switch via the file explorer no longer overwrites the destination file.** Opening file A then clicking file B in the file tree could overwrite B with A's content (only via the explorer tree — links/tabs were fine). Cause: clicking a file in the explorer reuses the same editor and Obsidian updates "which file this is" BEFORE swapping the document text, so for a moment the editor claimed to be B while still holding A's text — and the bind logic merged A's stale text into B. The v2.2.1 file-path check passed because the path already said B. **Root fix: on bind the editor is now a pure viewer — it ADOPTS the synced content (ytext→editor) and never pushes its pre-existing content INTO the shared document.** All content seeding/merging now happens exclusively between disk and the CRDT inside `TextSession` (with the DiskBuffer base), where it belongs; the editor binding only forwards genuine user keystrokes (gated on CodeMirror user-event detection, so a programmatic file-swap replacement can never be mistaken for typing). This removes the entire "editor's transient content corrupts another file" class.
+- **Deleting a file no longer requires several attempts.** A delete could be resurrected: a peer that still had the file locally would re-register it during reconcile (seeing "exists locally, not in manifest") before the delete propagated. Now reconcile honors the trash tombstone — a local file whose path is tombstoned is deleted locally instead of re-registered — and creating a file at a tombstoned path clears the tombstone (intentional re-creation). One delete now propagates and sticks for everyone.
+
+### Notes
+- Brand-new local files still seed correctly (from disk, on true sync, via TextSession) so peers see their content without needing an extra keystroke.
+- Client-only, no protocol bump. Canvas / presence untouched.
+
 ## 2.3.0 — 2026-05-28
 
 ### Added

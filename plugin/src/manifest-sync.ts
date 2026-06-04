@@ -410,6 +410,15 @@ export class ManifestSync {
     // Local → manifest: anything local not yet known.
     if (!this.deps.sessionManager.isReadOnly()) {
       const newBinaries: Array<{ file: TFile; entry: ManifestEntry; path: string }> = [];
+      // BUG 2 — files to honor a deletion tombstone for. A local file
+      // present but NOT in the manifest is normally re-registered. But if
+      // a peer deleted it (manifest delete + trash tombstone), B may still
+      // have it on disk and would otherwise resurrect it. If the path is
+      // in trash at reconcile time, that's an un-cleared tombstone (a
+      // genuine re-creation clears the tombstone in onLocalCreate, so a
+      // re-created file's path is never in trash here) → delete it locally
+      // instead of registering. The 30-day purge bounds the window.
+      const tombstonedLocal: TAbstractFile[] = [];
       const CHUNK = 200;
       for (let i = 0; i < allLocal.length; i += CHUNK) {
         const slice = allLocal.slice(i, i + CHUNK);
@@ -417,6 +426,11 @@ export class ManifestSync {
         const additions: Array<{ path: string; entry: ManifestEntry; file: TFile | null }> = [];
         for (const file of slice) {
           if (this.map.has(file.path)) continue;
+          // BUG 2 — honor the deletion tombstone before registering.
+          if (this.hasTrashTombstone(file.path)) {
+            tombstonedLocal.push(file);
+            continue;
+          }
           const kind = this.classify(file);
           if (!kind) continue;
           if (kind === "binary" && file instanceof TFile) {
@@ -455,6 +469,13 @@ export class ManifestSync {
       }
       // Upload binaries discovered locally.
       for (const b of newBinaries) void this.uploadBinaryAndRegister(b.file, b.entry);
+
+      // BUG 2 — honor deletion tombstones: a peer deleted these, we
+      // still have them on disk. Delete locally (suppressed so it
+      // doesn't echo back into the manifest) instead of resurrecting.
+      for (const file of tombstonedLocal) {
+        await this.deleteLocalTombstoned(file);
+      }
     }
 
     if (this.trash) {
@@ -472,6 +493,64 @@ export class ManifestSync {
     for (const child of folder.children) {
       out.push(child);
       if (child instanceof TFolder) this.walk(child, out);
+    }
+  }
+
+  // ── BUG 2 — deletion-tombstone helpers ──────────────────────────────
+
+  // True if the trash map holds a tombstone for this path. The trash is
+  // keyed by docId, not path, so we scan values. A path in trash means
+  // "deleted by some peer, not yet re-created" — onLocalCreate clears
+  // the tombstone on a genuine re-creation, so a re-created file's path
+  // is never here. The 30-day purge bounds how long a stale tombstone
+  // can keep a re-appearing local file from registering.
+  private hasTrashTombstone(path: string): boolean {
+    if (!this.trash) return false;
+    for (const entry of this.trash.values()) {
+      if (entry.path === path) return true;
+    }
+    return false;
+  }
+
+  // Remove every trash tombstone whose path matches `path`. Called from
+  // onLocalCreate when the user intentionally re-creates a file at a
+  // previously-deleted path: the tombstone is now stale and must not
+  // cause reconcile (point 1) to auto-delete the fresh file. Runs in a
+  // single transaction.
+  private clearTrashTombstones(path: string): void {
+    if (!this.trash || !this.ydoc) return;
+    const ids: string[] = [];
+    for (const [id, entry] of this.trash.entries()) {
+      if (entry.path === path) ids.push(id);
+    }
+    if (ids.length === 0) return;
+    this.ydoc.transact(() => {
+      for (const id of ids) this.trash!.delete(id);
+    });
+    log.info("trash", `cleared ${ids.length} stale tombstone(s) for re-created ${path}`);
+  }
+
+  // Delete a local file that a peer already deleted (its path is in
+  // trash) — the reconcile backstop for the delete-resurrection race.
+  // Suppressed via remoteApplyPaths so onLocalDelete doesn't re-fire a
+  // manifest delete / re-trash. Also tears down any bound session.
+  private async deleteLocalTombstoned(file: TAbstractFile): Promise<void> {
+    const path = file.path;
+    this.deps.remoteApplyPaths.add(path);
+    try {
+      await this.deps.sessionManager.detach(path);
+      await this.deps.app.vault.delete(file, true);
+      log.info(
+        "sync",
+        `reconcile: ${path} is tombstoned (deleted by a peer) — removed locally instead of re-registering`,
+      );
+    } catch (err) {
+      log.warn("sync", `reconcile: failed to delete tombstoned ${path}`, err);
+    } finally {
+      setTimeout(
+        () => this.deps.remoteApplyPaths.delete(path),
+        SUPPRESS_HOLD_MS,
+      );
     }
   }
 
@@ -878,6 +957,11 @@ export class ManifestSync {
       log.info("sync", `vault.create: already in manifest ${file.path}`);
       return;
     }
+    // BUG 2 — intentional re-creation at a previously-deleted path. The
+    // old tombstone is now stale; clear it so reconcile's tombstone
+    // backstop (which would otherwise delete this fresh file) doesn't
+    // fire, and so the file registers + syncs as a brand-new file.
+    this.clearTrashTombstones(file.path);
     log.info("sync", `vault.create: ${file.path} (${kind})`);
     if (kind === "binary" && file instanceof TFile) {
       // Mint id now (so we have a stable identity), then upload bytes
