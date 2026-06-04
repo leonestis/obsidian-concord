@@ -99,6 +99,16 @@ export interface ManifestSyncDeps {
   // canonical auth signal because it's the always-on room that's open
   // the moment the socket connects.
   onAuthFailed: (reason: string) => void;
+  // v2.1.x: "is a CM editor currently open on this markdown path?".
+  // Wired to LiveViewManager.hasEditorFor. Background disk→Y capture in
+  // onLocalModify uses it to DEFER to the editor binding for open files
+  // (the editor owns disk↔Y for them) and only run the diff path for
+  // files with no live editor. Optional so call sites that build deps
+  // before LiveViewManager exists don't break. When ABSENT we treat the
+  // file as "editor present" and DEFER (skip background capture) — the
+  // safe branch, since fighting an open editor's disk↔Y binding is the
+  // worse failure. In practice main.ts wires it before any modify fires.
+  hasEditorFor?: (path: string) => boolean;
   debug: (...args: unknown[]) => void;
 }
 
@@ -365,10 +375,17 @@ export class ManifestSync {
     const binariesToDownload: Array<{ path: string; entry: ManifestEntry }> = [];
     for (const [path, entry] of this.map.entries()) {
       if (localPaths.has(path)) {
-        // Already have it locally — if it's a canvas/atomic, make
-        // sure the session is open so peers' edits flow through.
+        // Already have it locally — open the session so peers' edits
+        // flow through in the background, whether or not the file is
+        // open in an editor.
+        // v2.1.x: markdown ("file") now ALSO attaches eagerly (was
+        // canvas/atomic only) so every markdown file syncs in the
+        // background even when never opened in a CM editor (e.g. a note
+        // rendered by Kanban in its own view).
+        // TODO: cap background sessions (connection pool) for large
+        // vaults — Phase 7.
         const sk = this.sessionKindOf(entry.kind);
-        if (sk && sk !== "file") {
+        if (sk) {
           void this.deps.sessionManager.attach(path, sk, entry.id);
         }
         continue;
@@ -796,6 +813,13 @@ export class ManifestSync {
       await this.ensureFolderExists(path);
       if (entry.kind === "file") {
         await this.safeCreateIfMissing(path, "");
+        // v2.1.x: attach the markdown session eagerly so a peer-created
+        // note syncs in the background even if the user never opens it
+        // in a CM editor (e.g. a Kanban-rendered note).
+        // TODO: cap background sessions (connection pool) for large
+        // vaults — Phase 7.
+        const sk = this.sessionKindOf(entry.kind);
+        if (sk) await this.deps.sessionManager.attach(path, sk, entry.id);
         return;
       }
       if (entry.kind === "canvas" || entry.kind === "text") {
@@ -874,10 +898,34 @@ export class ManifestSync {
 
   onLocalModify(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
-    if (file.extension === "md") return; // markdown content syncs via editor binding
     if (!this.map) return;
     if (this.deps.sessionManager.isReadOnly()) return;
     if (this.deps.remoteApplyPaths.has(file.path)) return;
+    // ── markdown background disk→Y capture (v2.1.x) ───────────────────
+    // Previously markdown returned early here ("syncs via editor
+    // binding"). With eager whole-vault sessions, a disk write by
+    // ANOTHER plugin (e.g. Kanban) to a markdown file that is NOT open
+    // in a CM editor must be captured into ytext so peers see it.
+    //
+    // Routing:
+    //   - remoteApplyPaths.has → already returned above (our own
+    //     ytext→disk write echoing back; suppressed).
+    //   - editor open on this path → DEFER. The yedit binding owns
+    //     disk↔Y for open files; running the diff path too would fight
+    //     it. (Absent hasEditorFor dep ⇒ assume editor ⇒ defer.)
+    //   - no session bound → return (shouldn't happen with eager attach;
+    //     guard against a race where modify fires before attach binds).
+    //   - otherwise → session.applyDiskUpdate() (diff disk→ytext).
+    if (file.extension === "md") {
+      const editorOpen = this.deps.hasEditorFor
+        ? this.deps.hasEditorFor(file.path)
+        : true;
+      if (editorOpen) return;
+      const session = this.deps.sessionManager.getBound(file.path);
+      if (!session || session.sessionKind !== "file") return;
+      void (session as unknown as { applyDiskUpdate: () => Promise<void> }).applyDiskUpdate();
+      return;
+    }
     const kind = this.classify(file);
     if (kind === "canvas" || kind === "text") {
       const session = this.deps.sessionManager.getBound(file.path);

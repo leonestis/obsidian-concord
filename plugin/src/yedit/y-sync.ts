@@ -186,7 +186,7 @@ const dmp = new diff_match_patch();
 // THEIRS buffer, so no disk text is lost. We deliberately trust this
 // result, including legitimate offline DELETIONS (a local delete should
 // stay deleted, not be resurrected by an additive union).
-function threeWayMerge(base: string, ours: string, theirs: string): string {
+export function threeWayMerge(base: string, ours: string, theirs: string): string {
   // Local edits as patches against base.
   const patches = dmp.patch_make(base, theirs);
   if (patches.length === 0) return ours; // no local edits → ours wins
@@ -202,7 +202,7 @@ function threeWayMerge(base: string, ours: string, theirs: string): string {
 // not — that's the whole point.
 //
 // Returns the additively-merged string.
-function additiveMerge(ours: string, theirs: string): string {
+export function additiveMerge(ours: string, theirs: string): string {
   if (ours === theirs) return ours;
   const diffs = dmp.diff_main(ours, theirs);
   dmp.diff_cleanupSemantic(diffs);
@@ -224,7 +224,7 @@ function additiveMerge(ours: string, theirs: string): string {
 // Offsets are therefore relative to the live ytext, so they always line
 // up. Runs inside one transaction with the given origin. Returns true if
 // any op was applied.
-function applyStringToYText(
+export function applyStringToYText(
   ytext: Y.Text,
   target: string,
   origin: unknown,

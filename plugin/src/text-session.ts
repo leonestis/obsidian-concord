@@ -31,7 +31,21 @@ import * as Y from "yjs";
 import { log } from "./logger";
 import { docIdToRoom, waitForProviderSync } from "./util";
 import { DiskBuffer } from "./disk-buffer";
+import {
+  applyStringToYText,
+  threeWayMerge,
+  additiveMerge,
+} from "./yedit/y-sync";
 import type { BaseSession } from "./types";
+
+// Distinct transaction origin for background disk→Y.Text writes. Tagging
+// the transaction lets the disk-sync observer and (when one later opens)
+// the editor binding tell a background disk-merge apart from a genuine
+// user edit. The editor binding skips transactions whose origin is the
+// plugin instance (`tr.origin === this`); this origin is neither that
+// nor a user keystroke, so it flows through to disk-sync (intended) and
+// is never mistaken for a local edit to echo back upstream.
+export const DISK_UPDATE_ORIGIN = "disk-update";
 
 export interface TextSessionOptions {
   app: App;
@@ -148,8 +162,102 @@ export class TextSession implements BaseSession {
       ]),
       new Promise<void>((r) => setTimeout(r, 4000)),
     ]);
+    // BACKGROUND-SAFE SEED. With eager whole-vault attach (v2.1.x), a
+    // markdown session is now created even when the file is NOT open in
+    // an editor — so the editor's reconcileBinding (yedit/y-sync.ts) is
+    // NOT guaranteed to run and seed/merge ytext against disk. If we
+    // installed disk-sync straight away, the very next ytext change
+    // (or an empty just-synced room) could blind-write an EMPTY ytext
+    // over a non-empty local file — exactly the data-loss class this
+    // project keeps regressing on.
+    //
+    // So before installing disk-sync we reconcile ytext against the
+    // current disk content using the SAME loss-free primitives the
+    // editor path uses (threeWayMerge / additiveMerge / diff-apply).
+    // This is the "reconcile against disk itself" the create() header
+    // has warned about since v2.0.0.
+    //
+    // If an editor is already open on this file when create() runs, the
+    // editor's reconcileBinding will run too (on its next update/wake)
+    // and converge editor↔ytext; our disk-based seed here is consistent
+    // with disk, and disk lags the editor by at most Obsidian's async
+    // autosave — so the two reconcilers agree on steady state. We still
+    // do the disk seed unconditionally because it is loss-free in every
+    // case (it never deletes content without a BASE ancestor).
+    await s.seedFromDisk();
     s.installDiskSync();
     return s;
+  }
+
+  // Loss-free initial reconcile of ytext against disk, run once before
+  // installDiskSync for background (and editor) markdown sessions.
+  // Mirrors reconcileBinding's case taxonomy with disk as THEIRS:
+  //   1. equal            → record base, no-op
+  //   2. ytext empty      → seed ytext from disk (insert)
+  //   3. disk empty       → adopt ytext (nothing on disk to lose); the
+  //                         disk-sync observer will write ytext→disk
+  //   4. both differ      → BASE-mediated 3-way merge (or additive
+  //                         fallback when no BASE) so neither side is lost
+  // All ytext writes use DISK_UPDATE_ORIGIN.
+  private async seedFromDisk(): Promise<void> {
+    if (this.destroyed) return;
+    const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
+    if (!(tfile instanceof TFile)) return;
+    let disk: string;
+    let current: string;
+    try {
+      disk = await this.opts.app.vault.read(tfile);
+      current = this.ytext.toString();
+    } catch (err) {
+      log.warn("session", `seedFromDisk read failed for ${this.path}`, err);
+      return;
+    }
+    if (this.destroyed) return;
+
+    // Case 1 — already consistent.
+    if (disk === current) {
+      void this.diskBuffer.set(this.docId, disk);
+      return;
+    }
+    // Case 2 — ytext empty, disk has content: seed.
+    // Case 3 — disk empty, ytext has content: nothing on disk to lose.
+    //          The disk-sync observer (installed right after) writes
+    //          ytext→disk on its first fire, so we leave ytext as-is and
+    //          just record ytext as the base.
+    if (current.length === 0 && disk.length > 0) {
+      applyStringToYText(this.ytext, disk, DISK_UPDATE_ORIGIN);
+      void this.diskBuffer.set(this.docId, disk);
+      return;
+    }
+    if (disk.length === 0 && current.length > 0) {
+      void this.diskBuffer.set(this.docId, current);
+      return;
+    }
+    // Case 4 — both non-empty AND differ. BASE-mediated 3-way merge so
+    // neither offline-local disk edits nor synced remote edits are lost.
+    let base: string | null = null;
+    try {
+      base = (await this.diskBuffer.get(this.docId)) ?? null;
+    } catch {
+      /* treat as missing base */
+    }
+    if (this.destroyed) return;
+    // Re-read live ytext in case remote ops landed during the await.
+    const liveYtext = this.ytext.toString();
+    if (liveYtext === disk) {
+      void this.diskBuffer.set(this.docId, disk);
+      return;
+    }
+    const merged =
+      base != null
+        ? threeWayMerge(base, liveYtext, disk)
+        : additiveMerge(liveYtext, disk);
+    applyStringToYText(this.ytext, merged, DISK_UPDATE_ORIGIN);
+    void this.diskBuffer.set(this.docId, merged);
+    log.info(
+      "session",
+      `seedFromDisk ${this.path}: ${base != null ? "3-way" : "additive"} merge (disk=${disk.length}, ytext=${liveYtext.length} → ${merged.length})`,
+    );
   }
 
   private installDiskSync() {
@@ -198,6 +306,55 @@ export class TextSession implements BaseSession {
     };
     this.ytext.observe(observer);
     this.observers.push(observer);
+  }
+
+  // Background (non-editor) disk→Y.Text capture. Called by
+  // ManifestSync.onLocalModify when ANOTHER plugin (e.g. Kanban) writes
+  // this markdown file to disk while it is NOT open in a CodeMirror
+  // editor. The open-editor path is owned entirely by the yedit binding
+  // (y-sync.ts) and must never reach here — manifest-sync guards on
+  // hasEditorFor() before calling us.
+  //
+  // We diff ytext→disk and apply the minimal insert/delete ops onto
+  // ytext (NOT a blind delete-all+insert), so any remote edits that
+  // landed in ytext between the disk read and this apply are preserved
+  // by diff-match-patch's offset-relative ops. The transaction carries
+  // DISK_UPDATE_ORIGIN so it isn't mistaken for a user edit.
+  //
+  // Loop safety: this method writes to ytext only. The disk-sync
+  // observer will then fire, read ytext (now equal to what we just
+  // diffed FROM disk) and short-circuit on `current === content` — it
+  // will NOT re-write disk, so there's no echo. This method does not
+  // write disk itself, so it needs no remoteApplyPaths suppression.
+  async applyDiskUpdate(): Promise<void> {
+    if (this.destroyed) return;
+    const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
+    if (!(tfile instanceof TFile)) return;
+    let diskContent: string;
+    try {
+      diskContent = await this.opts.app.vault.read(tfile);
+    } catch (err) {
+      log.warn("binding", `applyDiskUpdate read failed for ${this.path}`, err);
+      return;
+    }
+    if (this.destroyed) return;
+    let current: string;
+    try {
+      current = this.ytext.toString();
+    } catch (err) {
+      log.warn("binding", `applyDiskUpdate ytext read failed for ${this.path}`, err);
+      return;
+    }
+    if (diskContent === current) return; // already consistent — no-op
+    const changed = applyStringToYText(this.ytext, diskContent, DISK_UPDATE_ORIGIN);
+    if (changed) {
+      // Disk and ytext now agree; record the merge base so a later
+      // offline divergence has an accurate ancestor.
+      void this.diskBuffer.set(this.docId, diskContent);
+      this.opts.debug(
+        `[collab] applyDiskUpdate ${this.path}: merged disk → ytext (${diskContent.length} chars)`,
+      );
+    }
   }
 
   // v1.0.5's reconcileEditorAndYtext is GONE in v2.0.0. The reconcile

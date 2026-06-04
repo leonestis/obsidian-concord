@@ -152,6 +152,13 @@ export default class CollabPlugin extends Plugin {
       remoteApplyPaths: this.remoteApplyPaths,
       onDownloadProgress: (label) => this.statusBar.setProgress(label),
       onAuthFailed: (reason) => this.handleAuthFailure(reason),
+      // Lazy: liveViewManager is constructed AFTER manifestSync (below),
+      // so resolve it at call time. Default to "editor open" (defer
+      // background capture) until it exists — the safe branch.
+      hasEditorFor: (path) =>
+        this.liveViewManager
+          ? this.liveViewManager.hasEditorFor(path)
+          : true,
       debug: (...a) => this.debug(...a),
     });
 

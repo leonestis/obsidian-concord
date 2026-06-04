@@ -337,6 +337,32 @@ export class LiveViewManager {
     };
   }
 
+  // True if a CodeMirror editor is currently OPEN and showing this
+  // markdown path in some workspace leaf. Used by ManifestSync's
+  // background disk→Y capture to defer to the editor binding (yedit owns
+  // disk↔Y for open files; the background diff path must not also fire,
+  // or the two would fight). We probe the live workspace rather than the
+  // diagnostics `knownPaths` set so the answer is always current — a
+  // leaf can be open before any refresh has recorded it.
+  hasEditorFor(path: string): boolean {
+    let found = false;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (found) return;
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) return;
+      const file = view.file;
+      if (!(file instanceof TFile)) return;
+      if (file.path !== path) return;
+      // The leaf must actually have a live CodeMirror editor mounted
+      // (source/live-preview). A pure reading-mode leaf has no editor
+      // binding, so disk↔Y for it is NOT owned by yedit — in that case
+      // the background path SHOULD run, so we report false.
+      const cm = (view.editor as unknown as { cm?: EditorView }).cm;
+      if (cm && cm.dom.isConnected) found = true;
+    });
+    return found;
+  }
+
   // ── teardown ───────────────────────────────────────────────────────
 
   destroy(): void {

@@ -2,6 +2,19 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.2.0 — 2026-05-28
+
+### Added
+- **Whole-vault background markdown sync.** Until now a markdown file only synced in real time while it was OPEN in a CodeMirror editor (we bind to the editor). A file shown by another plugin's custom view (Kanban / Project-manager board, etc.) or simply not open didn't sync live — you had to open the file to trigger a pull. Now **every** markdown file in the vault syncs in the background regardless of whether it's open:
+  - Markdown sessions are created eagerly for all manifest entries (previously lazy, on file-open). Each connects to its Y.Doc room over the shared multiplexed socket. (A connection-pool cap for very large vaults is noted as a future Phase-7 item; for now the whole vault is kept live, as requested.)
+  - The disk→Y direction now works without an editor: when another plugin writes to a markdown file that isn't open in the editor, the change is captured into the file's Y.Text via a diff-match-patch diff (origin-tagged so it can't echo). When the file IS open in an editor, the editor binding keeps ownership and the background path defers to it (no double-capture). The Y→disk direction already existed (the per-session disk-sync writer), so remote edits now land on disk for every file and plugins reading those files — like Kanban — reflect them live.
+  - Eager background sessions exposed a latent data-loss hazard (a freshly-synced empty Y.Text could overwrite a local file that has content), so `TextSession` now reconciles against disk on creation using the same loss-free taxonomy as the editor bind (equal / seed-empty-ytext-from-disk / adopt-ytext-into-empty-file / 3-way merge when both differ). No path blindly overwrites a non-empty local file.
+
+### Notes
+- This is what makes the Kanban / Project-manager board sync live instead of only-on-open. Any plugin that renders markdown and re-reads it from disk on change benefits.
+- Canvas is a separate case: it already background-syncs through its own disk↔Y bridge, but an OPEN canvas view doesn't reload from disk while focused (an Obsidian behaviour) — that's a known remaining item, not addressed here.
+- Client-only change, no protocol bump — interoperates with any 2.x peer.
+
 ## 2.1.3 — 2026-05-28
 
 ### Fixed
