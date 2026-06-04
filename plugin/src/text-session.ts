@@ -28,15 +28,13 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import { removeAwarenessStates } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { Notice } from "obsidian";
+
 import { log } from "./logger";
-import { docIdToRoom, waitForProviderSync } from "./util";
+import { docIdToRoom, localBackupPath, onProviderSynced } from "./util";
 import { DiskBuffer } from "./disk-buffer";
-import {
-  applyStringToYText,
-  threeWayMerge,
-  additiveMerge,
-} from "./yedit/y-sync";
-import type { BaseSession } from "./types";
+import { applyStringToYText, threeWayMerge } from "./yedit/y-sync";
+import type { BaseSession, SessionOrigin } from "./types";
 
 // Distinct transaction origin for background disk→Y.Text writes. Tagging
 // the transaction lets the disk-sync observer and (when one later opens)
@@ -54,6 +52,11 @@ export interface TextSessionOptions {
   authToken: string | undefined;
   docId: string;
   path: string;
+  // Invariant I3. "local" ONLY when we just created this file + its
+  // manifest entry locally (brand-new server room). "remote" for any
+  // peer-originated or pre-existing entry. Gates whether we may seed
+  // local disk content into the shared ytext.
+  origin: SessionOrigin;
   user: { name: string; color: string };
   remoteApplyPaths: {
     add: (p: string) => void;
@@ -67,6 +70,9 @@ export class TextSession implements BaseSession {
   readonly sessionKind = "file" as const;
   readonly docId: string;
   path: string;
+  // Invariant I3 — exposed so the editor binding (yedit) can gate
+  // seed-from-editor on local origin too.
+  readonly origin: SessionOrigin;
 
   readonly ydoc: Y.Doc;
   readonly ytext: Y.Text;
@@ -76,6 +82,25 @@ export class TextSession implements BaseSession {
   private destroyed = false;
   private observers: Array<(e: Y.YTextEvent, t: Y.Transaction) => void> = [];
   private diskWriteTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Invariant I2. True only after a GENUINE first `synced` with the
+  // server (never a timeout). The editor binding (yedit) reads this via
+  // syncedForReconcile() and refuses to seed/adopt/merge until it flips
+  // true — and we re-poke open editors when it does so the bind reruns
+  // with trustworthy ytext. Until then: do nothing destructive.
+  private trulySynced = false;
+  private syncUnsub: (() => void) | null = null;
+  // Editors waiting for true sync register here; fired once on sync.
+  private onSyncedListeners: Array<() => void> = [];
+  // CRITICAL ordering guard. The disk-sync observer must NOT write
+  // ytext→disk until the bind/connect reconcile (reconcileOnTrueSync)
+  // has run and decided what to do — otherwise, when the server's
+  // content streams into ytext on sync, the observer would write it over
+  // a non-empty LOCAL file (walkthrough 2's "My notes") BEFORE reconcile
+  // gets a chance to back that local content up. Stays false until
+  // reconcileOnTrueSync completes (it sets it true just before any
+  // ytext→disk write it performs itself).
+  private reconcileDone = false;
   // Shared BASE store for the Phase 3 three-way merge. Every time the
   // disk-sync writer confirms disk == ytext (whether it just wrote it or
   // disk already matched), that content is the new "last known
@@ -85,6 +110,7 @@ export class TextSession implements BaseSession {
   private constructor(private readonly opts: TextSessionOptions) {
     this.docId = opts.docId;
     this.path = opts.path;
+    this.origin = opts.origin;
 
     this.ydoc = new Y.Doc();
     this.ytext = this.ydoc.getText("content");
@@ -155,86 +181,167 @@ export class TextSession implements BaseSession {
   // against disk itself before installing the disk-sync observer.
   static async create(opts: TextSessionOptions): Promise<TextSession> {
     const s = new TextSession(opts);
+    // Let IndexedDB hydrate the local CRDT cache before we wire the
+    // synced handler, so that on a TRUE sync the merge sees the full
+    // local-cache state. We bound the wait so a cold IndexedDB never
+    // blocks attach indefinitely; if it loses the race the synced
+    // handler still re-reads live ytext, so correctness holds.
     await Promise.race([
-      Promise.all([
-        s.persistence.whenSynced,
-        waitForProviderSync(s.provider, 4000),
-      ]),
+      s.persistence.whenSynced,
       new Promise<void>((r) => setTimeout(r, 4000)),
     ]);
-    // BACKGROUND-SAFE SEED. With eager whole-vault attach (v2.1.x), a
-    // markdown session is now created even when the file is NOT open in
-    // an editor — so the editor's reconcileBinding (yedit/y-sync.ts) is
-    // NOT guaranteed to run and seed/merge ytext against disk. If we
-    // installed disk-sync straight away, the very next ytext change
-    // (or an empty just-synced room) could blind-write an EMPTY ytext
-    // over a non-empty local file — exactly the data-loss class this
-    // project keeps regressing on.
+    if (s.destroyed) return s;
+
+    // INVARIANT I2 — event-driven reconcile on TRUE sync only.
     //
-    // So before installing disk-sync we reconcile ytext against the
-    // current disk content using the SAME loss-free primitives the
-    // editor path uses (threeWayMerge / additiveMerge / diff-apply).
-    // This is the "reconcile against disk itself" the create() header
-    // has warned about since v2.0.0.
+    // We do NOT seed/merge here on a timed race. The reconcile runs
+    // ONLY when the provider genuinely syncs (server delivered its
+    // state). onProviderSynced fires:
+    //   - immediately (next microtask) if already synced, or
+    //   - on the first real `synced` event (provider keeps retrying in
+    //     the background after any timeout).
+    // Until then the disk-sync observer is installed (so genuine LIVE
+    // ytext changes still flow to disk) but reconcileOnTrueSync has not
+    // run, so we never blind-seed or blind-adopt against a not-yet-
+    // delivered server doc.
     //
-    // If an editor is already open on this file when create() runs, the
-    // editor's reconcileBinding will run too (on its next update/wake)
-    // and converge editor↔ytext; our disk-based seed here is consistent
-    // with disk, and disk lags the editor by at most Obsidian's async
-    // autosave — so the two reconcilers agree on steady state. We still
-    // do the disk seed unconditionally because it is loss-free in every
-    // case (it never deletes content without a BASE ancestor).
-    await s.seedFromDisk();
+    // installDiskSync is safe to install before sync because its
+    // observer only writes ytext→disk when they DIFFER, and on a brand-
+    // new (not-yet-synced) room ytext is whatever IndexedDB hydrated —
+    // it does not push disk INTO ytext. The dangerous direction
+    // (disk→ytext seed) happens ONLY inside reconcileOnTrueSync, gated
+    // on true sync + origin.
     s.installDiskSync();
+    s.syncUnsub = onProviderSynced(s.provider, () => {
+      if (s.destroyed) return;
+      void s.reconcileOnTrueSync();
+    });
     return s;
   }
 
-  // Loss-free initial reconcile of ytext against disk, run once before
-  // installDiskSync for background (and editor) markdown sessions.
-  // Mirrors reconcileBinding's case taxonomy with disk as THEIRS:
-  //   1. equal            → record base, no-op
-  //   2. ytext empty      → seed ytext from disk (insert)
-  //   3. disk empty       → adopt ytext (nothing on disk to lose); the
-  //                         disk-sync observer will write ytext→disk
-  //   4. both differ      → BASE-mediated 3-way merge (or additive
-  //                         fallback when no BASE) so neither side is lost
-  // All ytext writes use DISK_UPDATE_ORIGIN.
-  private async seedFromDisk(): Promise<void> {
+  // True iff the provider has genuinely synced (I2). The editor binding
+  // (yedit) reads this before doing anything destructive on bind.
+  syncedForReconcile(): boolean {
+    return this.trulySynced;
+  }
+
+  // Editors register here to be re-poked once true sync lands, so their
+  // reconcileBinding reruns with trustworthy ytext. Returns an
+  // unsubscribe. If already synced, fires on the next microtask.
+  onTrueSync(cb: () => void): () => void {
+    if (this.trulySynced) {
+      queueMicrotask(() => {
+        if (!this.destroyed) cb();
+      });
+      return () => {};
+    }
+    this.onSyncedListeners.push(cb);
+    return () => {
+      const i = this.onSyncedListeners.indexOf(cb);
+      if (i >= 0) this.onSyncedListeners.splice(i, 1);
+    };
+  }
+
+  // ── INVARIANT-COMPLIANT bind/connect decision tree (I1–I4, I6) ──────
+  //
+  // Runs exactly once, on the FIRST genuine server sync. At this point
+  // ytext.toString() is authoritative as "what the server has". For the
+  // background (non-editor) session, "local content" = disk content.
+  // (The editor binding runs its OWN identical tree via yedit, gated on
+  // syncedForReconcile() + a file-identity check.)
+  //
+  //   1. origin==="local" AND ytext empty: OUR brand-new file. Seed
+  //      ytext from disk. DiskBuffer = disk. (The ONLY seed-from-local.)
+  //   2. else (peer-originated OR ytext already has content):
+  //      a. base = DiskBuffer.get(docId).
+  //      b. base exists  → real 3-way merge (legit offline-edit case).
+  //      c. base is null →
+  //           - disk === ytext      : in sync, DiskBuffer = disk.
+  //           - disk empty          : adopt ytext, DiskBuffer = ytext.
+  //           - disk non-empty,
+  //             differs from ytext  : SERVER WINS. Back up disk to
+  //                                   <path>.local-backup-<docId>.md,
+  //                                   Notice, then adopt ytext.
+  //                                   NEVER additively merge.
+  private async reconcileOnTrueSync(): Promise<void> {
+    if (this.destroyed) return;
+    // Mark synced + wake any waiting editors regardless of how the disk
+    // reconcile below resolves — the editor path does its own reconcile.
+    this.trulySynced = true;
+    const waiters = this.onSyncedListeners.splice(0);
+    for (const cb of waiters) {
+      try {
+        cb();
+      } catch (err) {
+        log.warn("session", `onTrueSync listener threw for ${this.path}`, err);
+      }
+    }
+
+    try {
+      await this.runReconcileDecision();
+    } finally {
+      // The decision is made (or failed). From now on the disk-sync
+      // observer is allowed to write ytext→disk. We also do one explicit
+      // ytext→disk flush: any ytext change that arrived while
+      // reconcileDone was still false was DROPPED by the observer, and a
+      // branch like "disk empty → adopt" or "3-way merge" expects ytext
+      // to land on disk. writeYtextToDisk is a no-op when disk already
+      // matches, so this is safe for the in-sync / seeded branches too.
+      // NOTE: if the SERVER-WINS branch failed to back up, it left
+      // reconcileDone false-equivalent by NOT adopting — but we still
+      // must NOT clobber: that branch leaves disk as the user's local
+      // content and ytext as server content, and we WANT the local file
+      // preserved. To honour that, the backup-failure branch sets a flag
+      // (backupFailed) that suppresses this flush.
+      this.reconcileDone = true;
+      if (!this.suppressDiskFlush) {
+        await this.writeYtextToDisk();
+      }
+    }
+  }
+
+  // True only when the SERVER-WINS branch could NOT back up the local
+  // content. In that single case we must NOT flush ytext→disk (that
+  // would destroy the un-backed-up local file). Everything stays as-is
+  // until the next true sync retries.
+  private suppressDiskFlush = false;
+
+  private async runReconcileDecision(): Promise<void> {
     if (this.destroyed) return;
     const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
     if (!(tfile instanceof TFile)) return;
     let disk: string;
-    let current: string;
+    let ytextStr: string;
     try {
       disk = await this.opts.app.vault.read(tfile);
-      current = this.ytext.toString();
+      ytextStr = this.ytext.toString();
     } catch (err) {
-      log.warn("session", `seedFromDisk read failed for ${this.path}`, err);
+      log.warn("session", `reconcileOnTrueSync read failed for ${this.path}`, err);
       return;
     }
     if (this.destroyed) return;
 
-    // Case 1 — already consistent.
-    if (disk === current) {
+    // Step 1 — OUR brand-new file, empty server room. Seed from disk.
+    // This is the ONLY place background seed-from-local is allowed (I3).
+    if (this.opts.origin === "local" && this.ytext.length === 0) {
+      if (disk.length > 0) {
+        applyStringToYText(this.ytext, disk, DISK_UPDATE_ORIGIN);
+      }
+      void this.diskBuffer.set(this.docId, disk);
+      log.info(
+        "session",
+        `reconcile ${this.path}: seeded brand-new (local origin) ytext from disk (${disk.length})`,
+      );
+      return;
+    }
+
+    // Step 2 — peer-originated, or ytext already has content.
+    if (disk === ytextStr) {
+      // In sync. Record base.
       void this.diskBuffer.set(this.docId, disk);
       return;
     }
-    // Case 2 — ytext empty, disk has content: seed.
-    // Case 3 — disk empty, ytext has content: nothing on disk to lose.
-    //          The disk-sync observer (installed right after) writes
-    //          ytext→disk on its first fire, so we leave ytext as-is and
-    //          just record ytext as the base.
-    if (current.length === 0 && disk.length > 0) {
-      applyStringToYText(this.ytext, disk, DISK_UPDATE_ORIGIN);
-      void this.diskBuffer.set(this.docId, disk);
-      return;
-    }
-    if (disk.length === 0 && current.length > 0) {
-      void this.diskBuffer.set(this.docId, current);
-      return;
-    }
-    // Case 4 — both non-empty AND differ. BASE-mediated 3-way merge so
-    // neither offline-local disk edits nor synced remote edits are lost.
+
     let base: string | null = null;
     try {
       base = (await this.diskBuffer.get(this.docId)) ?? null;
@@ -242,27 +349,164 @@ export class TextSession implements BaseSession {
       /* treat as missing base */
     }
     if (this.destroyed) return;
-    // Re-read live ytext in case remote ops landed during the await.
+    // Re-read live ytext: remote ops may have landed during the await.
     const liveYtext = this.ytext.toString();
-    if (liveYtext === disk) {
-      void this.diskBuffer.set(this.docId, disk);
+    if (disk === liveYtext) {
+      void this.diskBuffer.set(this.docId, liveYtext);
       return;
     }
-    const merged =
-      base != null
-        ? threeWayMerge(base, liveYtext, disk)
-        : additiveMerge(liveYtext, disk);
-    applyStringToYText(this.ytext, merged, DISK_UPDATE_ORIGIN);
-    void this.diskBuffer.set(this.docId, merged);
-    log.info(
-      "session",
-      `seedFromDisk ${this.path}: ${base != null ? "3-way" : "additive"} merge (disk=${disk.length}, ytext=${liveYtext.length} → ${merged.length})`,
-    );
+
+    // 2b — base exists: legit offline-edit case. Real 3-way merge so
+    // both the offline-local disk edits and remote edits survive.
+    if (base != null) {
+      const merged = threeWayMerge(base, liveYtext, disk);
+      applyStringToYText(this.ytext, merged, DISK_UPDATE_ORIGIN);
+      void this.diskBuffer.set(this.docId, merged);
+      log.info(
+        "session",
+        `reconcile ${this.path}: 3-way merge (base=${base.length}, ytext=${liveYtext.length}, disk=${disk.length} → ${merged.length})`,
+      );
+      return;
+    }
+
+    // 2c — NO base. We have never synced this file before, so we cannot
+    // tell offline-edits from "this is a different file's content". A
+    // merge here is exactly the Bug-1 corruption source. So:
+    if (disk.length === 0) {
+      // Nothing local to lose — adopt ytext. The disk-sync observer
+      // writes ytext→disk; record ytext as base.
+      void this.diskBuffer.set(this.docId, liveYtext);
+      log.info(
+        "session",
+        `reconcile ${this.path}: no base, disk empty → adopt ytext (${liveYtext.length})`,
+      );
+      return;
+    }
+    // disk non-empty AND differs from ytext, no base → SERVER WINS.
+    // Back up the local disk content (so it's never lost), then adopt
+    // ytext. NEVER additively merge into the shared doc.
+    await this.backupLocalThenAdopt(disk, liveYtext);
+  }
+
+  // SERVER WINS path (I4). Save the local disk content to a local-only
+  // backup sibling, Notice the user. We do NOT write the live file here:
+  // the unified ytext→disk flush in reconcileOnTrueSync's finally adopts
+  // ytext onto disk (and records the base) once reconcileDone flips. If
+  // the backup FAILS we set suppressDiskFlush so that flush is skipped —
+  // the live file keeps the un-backed-up local content, ytext stays the
+  // server version, and the next true sync retries. Never clobber
+  // un-backed-up data. The backup file is suppressed via remoteApplyPaths
+  // and skipped by classify(), so it never enters the manifest / peers.
+  private async backupLocalThenAdopt(
+    diskContent: string,
+    ytextStr: string,
+  ): Promise<void> {
+    const ok = await this.backupLocalContent(diskContent);
+    if (!ok) {
+      this.suppressDiskFlush = true;
+      return;
+    }
+    // Backup is safe — record ytext as the new base; the finally-flush
+    // writes ytext onto disk so the user sees the shared version.
+    void this.diskBuffer.set(this.docId, ytextStr);
+  }
+
+  // SERVER-WINS backup (I4), reusable by both the background reconcile
+  // and the editor binding (yedit). Persists `content` to a LOCAL-ONLY
+  // backup sibling `<path>.local-backup-<docId>.md`, Notices the user.
+  // Returns true on success (caller may safely adopt ytext), false on
+  // failure (caller must NOT adopt — local content wasn't preserved).
+  //
+  // Loop/echo safety: the create/modify is wrapped in remoteApplyPaths
+  // so onLocalCreate/onLocalModify drop it, and classify() skips
+  // `.local-backup-*` so the backup NEVER enters the manifest or syncs
+  // to peers regardless. It exists purely on this device for recovery.
+  async backupLocalContent(content: string): Promise<boolean> {
+    if (this.destroyed) return false;
+    const backupPath = localBackupPath(this.path, this.docId);
+    try {
+      const existing = this.opts.app.vault.getAbstractFileByPath(backupPath);
+      this.opts.remoteApplyPaths.add(backupPath);
+      try {
+        if (existing instanceof TFile) {
+          // Reuse the stable per-docId backup name (overwrite) instead of
+          // spawning duplicates on repeated reconciles.
+          await this.opts.app.vault.modify(existing, content);
+        } else if (!existing) {
+          await this.opts.app.vault.create(backupPath, content);
+        } else {
+          // A folder sits at that path (pathological). Bail as failure.
+          return false;
+        }
+      } finally {
+        setTimeout(() => this.opts.remoteApplyPaths.delete(backupPath), 1000);
+      }
+      log.info(
+        "session",
+        `${this.path}: server wins — backed up local content (${content.length}) to ${backupPath}`,
+      );
+      try {
+        new Notice(
+          `Collab: ${this.path} had local changes that differ from the shared version. ` +
+            `The shared version was kept; your local copy is saved as ${backupPath}.`,
+          12_000,
+        );
+      } catch {
+        /* Notice unavailable in some contexts; ignore */
+      }
+      return true;
+    } catch (err) {
+      log.warn(
+        "session",
+        `${this.path}: local-backup failed; NOT adopting (local content left intact)`,
+        err,
+      );
+      return false;
+    }
+  }
+
+  // One-shot ytext→disk writer (mirrors the disk-sync observer body)
+  // used by the SERVER-WINS adopt so the live file converges immediately
+  // instead of waiting for the next ytext change.
+  private async writeYtextToDisk(): Promise<void> {
+    if (this.destroyed) return;
+    const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
+    if (!(tfile instanceof TFile)) return;
+    let content: string;
+    try {
+      content = this.ytext.toString();
+    } catch {
+      return;
+    }
+    try {
+      const current = await this.opts.app.vault.read(tfile);
+      if (this.destroyed) return;
+      if (current === content) {
+        void this.diskBuffer.set(this.docId, content);
+        return;
+      }
+      this.opts.remoteApplyPaths.add(this.path);
+      await this.opts.app.vault.modify(tfile, content);
+      void this.diskBuffer.set(this.docId, content);
+    } catch (err) {
+      log.warn("session", `writeYtextToDisk failed for ${this.path}`, err);
+    } finally {
+      setTimeout(() => this.opts.remoteApplyPaths.delete(this.path), 1000);
+    }
   }
 
   private installDiskSync() {
     const observer = () => {
       if (this.destroyed) return;
+      // Ordering guard (see reconcileDone): do NOT write ytext→disk
+      // before the bind/connect reconcile has run. When the server's
+      // content first streams into ytext on sync, this observer fires —
+      // but if reconcile hasn't decided yet, writing here would clobber a
+      // non-empty local file before reconcile can back it up. We drop
+      // (don't reschedule) — reconcileOnTrueSync performs the correct
+      // ytext→disk write itself once it has backed up / decided, and any
+      // post-reconcile ytext change re-fires this observer normally.
+      if (!this.reconcileDone) return;
       if (this.diskWriteTimer) clearTimeout(this.diskWriteTimer);
       this.diskWriteTimer = setTimeout(async () => {
         this.diskWriteTimer = null;
@@ -328,6 +572,13 @@ export class TextSession implements BaseSession {
   // write disk itself, so it needs no remoteApplyPaths suppression.
   async applyDiskUpdate(): Promise<void> {
     if (this.destroyed) return;
+    // I2: do not push disk→ytext before the bind/connect reconcile has
+    // run on a true sync. Before that, ytext is not trustworthy and
+    // forwarding disk content could push local content into a not-yet-
+    // delivered shared doc (I1). The reconcile itself handles the
+    // pre-sync disk content; a genuine post-sync external modify reaches
+    // here normally.
+    if (!this.reconcileDone) return;
     const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
     if (!(tfile instanceof TFile)) return;
     let diskContent: string;
@@ -384,6 +635,15 @@ export class TextSession implements BaseSession {
       clearTimeout(this.diskWriteTimer);
       this.diskWriteTimer = null;
     }
+    if (this.syncUnsub) {
+      try {
+        this.syncUnsub();
+      } catch {
+        /* ignore */
+      }
+      this.syncUnsub = null;
+    }
+    this.onSyncedListeners.length = 0;
     for (const fn of this.observers) {
       try {
         this.ytext.unobserve(fn);

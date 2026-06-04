@@ -334,6 +334,12 @@ export class LiveViewManager {
       // of identity; this is just a fallback so the editor's cursor
       // write can't advertise a nameless (or empty) state.
       user: this.presence.getUser(),
+      // ── data-corruption fix wiring (I2, I3, I5, I4) ───────────────
+      sessionPath: text.path,
+      origin: text.origin,
+      isSynced: () => text.syncedForReconcile(),
+      onSynced: (cb) => text.onTrueSync(cb),
+      backupLocal: (localContent) => text.backupLocalContent(localContent),
     };
   }
 

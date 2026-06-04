@@ -50,7 +50,7 @@ import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 import diff_match_patch from "diff-match-patch";
 
-import { Notice, TFile, editorInfoField } from "obsidian";
+import { TFile, editorInfoField } from "obsidian";
 import { DiskBuffer } from "../disk-buffer";
 
 // Resolved context: what Y.Text + which Awareness this editor should bind
@@ -78,6 +78,25 @@ export interface YeditContext {
   docId: string;
   active: boolean;
   user: { name: string; color: string };
+  // ── data-corruption fix wiring (invariants I2, I3, I5) ──────────────
+  // The session's current vault path. Used for the file-identity check
+  // (I5): the editor must be showing THIS file before we reconcile.
+  sessionPath: string;
+  // Where this markdown session originated (I3). Only "local" may seed
+  // the editor's content into an empty ytext.
+  origin: "local" | "remote";
+  // I2: has the session's provider genuinely synced? Reconcile is
+  // forbidden until true.
+  isSynced: () => boolean;
+  // Register to be re-poked when the session truly syncs. Returns an
+  // unsubscribe. The binding uses this to re-run reconcile once the
+  // server's state arrives (instead of acting on a not-yet-synced doc).
+  onSynced: (cb: () => void) => () => void;
+  // SERVER-WINS backup (I4): persist `localContent` to a local-only
+  // backup sibling, Notice the user. Used when there's no base and the
+  // editor content differs from the synced ytext. Async; resolves true
+  // on success (safe to adopt ytext), false on failure (do NOT adopt).
+  backupLocal: (localContent: string) => Promise<boolean>;
 }
 
 export type ResolveContext = (view: EditorView) => YeditContext | null;
@@ -194,30 +213,12 @@ export function threeWayMerge(base: string, ours: string, theirs: string): strin
   return merged;
 }
 
-// Additive fallback for when we have no BASE (first-ever open on this
-// device). We can't tell which side changed what, so we never DELETE:
-// we keep all of OURS and splice in the spans that THEIRS has and OURS
-// lacks. Both sides survive. In a true conflict this can duplicate a
-// region, but duplication is recoverable by the user and data loss is
-// not — that's the whole point.
-//
-// Returns the additively-merged string.
-export function additiveMerge(ours: string, theirs: string): string {
-  if (ours === theirs) return ours;
-  const diffs = dmp.diff_main(ours, theirs);
-  dmp.diff_cleanupSemantic(diffs);
-  let out = "";
-  for (const [type, text] of diffs) {
-    if (type === 0) {
-      out += text; // common to both → keep once
-    } else if (type === 1) {
-      out += text; // present in THEIRS only → add it
-    } else if (type === -1) {
-      out += text; // present in OURS only → keep it (do NOT delete)
-    }
-  }
-  return out;
-}
+// NOTE: the old `additiveMerge` (no-BASE union of both sides) was
+// REMOVED in the data-corruption fix. Merging without a BASE is exactly
+// what produced Bug 1's garbage — when there is no base we cannot tell a
+// genuine offline edit from a different file's content, so the only safe
+// action is SERVER WINS + back up local (see reconcileBinding step 4 and
+// TextSession.backupLocalContent). There is no additive path anymore.
 
 // Apply a target string onto a Y.Text as minimal insert/delete ops,
 // computed by diffing the Y.Text's CURRENT content against the target.
@@ -284,6 +285,10 @@ class YSyncPluginValue {
   // edits we're in the middle of preserving. Cleared when the merge's
   // ytext + editor + DiskBuffer are all settled.
   private mergeInFlight = false;
+  // I2: when a bind happens before the session has truly synced, we
+  // defer reconcile and register here to be re-poked on real sync. Held
+  // so a rebind/teardown can cancel a stale waiter.
+  private syncWaitUnsub: (() => void) | null = null;
 
   constructor(view: EditorView) {
     this.view = view;
@@ -319,6 +324,7 @@ class YSyncPluginValue {
           /* ignore */
         }
       }
+      this.cancelSyncWait();
       this.observer = null;
       this.boundYtext = null;
       this.boundDocId = null;
@@ -347,6 +353,9 @@ class YSyncPluginValue {
         /* ignore */
       }
     }
+    // A sync-wait registered for the PREVIOUS binding must not fire a
+    // reconcile against the new one.
+    this.cancelSyncWait();
 
     // Set the new bound state BEFORE installing the observer so reentrant
     // events have consistent state. Reset mergeInFlight first: a merge
@@ -359,24 +368,10 @@ class YSyncPluginValue {
     this.boundDocId = ctx.docId;
     this.boundYtext = ctx.ytext;
 
-    // Reconcile editor content with the new ytext content.
-    // Phase 3 decision tree (see reconcileBinding). The four cases:
-    //
-    //   1. editor === ytext            → in sync, set DiskBuffer = editor.
-    //   2. ytext empty, editor present → seed ytext from editor (first
-    //                                     peer), set DiskBuffer = editor.
-    //   3. editor empty, ytext present → adopt ytext into editor (joining
-    //                                     peer, nothing local to lose),
-    //                                     set DiskBuffer = ytext.
-    //   4. both non-empty AND differ   → DANGEROUS. Three-way merge via
-    //                                     DiskBuffer (async). NEVER discard
-    //                                     the editor buffer.
-    //
-    // Cases 1–3 are synchronous. Case 4 needs an async DiskBuffer.get and
-    // is handled by reconcileBinding kicking runDiskMerge(); the parity
-    // check is suppressed (mergeInFlight) until that settles so it can't
-    // force editor→ytext and undo the merge.
-    this.reconcileBinding(ctx.ytext, ctx.docId);
+    // Reconcile editor content with the new ytext content — gated by
+    // the data-corruption invariants (I2 true-sync, I5 file-identity,
+    // I3 origin, I4 base-required). See reconcileBinding.
+    this.reconcileBinding(ctx);
 
     // Install the Y.Text observer. Translates Y events into editor
     // ChangeSpec[]. Defensive against torn-down sessions.
@@ -439,16 +434,89 @@ class YSyncPluginValue {
     return ctx;
   }
 
-  // ── Phase 3: reconcile-on-bind decision tree ────────────────────────
+  // Cancel a pending I2 sync-wait (if any). Idempotent.
+  private cancelSyncWait(): void {
+    if (this.syncWaitUnsub) {
+      try {
+        this.syncWaitUnsub();
+      } catch {
+        /* ignore */
+      }
+      this.syncWaitUnsub = null;
+    }
+  }
+
+  // The vault path the editor is CURRENTLY displaying, via Obsidian's
+  // editorInfoField. null if unavailable / not an Obsidian file context.
+  // Used for the I5 file-identity check.
+  private editorFilePath(): string | null {
+    try {
+      const info = this.view.state.field(editorInfoField, false);
+      if (info && info.file instanceof TFile) return info.file.path;
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  // ── INVARIANT-COMPLIANT reconcile-on-bind decision tree ─────────────
   //
-  // Run once per real binding (called from rebindIfNeeded after we've
-  // set boundYtext/boundDocId and before installing the observer). The
-  // observer is installed AFTER this returns, but cases that mutate
-  // ytext do so under origin `this`, which the observer skips anyway —
-  // and the async merge re-reads live content, so observer-install order
-  // is not load-bearing for correctness. The #1 rule: never discard a
-  // non-empty editor buffer without merging it into ytext first.
-  private reconcileBinding(ytext: Y.Text, docId: string): void {
+  // Run once per real binding (and re-run via onSynced if the session
+  // hadn't truly synced yet). Enforces, in order:
+  //
+  //   I5 (file identity): the editor must currently be showing the SAME
+  //       file as the session we're reconciling against. On a fast file
+  //       switch the recycled EditorView briefly still holds the previous
+  //       file's text; reconciling then would inject fileA's text into
+  //       fileB's ytext (Bug 2). If editorInfoField.file.path !==
+  //       ctx.sessionPath, ABORT — the bind reruns cleanly once the
+  //       editor settles (a wake/update will re-call us).
+  //
+  //   I2 (true sync only): if the session's provider hasn't genuinely
+  //       synced, the editor shows disk content and we do NOTHING
+  //       destructive. We register onSynced to re-run this reconcile when
+  //       the server's state truly arrives.
+  //
+  //   Then the decision tree (I1/I3/I4/I6) with editor as "local":
+  //     1. origin==="local" AND ytext empty → seed ytext from editor
+  //        (OUR brand-new file). The only editor→ytext seed.
+  //     2. editor === ytext → in sync, record base.
+  //     3. base exists → real 3-way merge (legit offline-edit case).
+  //     4. no base:
+  //          - editor empty → adopt ytext into editor.
+  //          - editor non-empty, differs → SERVER WINS: back up editor
+  //            content to a local-only file, then adopt ytext. NEVER
+  //            additively merge into the shared doc.
+  private reconcileBinding(ctx: YeditContext): void {
+    const { ytext, docId } = ctx;
+
+    // I5 — file identity. The editor must be on THIS session's file.
+    const editorPath = this.editorFilePath();
+    if (editorPath !== null && editorPath !== ctx.sessionPath) {
+      console.log(
+        `[yedit] reconcile aborted (I5): editor shows ${editorPath}, session is ${ctx.sessionPath} — will rerun once editor settles`,
+      );
+      return;
+    }
+
+    // I2 — only on a genuine sync. If not yet synced, defer: do nothing
+    // destructive, and re-run when the server's state truly arrives.
+    if (!ctx.isSynced()) {
+      this.cancelSyncWait();
+      this.syncWaitUnsub = ctx.onSynced(() => {
+        this.syncWaitUnsub = null;
+        // Still bound to the same context? (A switch may have happened
+        // while we waited.) If not, the new binding owns reconcile.
+        if (this.boundYtext !== ytext || this.boundDocId !== docId) return;
+        if (!this.view.dom.isConnected) return;
+        this.reconcileBinding(ctx);
+      });
+      console.log(
+        `[yedit] reconcile deferred (I2): session ${ctx.sessionPath} not yet synced — waiting for true sync`,
+      );
+      return;
+    }
+
     let editorStr: string;
     let ytextStr: string;
     try {
@@ -459,17 +527,10 @@ class YSyncPluginValue {
       return;
     }
 
-    // Case 1 — already in sync. Record the base; no dispatch.
-    if (editorStr === ytextStr) {
-      void this.diskBuffer.set(docId, editorStr);
-      return;
-    }
-
-    // Case 2 — first peer on this file (server has nothing). Seed ytext
-    // from the editor. Origin `this` so the observer skips it (the
-    // editor already holds this content; echoing it back would double
-    // it). Base = the seeded content.
-    if (ytext.length === 0 && editorStr.length > 0) {
+    // Step 1 — OUR brand-new file, empty server room (I3). Seed ytext
+    // from the editor. Origin `this` so the observer skips it. This is
+    // the ONLY editor→ytext seed permitted.
+    if (ctx.origin === "local" && ytext.length === 0 && editorStr.length > 0) {
       const doc = ytext.doc;
       if (doc) {
         try {
@@ -477,7 +538,7 @@ class YSyncPluginValue {
             ytext.insert(0, editorStr);
           }, this);
           console.log(
-            `[yedit] seeded ytext from editor (${editorStr.length} chars) on first bind`,
+            `[yedit] seeded ytext from editor (${editorStr.length} chars) — local origin, brand-new room`,
           );
         } catch (err) {
           console.warn("[yedit] seed failed", err);
@@ -487,185 +548,119 @@ class YSyncPluginValue {
       return;
     }
 
-    // Case 3 — joining peer, local file empty/new. Nothing local to
-    // lose; adopt ytext into the editor via a minimal diff (caret/undo
-    // survive). Base = ytext content.
-    if (editorStr.length === 0 && ytext.length > 0) {
-      try {
-        const changes = bufferDiffToChanges(editorStr, ytextStr);
-        if (changes.length > 0) {
-          this.view.dispatch({
-            changes,
-            annotations: [ySyncAnnotation.of(true)],
-          });
-        }
-      } catch (err) {
-        console.warn("[yedit] case-3 adopt failed", err);
-      }
-      void this.diskBuffer.set(docId, ytextStr);
+    // Step 2 — already in sync. Record base; no dispatch.
+    if (editorStr === ytextStr) {
+      void this.diskBuffer.set(docId, editorStr);
       return;
     }
 
-    // Case 4 — both non-empty AND differ. The dangerous one. Hand to the
-    // async three-way merge. Suppress the parity check until it settles.
-    // runDiskMerge re-reads live content after its await, so we don't
-    // pass the snapshots — they could be stale by the time it resumes.
+    // Steps 3/4 need an async DiskBuffer.get. Suppress the parity check
+    // until it settles so it can't force editor→ytext and undo us.
     this.mergeInFlight = true;
-    void this.runDiskMerge(ytext, docId);
+    void this.runReconcileMerge(ctx);
   }
 
-  // The async half of case 4. Loads BASE from the DiskBuffer, computes
-  // the merged content (true 3-way if BASE exists, additive fallback if
-  // not), applies it to ytext (origin `this`), pushes the same result
-  // into the editor via a minimal diff, and records the new BASE.
-  //
-  // Everything is wrapped so that an exception can NEVER leave the editor
-  // buffer discarded: on any failure we leave both editor and ytext as
-  // they were (the user's text stays in the editor) and just clear the
-  // in-flight flag. Losing text is the cardinal sin; a failed merge that
-  // leaves both copies intact is recoverable, a merge that wiped the
-  // editor is not.
-  private async runDiskMerge(ytext: Y.Text, docId: string): Promise<void> {
-    let merged: string;
-    let usedAdditiveFallback = false;
-    // Are we still the merge that owns the current binding? Used to guard
-    // every mergeInFlight write so a SUPERSEDED merge (user switched away
-    // and a new binding — possibly its own case-4 merge — took over)
-    // never clears the flag the NEW binding is relying on. Only the merge
-    // that still owns the binding may clear it.
+  // Async tail of reconcileBinding (steps 3/4). Loads BASE; if present
+  // does a real 3-way merge (legit offline-edit case). If absent: server
+  // wins — adopt ytext into the editor, backing up the editor's content
+  // to a local-only file first when it's non-empty and differs (I4). It
+  // NEVER additively merges into the shared doc (the Bug-1 corruption
+  // source) and NEVER discards the editor buffer without first backing
+  // it up.
+  private async runReconcileMerge(ctx: YeditContext): Promise<void> {
+    const { ytext, docId } = ctx;
     const stillOwner = () =>
       this.boundYtext === ytext && this.boundDocId === docId;
     try {
       const base = await this.diskBuffer.get(docId);
-
-      // The binding may have changed while we awaited IndexedDB (user
-      // switched files). If so, abandon this merge — a fresh
-      // reconcileBinding ran for the new context and now owns the
-      // mergeInFlight flag. Leave the editor as-is; do NOT touch the flag.
       if (!stillOwner()) return;
+      // I5 again: the editor may have switched files during the await.
+      const editorPath = this.editorFilePath();
+      if (editorPath !== null && editorPath !== ctx.sessionPath) return;
 
-      // Re-read live content: remote ops or local keystrokes may have
-      // landed during the await. We merge the CURRENT state, not the
-      // snapshot we were called with.
+      // Re-read live content: remote ops / keystrokes may have landed.
       const liveYtext = ytext.toString();
       const liveEditor = this.view.state.doc.toString();
       if (liveYtext === liveEditor) {
-        // Converged on their own while we waited. Record base, done.
         void this.diskBuffer.set(docId, liveYtext);
         return;
       }
 
       if (base != null) {
-        // Case 4a — true three-way merge. Local edits (base→theirs)
-        // replayed onto ours via fuzzy patch matching. We trust the
-        // result (see threeWayMerge): it preserves remote edits and
-        // honours legitimate local deletions.
-        merged = threeWayMerge(base, liveYtext, liveEditor);
-      } else {
-        // Case 4b — no common ancestor (first-ever open on this device).
-        // Additive merge: keep everything from both sides. May duplicate
-        // in a true conflict; never loses. We warn the user via Notice.
-        merged = additiveMerge(liveYtext, liveEditor);
-        usedAdditiveFallback = true;
+        // Step 3 — true 3-way merge. Local edits (base→editor) replayed
+        // onto ours (ytext) via fuzzy patch matching. Preserves remote
+        // edits and honours legitimate local deletions.
+        const merged = threeWayMerge(base, liveYtext, liveEditor);
+        applyStringToYText(ytext, merged, this);
+        const finalContent = ytext.toString();
+        this.pushEditor(finalContent);
+        void this.diskBuffer.set(docId, finalContent);
+        console.log(
+          `[yedit] reconcile 3-way for ${docId}: base=${base.length} ours=${liveYtext.length} theirs=${liveEditor.length} → ${finalContent.length}`,
+        );
+        return;
       }
 
-      // Apply the merged content to ytext. Origin `this` → our observer
-      // skips it (it would otherwise translate ours-relative offsets
-      // onto the editor, which still holds THEIRS — a mismatch). We push
-      // the editor explicitly below instead.
-      const changedYtext = applyStringToYText(ytext, merged, this);
-      // Recompute merged from the actual post-apply ytext, in case
-      // concurrent remote ops merged in during our transaction (Yjs may
-      // interleave). This is the true converged content.
-      const finalContent = ytext.toString();
-
-      // Push the converged content into the editor via a minimal diff
-      // from its current (THEIRS) content. Offsets are editor-relative
-      // so they always line up.
-      try {
-        const changes = bufferDiffToChanges(
-          this.view.state.doc.toString(),
-          finalContent,
+      // Step 4 — NO base. We cannot distinguish offline edits from a
+      // different file's content, so we must NOT merge into the shared
+      // doc. Server wins.
+      if (liveEditor.length === 0) {
+        // Nothing local to lose — adopt ytext into the editor.
+        this.pushEditor(liveYtext);
+        void this.diskBuffer.set(docId, liveYtext);
+        console.log(
+          `[yedit] reconcile no-base, editor empty → adopt ytext (${liveYtext.length})`,
         );
-        if (changes.length > 0) {
-          this.view.dispatch({
-            changes,
-            annotations: [ySyncAnnotation.of(true)],
-          });
-        }
-      } catch (err) {
+        return;
+      }
+      // editor non-empty AND differs from ytext → back up local, adopt.
+      const backedUp = await ctx.backupLocal(liveEditor);
+      if (!stillOwner()) return;
+      if (!backedUp) {
+        // Backup failed — do NOT discard the editor content. Leave it;
+        // a future true-sync/rebind retries. (The editor still holds the
+        // user's text, so nothing is lost.)
         console.warn(
-          "[yedit] disk-merge: editor dispatch failed; ytext holds merged content, editor will resync via parity",
-          err,
+          `[yedit] reconcile no-base, backup FAILED for ${docId} — leaving editor content intact, not adopting`,
         );
+        return;
       }
-
-      // New BASE = the converged content now on both sides.
-      void this.diskBuffer.set(docId, finalContent);
-
+      // Backup safe — adopt ytext into the editor.
+      const adoptYtext = ytext.toString();
+      this.pushEditor(adoptYtext);
+      void this.diskBuffer.set(docId, adoptYtext);
       console.log(
-        `[yedit] disk-merge (${usedAdditiveFallback ? "additive/no-base" : "3-way"}) ` +
-          `for ${docId}: base=${base?.length ?? "null"} ours=${liveYtext.length} ` +
-          `theirs=${liveEditor.length} → merged=${finalContent.length}` +
-          (changedYtext ? "" : " (ytext unchanged)"),
+        `[yedit] reconcile no-base, server wins for ${docId}: backed up editor (${liveEditor.length}), adopted ytext (${adoptYtext.length})`,
       );
-
-      if (usedAdditiveFallback) {
-        // No clean ancestor — warn the user to eyeball the result, as the
-        // additive union can duplicate a region in a true conflict.
-        const name = this.fileNameForNotice();
-        try {
-          new Notice(
-            `Collab merged your local version of ${name} with the shared version — check the result.`,
-            10_000,
-          );
-        } catch {
-          /* Notice unavailable in some contexts; ignore */
-        }
-      }
     } catch (err) {
-      // Hard failure somewhere in the merge. We never DISCARD text: the
-      // editor buffer (THEIRS) is never cleared by this method, so the
-      // user's local content is always still on screen and on its way to
-      // disk. Two sub-cases when the flag clears and the parity check
-      // re-enables:
-      //   - threw before ytext was modified → ytext == OURS, editor ==
-      //     THEIRS; parity will reconcile editor→ytext (ytext wins) but
-      //     the editor text also already merged into nothing was lost —
-      //     it remains in the editor until that resync, and the disk-sync
-      //     writer captured nothing destructive. (This is the pre-Phase-3
-      //     behaviour, only reachable on a merge crash.)
-      //   - threw after applyStringToYText → ytext already holds the
-      //     merged (both-sides) content; parity reconciles editor→ytext,
-      //     so the editor converges to the merged content. Both sides
-      //     preserved.
-      // Either way no data is silently destroyed by THIS code path.
+      // Never discard the editor buffer on failure — the user's content
+      // stays on screen and flows to disk. Recoverable.
       console.error(
-        "[yedit] disk-merge failed; editor buffer left intact (never discarded)",
+        "[yedit] reconcile merge failed; editor buffer left intact (never discarded)",
         err,
       );
     } finally {
-      // Only clear the flag if we still own the binding. If a switch
-      // happened mid-merge, the new binding (and possibly its own merge)
-      // owns mergeInFlight now — clearing it here would wrongly re-enable
-      // the new binding's parity check before its merge applied, risking
-      // its local edits. The superseded merge simply leaves the flag to
-      // its rightful owner.
       if (stillOwner()) this.mergeInFlight = false;
     }
   }
 
-  // Best-effort human filename for the merge Notice. Reads Obsidian's
-  // editorInfoField off the view state; falls back to a generic label if
-  // the field isn't present (e.g. a non-Obsidian CodeMirror context).
-  private fileNameForNotice(): string {
+  // Push `content` into the editor via a minimal diff from its current
+  // text (caret/undo survive). Annotated so our observer/forward skip it.
+  private pushEditor(content: string): void {
     try {
-      const info = this.view.state.field(editorInfoField, false);
-      if (info && info.file instanceof TFile) return info.file.name;
-    } catch {
-      /* ignore */
+      const changes = bufferDiffToChanges(this.view.state.doc.toString(), content);
+      if (changes.length > 0) {
+        this.view.dispatch({
+          changes,
+          annotations: [ySyncAnnotation.of(true)],
+        });
+      }
+    } catch (err) {
+      console.warn(
+        "[yedit] pushEditor dispatch failed; parity will resync editor to ytext",
+        err,
+      );
     }
-    return "this file";
   }
 
   // Forward editor changes into ytext. Skips our own Y-annotated
@@ -673,6 +668,22 @@ class YSyncPluginValue {
   update(update: ViewUpdate): void {
     const ctx = this.rebindIfNeeded();
     if (!ctx || !ctx.active) return;
+
+    // I2 + I5 gate on the editor→ytext forward path. Until the session
+    // has TRULY synced, ytext is not trustworthy (server state may not
+    // have arrived), and the editor may be showing disk content for a
+    // remote-origin file — forwarding it would push local content into
+    // the shared doc (violating I1). Likewise if the editor is showing a
+    // DIFFERENT file than the bound session (mid-switch), forwarding
+    // would cross-contaminate (Bug 2). In both cases: do not forward and
+    // do not run the parity check (which could also force editor→ytext).
+    // The bound observer (ytext→editor) is unaffected, and the reconcile
+    // re-runs once synced / once the editor settles on the right file.
+    if (!ctx.isSynced()) return;
+    {
+      const editorPath = this.editorFilePath();
+      if (editorPath !== null && editorPath !== ctx.sessionPath) return;
+    }
 
     if (!update.docChanged) {
       this.parityCheck(update);
@@ -783,6 +794,7 @@ class YSyncPluginValue {
         /* ignore */
       }
     }
+    this.cancelSyncWait();
     this.observer = null;
     this.boundYtext = null;
     this.boundDocId = null;

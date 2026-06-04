@@ -35,7 +35,7 @@ import * as Y from "yjs";
 
 import { log } from "./logger";
 import { DiskBuffer } from "./disk-buffer";
-import { MANIFEST_ROOM, mimeFromExtension, sha256Hex, uuid } from "./util";
+import { MANIFEST_ROOM, isLocalBackupPath, mimeFromExtension, sha256Hex, uuid } from "./util";
 import {
   PROTOCOL_VERSION,
   type EntryKind,
@@ -310,7 +310,13 @@ export class ManifestSync {
     if (
       !file.path ||
       file.path.startsWith(".obsidian/") ||
-      file.path === ".obsidian"
+      file.path === ".obsidian" ||
+      // Local-only conflict backups produced by the bind/connect
+      // "server wins, back up local" path (invariant I4). These must
+      // NEVER enter the manifest or sync to peers — they exist solely
+      // so the user can recover their pre-merge local content on THIS
+      // device. The name pattern is `<path>.local-backup-<docId>.md`.
+      isLocalBackupPath(file.path)
     ) {
       return null;
     }
@@ -434,7 +440,13 @@ export class ManifestSync {
         for (const a of additions) {
           const sk = this.sessionKindOf(a.entry.kind);
           if (sk && a.file) {
-            void this.deps.sessionManager.attach(a.path, sk, a.entry.id);
+            // origin="local" (I3): these are local files NOT present in
+            // the manifest — we just minted a fresh UUID and added the
+            // entry above, so `doc:<id>` is a brand-new room, empty by
+            // construction. (Files that DID already exist in the manifest
+            // took the localPaths.has → attach path earlier, which is
+            // "remote": their room may hold peer content.) Safe to seed.
+            void this.deps.sessionManager.attach(a.path, sk, a.entry.id, "local");
           }
         }
         if (i + CHUNK < allLocal.length) {
@@ -892,7 +904,12 @@ export class ManifestSync {
       // is already showing this file. No need for an explicit chained
       // bindEditorIfReady — LiveViewManager replaces that entire
       // pipeline.
-      void this.deps.sessionManager.attach(file.path, sk, id);
+      //
+      // origin="local" (I3): the user just created this file locally and
+      // we just minted+added its manifest entry above, so the server
+      // room `doc:<id>` is brand-new and empty BY CONSTRUCTION. This is
+      // the ONLY attach allowed to seed local disk content into ytext.
+      void this.deps.sessionManager.attach(file.path, sk, id, "local");
     }
   }
 

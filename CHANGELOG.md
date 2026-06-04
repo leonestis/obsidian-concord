@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.2.1 — 2026-05-28
+
+### Fixed (data corruption — important)
+- **First-connect clobber.** A new peer's files materialise empty and the real content streams in asynchronously. The reconcile/seed logic could fire before the server's content actually arrived (the `waitForProviderSync` 4s timeout resolving instead of a true `synced`), conclude "the shared doc is empty, I'll seed it from my local disk", and push local content into a doc that already had content on the server — corrupting it for everyone once the real content merged in. Fixed by three enforced invariants: **(1)** seed/merge now runs ONLY on a genuine `synced` event, never on the timeout fallback (before true sync the session does nothing destructive); **(2)** seeding local content into a shared doc is allowed ONLY when this peer provably originated the file (created it locally this run — a brand-new, empty-by-construction room); for any peer-originated entry the server is authoritative and we never seed; **(3)** merging requires a DiskBuffer BASE — without one we never blind-merge. When a new peer has a genuinely different local version of a peer-owned file, the server wins and the local version is saved to a side `<path>.local-backup-<id>.md` file (which is excluded from sync, never propagates) plus a Notice — instead of being additively merged into the shared doc. The additive-merge-without-base path (the actual source of the garbled text) was removed.
+- **File-switch cross-contamination.** Switching from fileA to fileB could inject fileA's text into fileB: the reused editor still held fileA's content while we rebound it to fileB's Y.Text, and the merge mistook fileA's text for "edits to fileB". Fixed with a file-identity guard — before any reconcile/merge, the editor's current file (`editorInfoField`) must equal the session's path; on mismatch (mid-switch / stale) the reconcile and the editor→Y.Text forward path both abort and re-run cleanly once the editor settles on the right file.
+
+### Notes
+- Net effect: it is now impossible to push local content into a shared document unless we provably originated a brand-new file, and impossible to merge without a base. When in doubt the server wins and local content is backed up to a non-syncing side file — never blindly merged. The genuine offline-edit case (you edited a file you'd synced before, so a base exists) still does a correct 3-way merge.
+- Client-only, no protocol bump. Canvas/atomic-text sessions are unchanged (they ignore the new origin flag).
+
 ## 2.2.0 — 2026-05-28
 
 ### Added

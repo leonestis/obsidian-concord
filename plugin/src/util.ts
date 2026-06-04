@@ -61,31 +61,90 @@ export async function sha256Hex(bytes: Uint8Array | ArrayBuffer): Promise<string
     .join("");
 }
 
-// Wait until a HocuspocusProvider has completed its first sync with
-// the server (or until `timeoutMs` elapses). Resolves immediately if
-// already synced.
+// Outcome of waiting for a provider's first sync. CRITICAL for the
+// data-corruption fix (invariant I2): a "timeout" is NOT a sync. The
+// caller must do NOTHING destructive (no seed, no adopt, no merge) on a
+// timeout — the server may simply be slow and have content we haven't
+// received yet. Only a genuine "synced" means the server delivered its
+// state and ytext is trustworthy as "what the server has".
+export type ProviderSyncOutcome = "synced" | "timeout";
+
+// Wait until a HocuspocusProvider has completed its first TRUE sync with
+// the server (the `synced` event, or it was already synced), OR until
+// `timeoutMs` elapses. Returns WHICH happened so the caller can gate
+// destructive seed/merge logic on a real sync (I2). Resolves "synced"
+// immediately if already synced.
+//
+// Note: on timeout we do NOT unsubscribe — but callers that need the
+// eventual real sync should use onProviderSynced instead, which is the
+// event-driven path the bind/connect decision tree relies on.
 export function waitForProviderSync(
   provider: HocuspocusProvider,
   timeoutMs: number,
-): Promise<void> {
-  return new Promise<void>((resolve) => {
+): Promise<ProviderSyncOutcome> {
+  return new Promise<ProviderSyncOutcome>((resolve) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if ((provider as any).synced === true) {
-      resolve();
+      resolve("synced");
       return;
     }
     let done = false;
-    const finish = () => {
+    const onSynced = () => {
       if (done) return;
       done = true;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (provider as any).off?.("synced", finish);
-      resolve();
+      (provider as any).off?.("synced", onSynced);
+      resolve("synced");
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (provider as any).on("synced", finish);
-    setTimeout(finish, timeoutMs);
+    (provider as any).on("synced", onSynced);
+    setTimeout(() => {
+      if (done) return;
+      done = true;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (provider as any).off?.("synced", onSynced);
+      resolve("timeout");
+    }, timeoutMs);
   });
+}
+
+// Subscribe to the provider's FIRST genuine sync. Fires `cb` exactly
+// once — immediately (next microtask) if the provider is already
+// synced, otherwise on the first `synced` event. Returns an unsubscribe
+// function. This is the event-driven path the reconcile/seed/merge
+// logic uses (I2): the provider keeps trying to connect/sync in the
+// background, and when the server's state truly arrives, THEN we
+// reconcile — never on a mere timeout.
+export function onProviderSynced(
+  provider: HocuspocusProvider,
+  cb: () => void,
+): () => void {
+  let done = false;
+  const fire = () => {
+    if (done) return;
+    done = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (provider as any).off?.("synced", onSynced);
+    cb();
+  };
+  const onSynced = () => fire();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  if ((provider as any).synced === true) {
+    // Already synced — fire on the next microtask so the caller has
+    // finished wiring up (e.g. assigned fields) before cb runs.
+    queueMicrotask(fire);
+    return () => {
+      done = true;
+    };
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (provider as any).on("synced", onSynced);
+  return () => {
+    if (done) return;
+    done = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (provider as any).off?.("synced", onSynced);
+  };
 }
 
 // Strip ws:// or wss:// and replace with http:// or https://. Used to
@@ -131,4 +190,25 @@ export function mimeFromExtension(ext: string): string {
 export function parentFolder(path: string): string {
   const slash = path.lastIndexOf("/");
   return slash <= 0 ? "" : path.substring(0, slash);
+}
+
+// ── local-only conflict backups (invariant I4) ──────────────────────
+//
+// When a peer-originated file's local disk content differs from the
+// server's ytext on first true sync and we have no merge BASE, the
+// SERVER WINS: we adopt ytext and back up the local content to a
+// sibling file so nothing is lost. That backup is LOCAL ONLY — it must
+// never enter the manifest or sync to peers (classify() skips it).
+//
+// Name shape: `<path>.local-backup-<docId>.md`. The docId is a UUID, so
+// names never collide (no timestamp races) and a given file/docId pair
+// reuses a stable name (so repeated reconciles don't litter the vault).
+const LOCAL_BACKUP_INFIX = ".local-backup-";
+
+export function localBackupPath(path: string, docId: string): string {
+  return `${path}${LOCAL_BACKUP_INFIX}${docId}.md`;
+}
+
+export function isLocalBackupPath(path: string): boolean {
+  return path.includes(LOCAL_BACKUP_INFIX);
 }

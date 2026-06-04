@@ -45,6 +45,7 @@ import { AtomicTextSession } from "./atomic-text-session";
 import type {
   AnySession,
   SessionKind,
+  SessionOrigin,
   SessionState,
 } from "./types";
 import type { BoundMarkdownSession } from "./local-presence";
@@ -124,10 +125,19 @@ export class SessionManager {
   // from v1.x — see the long comment in that file for the full
   // analysis of why concurrent attach/detach must serialise through a
   // single state map.
+  // `origin` (invariant I3) defaults to "remote" — the SAFE default. Only
+  // ManifestSync.onLocalCreate passes "local", for a markdown file the
+  // user just created locally (so its server room is brand-new). Origin
+  // is only consulted for markdown ("file") sessions; canvas/text ignore
+  // it. If a concurrent attach for the same docId is already in flight,
+  // its origin wins (the in-flight promise is shared) — harmless because
+  // the only "local" caller is the unique local-create for a fresh docId,
+  // which has no competing attach to race.
   async attach(
     path: string,
     kind: SessionKind,
     docId: string,
+    origin: SessionOrigin = "remote",
   ): Promise<AnySession | null> {
     if (this.readOnly) {
       this.deps.debug(`[collab] attach refused (read-only): ${path}`);
@@ -149,7 +159,7 @@ export class SessionManager {
     for (let iter = 0; iter < 8; iter++) {
       const st = this.byPath.get(path);
       if (!st || st.kind === "detached") {
-        return await this.startAttach(path, kind, docId, socket);
+        return await this.startAttach(path, kind, docId, socket, origin);
       }
       if (st.kind === "bound") {
         if (st.docId === docId) return st.session;
@@ -196,12 +206,13 @@ export class SessionManager {
     kind: SessionKind,
     docId: string,
     socket: HocuspocusProviderWebsocket,
+    origin: SessionOrigin,
   ): Promise<AnySession | null> {
     const abort = new AbortController();
     // Build the work-promise FIRST, then publish it into state alongside
     // abort. Concurrent attach() callers for the same docId will await
     // this exact promise (see attach() loop) instead of spin-polling.
-    const promise = this.startAttachWork(path, kind, docId, socket, abort);
+    const promise = this.startAttachWork(path, kind, docId, socket, abort, origin);
     this.byPath.set(path, {
       kind: "attaching",
       docId,
@@ -219,6 +230,7 @@ export class SessionManager {
     docId: string,
     socket: HocuspocusProviderWebsocket,
     abort: AbortController,
+    origin: SessionOrigin,
   ): Promise<AnySession | null> {
     try {
       const baseOpts = {
@@ -234,7 +246,8 @@ export class SessionManager {
       };
       let session: AnySession;
       if (kind === "file") {
-        session = await TextSession.create(baseOpts);
+        // Only markdown sessions consult origin (I3). canvas/text ignore.
+        session = await TextSession.create({ ...baseOpts, origin });
       } else if (kind === "canvas") {
         session = new CanvasSession(baseOpts);
       } else {

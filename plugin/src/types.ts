@@ -55,6 +55,19 @@ export interface TrashEntry {
 // Kinds that map to a per-file Y.Doc room.
 export type SessionKind = "file" | "canvas" | "text";
 
+// Where a markdown session's manifest entry came from (invariant I3).
+//   "local"  — WE created this file locally AND added its manifest
+//              entry this run, so the server room is brand-new and
+//              empty BY CONSTRUCTION. Only this origin may seed local
+//              disk content INTO the shared ytext.
+//   "remote" — the manifest entry arrived from a peer (or pre-existed
+//              and we're re-attaching). The server room may already
+//              hold content that sync hasn't delivered yet, so we must
+//              NEVER seed local content into it. The server wins.
+// Defaults to "remote" everywhere except the explicit local-create
+// path — the safe default.
+export type SessionOrigin = "local" | "remote";
+
 // The session-manager state machine. Every transition is atomic.
 //   detached       — no session, no Y.Doc, no provider.
 //   attaching      — createSession in flight; abortable.
@@ -108,4 +121,4 @@ export type AnySession = BaseSession & Record<string, any>;
 // introduces v2 (UUID-keyed rooms, HTTP-stored binaries).
 export const PROTOCOL_VERSION = 2;
 
-export const PLUGIN_VERSION = "2.2.0";
+export const PLUGIN_VERSION = "2.2.1";
