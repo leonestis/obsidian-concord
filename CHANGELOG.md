@@ -2,6 +2,20 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.3.0 — 2026-05-28
+
+### Added
+- **Realtime canvas content sync (live-view bridge).** Cards, colours, text and structure on an OPEN canvas now sync between peers in real time. Until now canvas content synced only through disk — but an open Obsidian canvas view holds its state in memory and doesn't reload the `.canvas` file when it changes, so a peer's edits never appeared (and the open view would overwrite them on its next save). v2.3.0 bridges the live canvas view's internal API directly to the Y.Doc when the canvas is open:
+  - **Remote → live view:** a peer's change is applied straight into the open canvas (via the canvas's own `setData`/`importData` + `requestFrame`), so it shows immediately instead of only on reopen.
+  - **Local → Y:** local edits are captured the instant Obsidian decides to persist them (by wrapping the canvas's `requestSave`), not after the debounced disk write — with a 10 Hz `getData()` poll as automatic fallback if `requestSave` can't be wrapped on a given build.
+  - **Loop-safe:** Yjs transaction origins + an `applyingRemote` guard + content-equality short-circuits ensure remote-applies don't echo back and local-captures don't re-render over themselves.
+  - **Interaction-safe:** remote updates are deferred while you're actively dragging/selecting, so a peer's edit never yanks a card out from under your cursor.
+  - **Disk fallback preserved:** when the canvas is closed, the existing disk↔Y path keeps it current for closed peers and other plugins. Everything is feature-detected — if a canvas API method is missing on some Obsidian build, it falls back to the disk path and warns, never throws.
+
+### Notes
+- This uses Obsidian's undocumented internal canvas API (the same surface the cursor overlay already relies on). It's inherently more fragile to Obsidian updates than the public API; it's guarded defensively but needs real two-peer testing. The presence layer (cursors/selection) and all markdown paths are untouched.
+- Client-only, no protocol bump.
+
 ## 2.2.1 — 2026-05-28
 
 ### Fixed (data corruption — important)
