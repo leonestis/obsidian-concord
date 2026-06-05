@@ -352,6 +352,16 @@ class YSyncPluginValue {
     // events have consistent state.
     this.boundDocId = ctx.docId;
     this.boundYtext = ctx.ytext;
+    // Reset anti-thrash state for the new binding — a loop-stop / pending
+    // resync from the previous file must not bleed into this one.
+    if (this.parityResyncTimer) {
+      clearTimeout(this.parityResyncTimer);
+      this.parityResyncTimer = null;
+    }
+    this.divergenceLogged = false;
+    this.lastDivergedPair = null;
+    this.divergedPairCount = 0;
+    this.parityCycleStoppedFor = null;
 
     // Reconcile editor content with the new ytext content — gated by
     // the data-corruption invariants (I2 true-sync, I5 file-identity,
@@ -603,15 +613,54 @@ class YSyncPluginValue {
     // Programmatic doc changes with no userEvent — file-swap content
     // replacement, plugins setting the doc directly, our own adopts —
     // are NEVER forwarded.
+    // v2.3.2 (Bug report §E) — drag-drop image link.
+    //
+    // A standard CodeMirror/Obsidian drop dispatches with userEvent
+    // "input.drop", which `tr.isUserEvent("input")` already matches
+    // (isUserEvent is prefix-aware), so a dropped image link IS forwarded
+    // by the input branch below. The reported "drop no longer inserts"
+    // regression was the parity-thrash REVERTING the dropped link before
+    // it forwarded — fixed by §D's anti-thrash. This is the belt-and-
+    // suspenders: if a drop ever arrives WITHOUT a userEvent, still
+    // forward it IFF it is a small LOCALIZED insert — never a full-
+    // document replace (that's the file-swap shape we must NOT forward,
+    // or we re-open the v2.3.1 corruption hole). A drop is a tiny
+    // localized insert into an otherwise-unchanged doc; a file-swap
+    // replaces (nearly) the entire document.
+    const isFullDocReplace = (tr: (typeof update.transactions)[number]): boolean => {
+      // Sum the length of the old-doc ranges this transaction replaces.
+      // A file-swap replaces essentially the whole prior document; a
+      // localized edit/drop touches only a small span.
+      let replacedFrom = Number.POSITIVE_INFINITY;
+      let replacedTo = 0;
+      tr.changes.iterChanges((fromA, toA) => {
+        if (fromA < replacedFrom) replacedFrom = fromA;
+        if (toA > replacedTo) replacedTo = toA;
+      });
+      const oldLen = tr.startState.doc.length;
+      if (oldLen === 0) return false; // empty doc → any insert is localized
+      if (!Number.isFinite(replacedFrom)) return false; // no ranges (defensive)
+      const spanned = replacedTo - replacedFrom;
+      // Replacing ≥90% of the old document (measured by the outermost
+      // changed span) is a whole-doc swap, not a localized edit.
+      return spanned >= oldLen * 0.9;
+    };
+
     const isRealUserEdit = (tr: (typeof update.transactions)[number]): boolean => {
       if (tr.annotation(ySyncAnnotation)) return false; // our own adopt — echo
-      return (
+      if (
         tr.isUserEvent("input") ||
         tr.isUserEvent("delete") ||
         tr.isUserEvent("move") ||
         tr.isUserEvent("undo") ||
         tr.isUserEvent("redo")
-      );
+      ) {
+        return true;
+      }
+      // No recognized userEvent. Forward ONLY if it's a localized insert
+      // (drop fallback), never a full-document replace (file swap).
+      if (isFullDocReplace(tr)) return false;
+      return true;
     };
 
     let hasUserEdit = false;
@@ -653,34 +702,102 @@ class YSyncPluginValue {
   }
 
   // Defense-in-depth. After every editor cycle the editor's doc length
-  // MUST equal ytext.length. If they diverge — a stale delta, a
-  // misbehaving peer, a future bug in our forward path — we force-
-  // resync via a diff dispatch on the NEXT tick (can't dispatch from
-  // inside the update cycle, CodeMirror forbids re-entry).
+  // SHOULD equal ytext.length. If they diverge — a stale delta, a
+  // misbehaving peer, a future bug in our forward path — we force-resync
+  // the EDITOR to ytext (adopt ytext→editor ONLY; never editor→ytext).
+  //
+  // v2.3.2 ANTI-THRASH (Bug report §D). The production loop was:
+  //   parity broken → resync → external writer re-diverges → parity
+  //   broken → resync → … forever, eating user input (drag-drop link).
+  // Removing the competing disk writers for open files (TextSession gates
+  // above) should stop the divergence at the source. These two guards are
+  // belt-and-suspenders so a transient mid-update difference can never
+  // re-enter a resync storm:
+  //
+  //   1. DEBOUNCE — collapse bursts into a single resync that only fires
+  //      after ~250ms of NO further parity calls, so a transient diff
+  //      that self-heals on the next tick never triggers a dispatch.
+  //   2. LOOP-BREAKER — if we resync the SAME (editorLen, ytextLen) pair
+  //      more than MAX times inside a short window, something external is
+  //      still fighting us. Log an error and STOP resyncing this cycle —
+  //      better to leave a transient visual diff than to thrash and eat
+  //      user keystrokes. The cycle resets once parity holds (lengths
+  //      equal) or the diverged pair changes.
   private divergenceLogged = false;
+  private parityResyncTimer: ReturnType<typeof setTimeout> | null = null;
+  // Loop-breaker bookkeeping for the currently-diverged length pair.
+  private lastDivergedPair: string | null = null;
+  private divergedPairCount = 0;
+  private parityCycleStoppedFor: string | null = null;
+  private static readonly PARITY_DEBOUNCE_MS = 250;
+  private static readonly PARITY_MAX_RESYNCS = 5;
+
   private parityCheck(update: ViewUpdate): void {
     if (!this.boundYtext) return;
     const editorLen = update.state.doc.length;
     const ytextLen = this.boundYtext.length;
     if (editorLen === ytextLen) {
+      // In sync — reset all anti-thrash state.
       this.divergenceLogged = false;
+      this.lastDivergedPair = null;
+      this.divergedPairCount = 0;
+      this.parityCycleStoppedFor = null;
+      if (this.parityResyncTimer) {
+        clearTimeout(this.parityResyncTimer);
+        this.parityResyncTimer = null;
+      }
       return;
     }
+
+    const pair = `${editorLen}:${ytextLen}`;
+    // Loop-breaker: if we already gave up on this exact diverged pair,
+    // don't reschedule — leave the transient diff rather than thrash.
+    if (this.parityCycleStoppedFor === pair) return;
+
     if (!this.divergenceLogged) {
       console.warn(
         `[yedit] editor↔ytext parity broken: editor=${editorLen}, ytext=${ytextLen} — scheduling resync`,
       );
       this.divergenceLogged = true;
     }
+
     const view = update.view;
     const ytext = this.boundYtext;
-    setTimeout(() => {
+    // Debounce: restart the timer on every parity call so we only act
+    // once the divergence has been STABLE for PARITY_DEBOUNCE_MS.
+    if (this.parityResyncTimer) clearTimeout(this.parityResyncTimer);
+    this.parityResyncTimer = setTimeout(() => {
+      this.parityResyncTimer = null;
       if (!view.dom.isConnected) return;
       if (!ytext.doc) return; // ytext got destroyed in the meantime
       const editorStr = view.state.doc.toString();
       const ytextStr = ytext.toString();
-      if (editorStr === ytextStr) return;
+      if (editorStr === ytextStr) {
+        this.lastDivergedPair = null;
+        this.divergedPairCount = 0;
+        return;
+      }
+
+      // Loop-breaker accounting on the (re-read) live lengths.
+      const livePair = `${editorStr.length}:${ytextStr.length}`;
+      if (livePair === this.lastDivergedPair) {
+        this.divergedPairCount++;
+      } else {
+        this.lastDivergedPair = livePair;
+        this.divergedPairCount = 1;
+      }
+      if (this.divergedPairCount > YSyncPluginValue.PARITY_MAX_RESYNCS) {
+        this.parityCycleStoppedFor = livePair;
+        console.error(
+          `[yedit] parity resync loop detected for ${livePair} ` +
+            `(${this.divergedPairCount} attempts) — STOPPING resync to avoid ` +
+            `eating user input; an external writer is still diverging editor↔ytext`,
+        );
+        return;
+      }
+
       try {
+        // ADOPT-ONLY: editor is brought to ytext, never the reverse.
         const changes = bufferDiffToChanges(editorStr, ytextStr);
         if (changes.length === 0) return;
         view.dispatch({
@@ -693,7 +810,7 @@ class YSyncPluginValue {
       } catch (err) {
         console.error("[yedit] parity resync dispatch failed", err);
       }
-    }, 0);
+    }, YSyncPluginValue.PARITY_DEBOUNCE_MS);
   }
 
   destroy(): void {
@@ -712,6 +829,10 @@ class YSyncPluginValue {
       }
     }
     this.cancelSyncWait();
+    if (this.parityResyncTimer) {
+      clearTimeout(this.parityResyncTimer);
+      this.parityResyncTimer = null;
+    }
     this.observer = null;
     this.boundYtext = null;
     this.boundDocId = null;

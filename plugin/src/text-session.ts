@@ -63,6 +63,18 @@ export interface TextSessionOptions {
     delete: (p: string) => void;
     has: (p: string) => boolean;
   };
+  // v2.3.2 data-corruption fix. "Is this file currently OPEN in a live CM
+  // editor anywhere in the workspace?" (LiveViewManager.hasEditorFor).
+  // When a markdown file is open, Obsidian's OWN autosave persists the
+  // editor to disk and the yedit binding keeps the editor == ytext — so
+  // our ytext→disk write (disk-sync observer) and disk→ytext capture
+  // (applyDiskUpdate) would only FIGHT Obsidian's writer and feed the
+  // parity-thrash loop. Both are therefore SKIPPED while the file is open;
+  // they run only for CLOSED files (e.g. a Kanban-rendered note).
+  // Default-safe: if this callback is unavailable, treat the file as OPEN
+  // (skip the plugin disk write — safer to let Obsidian own disk than to
+  // fight it).
+  isOpenInEditor?: (path: string) => boolean;
   debug: (...args: unknown[]) => void;
 }
 
@@ -495,6 +507,19 @@ export class TextSession implements BaseSession {
     }
   }
 
+  // v2.3.2: true when this file is OPEN in a live CM editor anywhere.
+  // Default-safe — absent callback ⇒ treat as OPEN (skip plugin disk
+  // writes; let Obsidian's autosave own disk). See TextSessionOptions.
+  private isOpenInEditor(): boolean {
+    const cb = this.opts.isOpenInEditor;
+    if (!cb) return true;
+    try {
+      return cb(this.path);
+    } catch {
+      return true;
+    }
+  }
+
   private installDiskSync() {
     const observer = () => {
       if (this.destroyed) return;
@@ -511,6 +536,16 @@ export class TextSession implements BaseSession {
       this.diskWriteTimer = setTimeout(async () => {
         this.diskWriteTimer = null;
         if (this.destroyed) return;
+        // v2.3.2 CORE FIX — exactly ONE owner of disk↔ytext per file.
+        // If the file is OPEN in a CM editor, Obsidian's own autosave
+        // already writes the editor (which yedit keeps == ytext) to disk.
+        // Our write here would only fight Obsidian's editor→disk autosave
+        // and feed the parity-thrash / doubling loop. So SKIP for open
+        // files; we own ytext→disk only for CLOSED files (so a remote
+        // peer's edit to a file you don't have open still lands on disk
+        // for e.g. Kanban to read). Re-checked at write time (not just at
+        // observe time) because the file may have just been opened.
+        if (this.isOpenInEditor()) return;
         const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
         if (!(tfile instanceof TFile)) return;
         let content: string;
@@ -579,6 +614,15 @@ export class TextSession implements BaseSession {
     // pre-sync disk content; a genuine post-sync external modify reaches
     // here normally.
     if (!this.reconcileDone) return;
+    // v2.3.2 CORE FIX — disk→ytext capture must NOT run for OPEN files.
+    // For an open file the yedit binding is the SOLE editor↔ytext link
+    // and Obsidian's autosave owns editor→disk; reading disk back into
+    // ytext here would feed the feedback loop (writer #4 in the bug
+    // report). manifest-sync.onLocalModify already guards via
+    // hasEditorFor, but this is the robust belt-and-suspenders check at
+    // the actual mutation site. Default-safe (absent callback ⇒ OPEN ⇒
+    // skip). Capture runs only for CLOSED files (Kanban writing the .md).
+    if (this.isOpenInEditor()) return;
     const tfile = this.opts.app.vault.getAbstractFileByPath(this.path);
     if (!(tfile instanceof TFile)) return;
     let diskContent: string;

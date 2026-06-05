@@ -61,6 +61,16 @@ export interface SessionManagerDeps {
     delete: (p: string) => void;
     has: (p: string) => boolean;
   };
+  // v2.3.2 data-corruption fix: "is this markdown path currently OPEN in
+  // a live CodeMirror editor anywhere in the workspace?". Wired to
+  // LiveViewManager.hasEditorFor. Threaded into TextSession so its
+  // disk-sync observer can SKIP the ytext→disk write for open files (the
+  // editor binding + Obsidian's own autosave already own disk↔editor for
+  // them; our write only fights Obsidian's). Default-safe: when absent we
+  // treat the file as OPEN (skip the plugin write — safer to let Obsidian
+  // own disk than to fight it). Lazy resolution in main.ts because
+  // LiveViewManager is built after SessionManager.
+  isOpenInEditor?: (path: string) => boolean;
   debug: (...args: unknown[]) => void;
 }
 
@@ -242,6 +252,7 @@ export class SessionManager {
         path,
         user: this.deps.user(),
         remoteApplyPaths: this.deps.remoteApplyPaths,
+        isOpenInEditor: this.deps.isOpenInEditor,
         debug: this.deps.debug,
       };
       let session: AnySession;

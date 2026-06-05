@@ -139,6 +139,14 @@ export default class CollabPlugin extends Plugin {
         color: this.settings.userColor,
       }),
       remoteApplyPaths: this.remoteApplyPaths,
+      // v2.3.2 data-corruption fix. Lazy: liveViewManager is constructed
+      // AFTER sessionManager (below). Default to "open" (skip the plugin
+      // ytext→disk write) until it exists — the safe branch, since
+      // fighting Obsidian's own editor→disk autosave is the worse failure.
+      isOpenInEditor: (path) =>
+        this.liveViewManager
+          ? this.liveViewManager.hasEditorFor(path)
+          : true,
       debug: (...a) => this.debug(...a),
     });
 

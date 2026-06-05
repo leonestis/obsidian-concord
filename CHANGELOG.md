@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.3.2 — 2026-05-28
+
+### Fixed (critical data corruption)
+- **Multi-writer feedback loop corrupting markdown files** (typing "a" became "aaaa", spurious merge notices, files overwriting on switch, drag-drop links vanishing). After v2.2.0's whole-vault background sync, an OPEN markdown file had four independent writers of the same content: the editor binding (editor→ytext), the plugin's disk-sync (ytext→disk), Obsidian's own autosave (editor→disk), and the background capture (disk→ytext). For an open file the plugin's disk write fought Obsidian's autosave and the background capture read the result back into the CRDT — a feedback loop that doubled characters and triggered a parity-check resync storm (the logs showed `editor=2310, ytext=2306` resyncing forever). Fixed by making disk handling mutually exclusive on whether the file is open: **OPEN files** — only the editor binding touches the CRDT; the plugin's `ytext→disk` write and the background `disk→ytext` capture are both DISABLED (Obsidian's autosave owns disk). **CLOSED files** — both directions run, coordinated by the existing echo suppression (so a peer's edit still reaches a closed file's disk, and a Kanban-style external write to a closed file is still captured). The open/closed check scans all leaves for a live CodeMirror on the path.
+- **Parity-check resync storm.** The editor↔ytext length-parity safety net thrashed when external writers kept diverging the two. It's now debounced (only acts after the divergence is stable ~250 ms) and has a loop-breaker (after 5 resyncs of the same length pair it stops and logs, rather than eating user input). This also restores **drag-drop image links**, which the storm was reverting before they could sync.
+
+### Notes
+- Root cause was the interaction introduced by v2.2.0, not the eager sessions themselves (kept). Data safety prioritized: when uncertain whether a file is open, the plugin defers to Obsidian for disk and does not write — it can never fight Obsidian's autosave.
+- Client-only, no protocol bump. Canvas untouched.
+
 ## 2.3.1 — 2026-05-28
 
 ### Fixed (data integrity)
