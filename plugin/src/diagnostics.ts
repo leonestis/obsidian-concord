@@ -67,15 +67,15 @@ export class StatusBar {
     if (this.authFailed) {
       // Persistent, unmissable state — no progress overlay, it's moot
       // while sync is paused.
-      this.el.setText("⚠ collab auth failed — update token");
+      this.el.setText("⚠ Concord auth failed — update token");
       this.el.setAttr(
         "title",
-        `Server rejected the auth token. Open Collab settings and update your Auth token, or run “Reconnect to server”.\nServer: ${this.serverUrl}`,
+        `Server rejected the auth token. Open Concord settings and update your Auth token, or run “Reconnect to server”.\nServer: ${this.serverUrl}`,
       );
       return;
     }
     const dot = this.connected ? "🟢" : "🔴";
-    const label = this.connected ? "collab live" : "collab offline";
+    const label = this.connected ? "Concord live" : "Concord offline";
     const progress = this.progressLabel ? ` (${this.progressLabel})` : "";
     this.el.setText(`${dot} ${label}${progress}`);
     this.el.setAttr("title", `Server: ${this.serverUrl}`);

@@ -1243,7 +1243,7 @@ export class ManifestSync {
       const bytes = new Uint8Array(buf);
       if (buf.byteLength > LARGE_FILE_WARN_BYTES) {
         new Notice(
-          `Collab: ${file.path} is ${Math.floor(buf.byteLength / 1024 / 1024)} MB — sync may take a while`,
+          `Concord: ${file.path} is ${Math.floor(buf.byteLength / 1024 / 1024)} MB — sync may take a while`,
           5000,
         );
       }

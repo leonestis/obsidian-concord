@@ -411,7 +411,7 @@ export default class CollabPlugin extends Plugin {
       // back to creating a fresh split. Either way we end with a leaf.
       leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
       if (!leaf) {
-        new Notice("Collab: couldn't open the Collaborators panel");
+        new Notice("Concord: couldn't open the Collaborators panel");
         return;
       }
       await leaf.setViewState({ type: COLLABORATORS_VIEW_TYPE, active: true });
@@ -477,7 +477,7 @@ export default class CollabPlugin extends Plugin {
       // or a cryptic socket error — surface the missing setting once.
       log.info("socket", "connect skipped: Server URL is empty");
       new Notice(
-        "Collab: Server URL not configured. Open settings to enter your server's WebSocket URL.",
+        "Concord: Server URL not configured. Open settings to enter your server's WebSocket URL.",
         8000,
       );
       return;
@@ -521,7 +521,7 @@ export default class CollabPlugin extends Plugin {
       // binding will follow on the next file-open / bindEditorIfReady.
     } catch (err) {
       log.error("socket", "failed to open socket", err);
-      new Notice("Collab: failed to connect — see console");
+      new Notice("Concord: failed to connect — see console");
     }
   }
 
@@ -551,7 +551,7 @@ export default class CollabPlugin extends Plugin {
     // fine on top for immediacy, but the status bar carries the state.
     this.statusBar.setAuthFailed(true);
     new Notice(
-      "Collab: server rejected the auth token. Sync is paused — update your Auth token in settings (or run “Reconnect to server”) to resume.",
+      "Concord: server rejected the auth token. Sync is paused — update your Auth token in settings (or run “Reconnect to server”) to resume.",
       12_000,
     );
   }
@@ -594,7 +594,7 @@ export default class CollabPlugin extends Plugin {
     // fire one more event before unobserve takes effect.
     this.liveViewManager?.queueRefresh("reconnect");
     this.connect();
-    new Notice("Collab: reconnected");
+    new Notice("Concord: reconnected");
   }
 
   // ── trash ───────────────────────────────────────────────────────────
@@ -602,7 +602,7 @@ export default class CollabPlugin extends Plugin {
   private openTrashModal(): void {
     const trash = this.manifestSync.getTrash();
     if (!trash) {
-      new Notice("Collab: not connected — open trash after socket connects");
+      new Notice("Concord: not connected — open trash after socket connects");
       return;
     }
     new TrashModal(this.app, trash).open();
@@ -636,7 +636,7 @@ export default class CollabPlugin extends Plugin {
         "performWipeLocalCache: indexedDB.databases() unavailable (Firefox?)",
       );
       new Notice(
-        "Collab: cannot enumerate IndexedDB on this browser. Open DevTools → Application → IndexedDB and delete entries starting with " +
+        "Concord: cannot enumerate IndexedDB on this browser. Open DevTools → Application → IndexedDB and delete entries starting with " +
           prefix,
         15_000,
       );
@@ -649,7 +649,7 @@ export default class CollabPlugin extends Plugin {
       dbs = await idb.databases();
     } catch (err) {
       log.warn("plugin", "performWipeLocalCache: databases() threw", err);
-      new Notice("Collab: failed to enumerate IndexedDB — see console");
+      new Notice("Concord: failed to enumerate IndexedDB — see console");
       this.connect();
       return;
     }
@@ -687,7 +687,7 @@ export default class CollabPlugin extends Plugin {
       });
     }
     new Notice(
-      `Collab: wiped ${deleted}/${targets.length} local cache database(s). Reconnecting…`,
+      `Concord: wiped ${deleted}/${targets.length} local cache database(s). Reconnecting…`,
       8000,
     );
     log.info(
@@ -708,7 +708,7 @@ class CollabSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Collab settings" });
+    containerEl.createEl("h2", { text: "Concord settings" });
 
     new Setting(containerEl)
       .setName("Server URL")
@@ -817,7 +817,7 @@ class CollabSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        'Changes take effect on next reconnect. Use the command palette → "Collab: Reconnect to server" to apply now.',
+        'Changes take effect on next reconnect. Use the command palette → "Concord: Reconnect to server" to apply now.',
     });
   }
 }

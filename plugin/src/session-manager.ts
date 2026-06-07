@@ -97,7 +97,7 @@ export class SessionManager {
   setReadOnly(ro: boolean): void {
     if (ro && !this.readOnly) {
       new Notice(
-        "Collab: server is on a newer protocol. Plugin running read-only — please update.",
+        "Concord: server is on a newer protocol. Plugin running read-only — please update.",
         15_000,
       );
     }

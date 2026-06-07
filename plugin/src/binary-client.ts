@@ -110,7 +110,7 @@ export class BinaryClient {
     if (res.status === 404) return false;
     if (res.status === 401 || res.status === 403) {
       this.signalAuthError(
-        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+        `Concord blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
       );
       throw new BlobAuthError(`HEAD /blobs/${hash} → ${res.status}`);
     }
@@ -139,7 +139,7 @@ export class BinaryClient {
     if (res.status === 401 || res.status === 403) {
       const text = await res.text().catch(() => "");
       this.signalAuthError(
-        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+        `Concord blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
       );
       throw new BlobAuthError(`PUT /blobs/${hash} → ${res.status}: ${text}`);
     }
@@ -179,7 +179,7 @@ export class BinaryClient {
     if (res.status === 404) throw new BlobNotFoundError(`blob ${hash} not found`);
     if (res.status === 401 || res.status === 403) {
       this.signalAuthError(
-        `Collab blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
+        `Concord blob server rejected the auth token (${res.status}). Binary file sync is paused — open settings and refresh your Auth token, then reconnect.`,
       );
       throw new BlobAuthError(`GET /blobs/${hash} → ${res.status}`);
     }

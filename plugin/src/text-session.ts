@@ -459,7 +459,7 @@ export class TextSession implements BaseSession {
       );
       try {
         new Notice(
-          `Collab: ${this.path} had local changes that differ from the shared version. ` +
+          `Concord: ${this.path} had local changes that differ from the shared version. ` +
             `The shared version was kept; your local copy is saved as ${backupPath}.`,
           12_000,
         );

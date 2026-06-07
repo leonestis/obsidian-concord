@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.5.2 — 2026-06-08
+
+### Changed (rebrand)
+- User-facing labels now say **Concord**: the status-bar pill (`🟢 Concord live` / `🔴 Concord offline` / auth-failed), settings heading, and all `Notice` messages. (Internal code symbols, command ids and CSS classes are unchanged.)
+
 ## 2.5.1 — 2026-06-07
 
 ### Changed (internal)
