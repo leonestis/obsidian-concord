@@ -107,6 +107,13 @@ export class CanvasSession implements BaseSession {
   private layoutOff: (() => void) | null = null;
   // Poll fallback handle (only used if requestSave isn't patchable).
   private capturePollHandle = 0;
+  // Drag-capture handle: while the mouse button is held over the canvas,
+  // Obsidian often defers requestSave until the drag ENDS, so peers see a
+  // card teleport from start→end instead of moving. This light poll
+  // captures intermediate positions DURING the drag. It only does work
+  // while a button is down (CanvasSession.mouseDown) and the canonical
+  // gate in captureFromLiveView drops no-op frames, so idle cost is ~zero.
+  private dragCaptureHandle = 0;
 
   constructor(private readonly opts: CanvasSessionOptions) {
     this.docId = opts.docId;
@@ -355,6 +362,16 @@ export class CanvasSession implements BaseSession {
       );
     }
 
+    // Drag-capture poll: catch in-progress node moves that Obsidian only
+    // persists (requestSave) on drop. Gated on mouseDown so it's idle when
+    // nothing is happening; captureFromLiveView's canonical gate makes
+    // repeat frames at the same position free.
+    this.dragCaptureHandle = window.setInterval(() => {
+      if (this.applyingRemote) return;
+      if (!CanvasSession.mouseDown) return;
+      this.captureFromLiveView();
+    }, 120);
+
     // Seed: ensure the open view reflects current Y state immediately on
     // attach (e.g. canvas opened after a peer already edited it). This is
     // a Y→view push, guarded by applyingRemote so it doesn't capture-loop.
@@ -378,6 +395,10 @@ export class CanvasSession implements BaseSession {
       window.clearInterval(this.capturePollHandle);
       this.capturePollHandle = 0;
     }
+    if (this.dragCaptureHandle) {
+      window.clearInterval(this.dragCaptureHandle);
+      this.dragCaptureHandle = 0;
+    }
     this.liveCanvas = null;
     this.liveView = null;
     this.lastAppliedToView = "";
@@ -396,10 +417,13 @@ export class CanvasSession implements BaseSession {
     }
     if (!data || typeof data !== "object") return;
 
-    const serialized = JSON.stringify(this.normalizeForCompare(data));
+    const serialized = this.canonicalize(data);
     // Nothing changed since we last saw the view → skip (also covers the
     // requestSave that fires right after our own applyToLiveView setData,
-    // since that path sets lastAppliedToView to the same content).
+    // since that path sets lastAppliedToView to the same content). The
+    // canonical form means a cosmetic-only diff (key order / sub-pixel
+    // float) is treated as "no change" and never re-enters Y — this is
+    // what breaks the perpetual disk-write loop.
     if (serialized === this.lastAppliedToView) return;
     this.lastAppliedToView = serialized;
 
@@ -416,8 +440,9 @@ export class CanvasSession implements BaseSession {
     if (!canvas) return;
 
     // Skip if the view already holds this exact content (avoids needless
-    // re-render and breaks any residual echo).
-    const normalized = JSON.stringify(this.normalizeForCompare(json));
+    // re-render and breaks any residual echo). Canonical comparison so a
+    // cosmetic-only diff doesn't force a redundant setData.
+    const normalized = this.canonicalize(json);
     if (normalized === this.lastAppliedToView) return;
 
     // Interaction guard: if the local user is mid-interaction (something
@@ -498,28 +523,60 @@ export class CanvasSession implements BaseSession {
   private static installMouseTracker(): void {
     if (CanvasSession.mouseTrackerInstalled) return;
     CanvasSession.mouseTrackerInstalled = true;
+    // Pointer events fire for BOTH mouse and touch, so the interaction
+    // guard + drag-capture poll work on desktop and mobile alike.
     window.addEventListener(
-      "mousedown",
+      "pointerdown",
       (e) => {
-        if ((e as MouseEvent).button === 0) CanvasSession.mouseDown = true;
+        if ((e as PointerEvent).button === 0) CanvasSession.mouseDown = true;
       },
       true,
     );
-    window.addEventListener(
-      "mouseup",
-      () => {
-        CanvasSession.mouseDown = false;
-      },
-      true,
-    );
+    const clear = () => {
+      CanvasSession.mouseDown = false;
+    };
+    window.addEventListener("pointerup", clear, true);
+    window.addEventListener("pointercancel", clear, true);
   }
 
-  // Strip volatile/derived fields that don't affect logical canvas content
-  // before comparing getData() output against buildJson() output, so the
-  // two never ping-pong over cosmetic differences. Currently a pass-through
-  // with stable key ordering via JSON; kept as a seam for future tuning.
-  private normalizeForCompare(json: CanvasJson): CanvasJson {
-    return json;
+  // Canonical, comparison-only serialization. Two peers that hold the
+  // SAME logical canvas state must produce the SAME string here, even if
+  // their canvas.getData() differs cosmetically — otherwise the
+  // capture→Y→setData→getData→capture cycle never settles and the
+  // ".canvas" file ping-pongs forever (the 166↔167-byte loop seen in the
+  // logs). Two cosmetic sources of drift are neutralized:
+  //   1. Object KEY ORDER — getData() on device A and a setData round-trip
+  //      on device B can emit the same fields in a different order.
+  //   2. Sub-pixel FLOAT drift in node geometry (x/y/width/height) — a
+  //      drag/snap can leave 100 vs 100.0000001; rounding to whole pixels
+  //      (canvas geometry is integer-grained in practice) erases it.
+  // This is used ONLY for the change-detection gates in captureFromLiveView
+  // and applyToLiveView. The values actually written into Y / to disk are
+  // never rounded or reordered — only the equality test is canonicalized.
+  private static readonly GEOM_KEYS = new Set(["x", "y", "width", "height"]);
+  private canonicalize(value: unknown, key?: string): string {
+    if (value === null || typeof value !== "object") {
+      if (
+        typeof value === "number" &&
+        key !== undefined &&
+        CanvasSession.GEOM_KEYS.has(key)
+      ) {
+        return JSON.stringify(Math.round(value));
+      }
+      return JSON.stringify(value === undefined ? null : value);
+    }
+    if (Array.isArray(value)) {
+      return "[" + value.map((v) => this.canonicalize(v)).join(",") + "]";
+    }
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    return (
+      "{" +
+      keys
+        .map((k) => JSON.stringify(k) + ":" + this.canonicalize(obj[k], k))
+        .join(",") +
+      "}"
+    );
   }
 
   // Rename hook — re-attach the canvas presence overlay against the

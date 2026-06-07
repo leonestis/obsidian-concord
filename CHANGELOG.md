@@ -2,6 +2,17 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.4.1 — 2026-06-07
+
+### Fixed (canvas)
+- **Canvas cards sometimes didn't move for peers / the `.canvas` file wrote itself in a loop.** Two devices with the same board open could serialize the same logical state to *cosmetically* different JSON (different object key order, or sub-pixel float drift like `100` vs `100.0000001`). The change-detection gate compared raw strings, so each device kept seeing the other's write as "a change", re-captured it, and re-broadcast — a `getData → Y → setData → getData` loop that showed up as endless `canvas → disk` writes bouncing between 166↔167 bytes and made card moves stick or snap back. The gate now compares a **canonical** form (recursively sorted keys + node geometry rounded to whole pixels). The values written into Y / to disk are unchanged — only the equality test is canonicalized — so the loop dies without altering real content. (canvas-session.ts)
+- **Card moves now sync *during* a drag, not only on drop.** Obsidian often defers its save until a drag ends, so peers saw a card teleport from start→end. A light capture poll (gated on pointer-down, ~free when idle thanks to the canonical gate) now pushes intermediate positions, so movement looks continuous.
+- **Canvas presence (cursors, selections, drag preview) on mobile.** The presence layer listened only to `mouse*` events, which don't fire for touch — so on phones/tablets cursors were dead or mis-placed. Switched to **Pointer Events** (fire for both mouse and touch; `PointerEvent` extends `MouseEvent`, so capture + `posFromEvt` are unchanged). Desktop behaviour is identical.
+- **No more "cursor in the wrong place".** When a peer publishes world-space coordinates but the receiver can't derive its world→screen transform for that frame, the cursor is now **skipped** instead of being drawn at raw world values (which flung it far off-screen / to a wrong spot) — matching how selections and drag ghosts already behaved.
+
+### Notes
+- Client-only, no protocol bump. Canvas content sync semantics unchanged; only change-detection and input-event plumbing were touched.
+
 ## 2.4.0 — 2026-06-07
 
 ### Added

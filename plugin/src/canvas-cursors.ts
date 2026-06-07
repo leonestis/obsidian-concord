@@ -237,8 +237,13 @@ function attachToLeafIfCanvas(
   const onLeave = () => {
     publishCursor(null);
   };
-  wrapper.addEventListener("mousemove", onMove);
-  wrapper.addEventListener("mouseleave", onLeave);
+  // Pointer events (not mouse) so this fires for touch on mobile too —
+  // mouse* events don't fire for touch input, which is why canvas
+  // presence (cursors / selection / drag preview) was dead or misp
+  // -positioned on mobile. PointerEvent extends MouseEvent, so the
+  // handlers and posFromEvt calls are unchanged.
+  wrapper.addEventListener("pointermove", onMove);
+  wrapper.addEventListener("pointerleave", onLeave);
 
   // ─── Mouse button state ───────────────────────────────────────
   let pendingMarqueeEnd: { x: number; y: number } | null = null;
@@ -274,10 +279,12 @@ function attachToLeafIfCanvas(
     lastDragSnapshot = {};
     setAction(overNode ? "hover" : "idle");
   };
-  wrapper.addEventListener("mousedown", onDown);
-  // Listen on window for mouseup — pointer often releases outside
-  // the wrapper after a drag flick.
-  window.addEventListener("mouseup", onUp);
+  wrapper.addEventListener("pointerdown", onDown);
+  // Listen on window for pointerup — pointer often releases outside
+  // the wrapper after a drag flick. pointercancel covers touch being
+  // interrupted (e.g. the OS steals the gesture).
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
 
   // ─── Marquee publish loop ─────────────────────────────────────
   const marqueePoll = window.setInterval(() => {
@@ -364,10 +371,11 @@ function attachToLeafIfCanvas(
   const teardown = () => {
     if (torn) return;
     torn = true;
-    wrapper.removeEventListener("mousemove", onMove);
-    wrapper.removeEventListener("mouseleave", onLeave);
-    wrapper.removeEventListener("mousedown", onDown);
-    window.removeEventListener("mouseup", onUp);
+    wrapper.removeEventListener("pointermove", onMove);
+    wrapper.removeEventListener("pointerleave", onLeave);
+    wrapper.removeEventListener("pointerdown", onDown);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
     window.clearInterval(cursorFlush);
     window.clearInterval(selectionPoll);
     window.clearInterval(dragPoll);
@@ -789,11 +797,23 @@ function renderRemote(
       // anchored to its world position with no crawl.
       let screenX: number;
       let screenY: number;
-      if (st.mode === "world" && xform) {
+      if (st.mode === "world") {
+        if (!xform) {
+          // World-space coords but we couldn't derive this frame's
+          // world→screen transform (e.g. the probe failed). Rendering at
+          // raw world values would fling the cursor far off-screen / to a
+          // wrong spot — the exact "cursor in the wrong place" symptom.
+          // Skip drawing it this frame; the post-loop GC removes any stale
+          // node since we never add this client to seenCursor. Selections,
+          // drag ghosts and marquee already skip on `!xform` the same way.
+          return;
+        }
         const p = worldToScreen(xform, st.cx, st.cy);
         screenX = p.x;
         screenY = p.y;
       } else {
+        // screen-mode peer (a build without posFromEvt): raw wrapper-local
+        // screen coords are the best signal we have.
         screenX = st.cx;
         screenY = st.cy;
       }
