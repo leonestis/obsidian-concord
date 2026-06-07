@@ -43,7 +43,10 @@ import {
   colorFromName,
   deriveBlobUrl,
   randomName,
+  uuid,
 } from "./util";
+import { CollaboratorsView, COLLABORATORS_VIEW_TYPE } from "./collaborators-view";
+import { PresenceController } from "./presence-controller";
 
 interface CollabSettings {
   serverUrl: string;
@@ -57,6 +60,10 @@ interface CollabSettings {
   // Off by default — those lines contain the user's notes. Errors,
   // warnings and lifecycle events are always logged.
   debugLogging: boolean;
+  // Stable per-user id for the Collaborators presence roster. Generated
+  // once on first load and persisted so renames / color changes don't
+  // create duplicate offline roster rows. Not a security identifier.
+  presenceId: string;
 }
 
 const DEFAULT_SETTINGS: CollabSettings = {
@@ -67,6 +74,7 @@ const DEFAULT_SETTINGS: CollabSettings = {
   userColor: "",
   autoConnect: true,
   debugLogging: false,
+  presenceId: "",
 };
 
 export default class CollabPlugin extends Plugin {
@@ -90,6 +98,7 @@ export default class CollabPlugin extends Plugin {
   private sessionManager!: SessionManager;
   private presence!: LocalPresenceController;
   private liveViewManager!: LiveViewManager;
+  private presenceController: PresenceController | null = null;
   private binaryClient: BinaryClient | null = null;
 
   // Refcounted suppression — see the long-form comment in 0.9.x main.ts.
@@ -188,6 +197,28 @@ export default class CollabPlugin extends Plugin {
       presence: this.presence,
     });
 
+    // Collaborators presence panel (NEW, isolated feature). Reads the
+    // manifest awareness + roster only; never touches content sync. Safe
+    // to construct here — start() is deferred to connect() (manifest must
+    // be live first).
+    this.presenceController = new PresenceController({
+      app: this.app,
+      manifestSync: this.manifestSync,
+      presenceId: () => this.settings.presenceId,
+      user: () => ({
+        name: this.settings.userName,
+        color: this.settings.userColor,
+      }),
+    });
+
+    this.registerView(
+      COLLABORATORS_VIEW_TYPE,
+      (leaf) => new CollaboratorsView(leaf, () => this.presenceController),
+    );
+    this.addRibbonIcon("users", "Collaborators", () =>
+      void this.revealCollaboratorsView(),
+    );
+
     // Install the global editor extension. Applied to every CodeMirror
     // editor Obsidian opens, including markdown views opened later in
     // the session. The extension is stable across file switches — the
@@ -224,6 +255,11 @@ export default class CollabPlugin extends Plugin {
       id: "collab-wipe-local-cache",
       name: "Wipe local cache (IndexedDB)",
       callback: () => this.openWipeCacheModal(),
+    });
+    this.addCommand({
+      id: "collab-show-collaborators",
+      name: "Show collaborators",
+      callback: () => void this.revealCollaboratorsView(),
     });
 
     // v2.0.0: LiveViewManager subscribes to workspace 'file-open' /
@@ -273,6 +309,15 @@ export default class CollabPlugin extends Plugin {
     // (which removes our awareness state from every room so peers
     // see us go offline immediately, not after a 30s heartbeat).
     try {
+      // Tear down the Collaborators panel data layer first so it clears
+      // our published presence (peers see us go offline promptly) and
+      // detaches its awareness/roster listeners before the manifest stops.
+      this.presenceController?.destroy();
+      this.presenceController = null;
+    } catch (err) {
+      log.warn("plugin", "presenceController.destroy failed during unload", err);
+    }
+    try {
       this.liveViewManager?.destroy();
     } catch (err) {
       log.warn("plugin", "liveViewManager.destroy failed during unload", err);
@@ -297,6 +342,10 @@ export default class CollabPlugin extends Plugin {
     if (!this.settings.userName) this.settings.userName = randomName();
     if (!this.settings.userColor) {
       this.settings.userColor = colorFromName(this.settings.userName);
+    }
+    // Stable presence id for the Collaborators roster — generate once.
+    if (!this.settings.presenceId) {
+      this.settings.presenceId = uuid();
     }
     // Seed the token tracker BEFORE the saveSettings() below, so the
     // first save (during onload, when we haven't even connected yet)
@@ -326,6 +375,9 @@ export default class CollabPlugin extends Plugin {
       name: this.settings.userName,
       color: this.settings.userColor,
     });
+    // Republish presence + roster so the Collaborators panel reflects the
+    // new name/color immediately (no reconnect required).
+    this.presenceController?.onUserChanged();
     // FIX A recovery — if the user edited the auth token while we were
     // in the auth-failed state, treat it as "I fixed it": clear the
     // gate and rebuild the socket. We guard on authFailed so a token
@@ -343,6 +395,20 @@ export default class CollabPlugin extends Plugin {
 
   private debug(...args: unknown[]): void {
     if (this.settings?.debugLogging) console.log(...args);
+  }
+
+  // Reveal the Collaborators panel in the right sidebar, reusing an
+  // existing leaf if one is already open.
+  private async revealCollaboratorsView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(COLLABORATORS_VIEW_TYPE)[0];
+    if (!leaf) {
+      const right = workspace.getRightLeaf(false);
+      if (!right) return;
+      await right.setViewState({ type: COLLABORATORS_VIEW_TYPE, active: true });
+      leaf = right;
+    }
+    workspace.revealLeaf(leaf);
   }
 
   private blobBaseUrl(): string {
@@ -438,6 +504,10 @@ export default class CollabPlugin extends Plugin {
         log.info("socket", "close", event);
       });
       this.manifestSync.start();
+      // Bind the Collaborators panel's data layer now that the manifest
+      // room (its awareness + roster) is live. Idempotent + self-retrying
+      // if the manifest isn't ready yet.
+      this.presenceController?.start();
       // If a markdown file is already open, bind it lazily — manifest
       // sync's reconcile will create the session and the editor
       // binding will follow on the next file-open / bindEditorIfReady.

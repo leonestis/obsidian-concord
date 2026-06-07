@@ -225,3 +225,138 @@
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* ── Collaborators presence panel ─────────────────────────────────── */
+.collab-collaborators {
+  padding: 4px 0;
+}
+
+.collab-collaborators-empty {
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.collab-collaborators-section {
+  padding: 10px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.collab-collaborators-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  position: relative;
+}
+
+.collab-collaborators-row.is-clickable {
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.collab-collaborators-row.is-clickable:hover {
+  background: var(--background-modifier-hover);
+}
+
+.collab-collaborators-avatar {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.collab-collaborators-avatar.is-offline {
+  filter: grayscale(0.7);
+  opacity: 0.6;
+}
+
+.collab-collaborators-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.collab-collaborators-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collab-collaborators-you {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.collab-collaborators-plat {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.collab-collaborators-plat svg {
+  width: 13px;
+  height: 13px;
+}
+
+.collab-collaborators-sub {
+  font-size: 11px;
+  color: var(--text-accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collab-collaborators-sub.is-muted {
+  color: var(--text-muted);
+}
+
+.collab-collaborators-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.collab-collaborators-fileicon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.collab-collaborators-fileicon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.collab-collaborators-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.collab-collaborators-dot.is-online {
+  background: var(--color-green, #43a047);
+}
+
+.collab-collaborators-dot.is-offline {
+  background: var(--text-faint);
+}

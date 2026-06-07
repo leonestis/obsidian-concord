@@ -21,7 +21,8 @@ type Sub =
   | "blob"
   | "socket"
   | "trash"
-  | "diag";
+  | "diag"
+  | "presence";
 
 interface SubStyle {
   bg: string;
@@ -37,6 +38,7 @@ const STYLES: Record<Sub, SubStyle> = {
   socket:  { bg: "#00acc1", fg: "#fff" }, // cyan
   trash:   { bg: "#5d4037", fg: "#fff" }, // brown
   diag:    { bg: "#546e7a", fg: "#fff" }, // blue-gray
+  presence:{ bg: "#d81b60", fg: "#fff" }, // pink
 };
 
 const RESET = "color: inherit; background: inherit; font-weight: normal";

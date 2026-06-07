@@ -32,6 +32,7 @@ import {
 import { HocuspocusProvider, type HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
+import type { Awareness } from "y-protocols/awareness";
 
 import { log } from "./logger";
 import { DiskBuffer } from "./disk-buffer";
@@ -40,6 +41,7 @@ import {
   PROTOCOL_VERSION,
   type EntryKind,
   type ManifestEntry,
+  type RosterEntry,
   type SessionKind,
   type TrashEntry,
 } from "./types";
@@ -117,6 +119,10 @@ export class ManifestSync {
   private map: Y.Map<ManifestEntry> | null = null;
   private trash: Y.Map<TrashEntry> | null = null;
   private meta: Y.Map<unknown> | null = null;
+  // Presence roster — a NEW Y.Map, independent of files/trash/meta.
+  // Read/written ONLY by the Collaborators panel via the accessors
+  // below. Adding it does not touch any content-sync observer or path.
+  private roster: Y.Map<RosterEntry> | null = null;
   private provider: HocuspocusProvider | null = null;
   private persistence: IndexeddbPersistence | null = null;
   private mapObserver:
@@ -189,6 +195,65 @@ export class ManifestSync {
   getTrash(): Y.Map<TrashEntry> | null {
     return this.trash;
   }
+
+  // ── presence (Collaborators panel) ──────────────────────────────────
+  //
+  // Clean accessors so the panel never reaches into our privates. All
+  // three return null before start()/after stop(). The panel publishes
+  // local presence into the awareness and reads peers from it + the
+  // roster; it must never touch the files/trash/meta content maps.
+
+  // The manifest provider's awareness — the always-on GLOBAL presence
+  // channel. The panel writes the local presence field here and listens
+  // for `change` to learn who's online. This is a SEPARATE channel from
+  // the doc; writing the local awareness state cannot affect content.
+  getPresenceAwareness(): Awareness | null {
+    return this.provider?.awareness ?? null;
+  }
+
+  // The roster Y.Map (offline last-seen tracking). Separate from
+  // files/trash/meta — safe to read/observe/upsert without touching
+  // content sync.
+  getRoster(): Y.Map<RosterEntry> | null {
+    return this.roster;
+  }
+
+  // The shared Y.Doc, exposed ONLY so the panel can wrap a roster upsert
+  // in a transaction (this.ydoc.transact). Callers MUST write to the
+  // roster map only — never files/trash/meta.
+  getDoc(): Y.Doc | null {
+    return this.ydoc;
+  }
+
+  // Upsert the local user's roster entry in one transaction. Called by
+  // the panel on connect and whenever activeFile changes. Touches ONLY
+  // the roster map. lastSeen uses Date.now() (presence, not the
+  // deterministic-content path, so wall-clock is fine).
+  upsertRoster(presenceId: string, name: string, color: string): void {
+    if (!this.roster || !this.ydoc) return;
+    this.ydoc.transact(() => {
+      this.roster!.set(presenceId, { name, color, lastSeen: Date.now() });
+    });
+  }
+
+  // Purge roster entries older than `maxAgeMs` (default 30 days) so the
+  // roster can't grow unbounded as people come and go. Touches ONLY the
+  // roster map. Called once after the manifest first syncs.
+  purgeOldRoster(maxAgeMs: number = 30 * 24 * 60 * 60 * 1000): void {
+    if (!this.roster || !this.ydoc) return;
+    const cutoff = Date.now() - maxAgeMs;
+    const stale: string[] = [];
+    for (const [id, entry] of this.roster.entries()) {
+      if (typeof entry.lastSeen !== "number" || entry.lastSeen < cutoff) {
+        stale.push(id);
+      }
+    }
+    if (stale.length === 0) return;
+    this.ydoc.transact(() => {
+      for (const id of stale) this.roster!.delete(id);
+    });
+    log.info("presence", `purged ${stale.length} stale roster entries`);
+  }
   // Lookup helper for main.ts's file-open handler: returns the manifest
   // entry for a path, or null if the manifest isn't loaded yet or has
   // no entry. Used to drive auto-attach on file-open for markdown files
@@ -206,6 +271,8 @@ export class ManifestSync {
     this.map = this.ydoc.getMap<ManifestEntry>("files");
     this.trash = this.ydoc.getMap<TrashEntry>("trash");
     this.meta = this.ydoc.getMap<unknown>("meta");
+    // Presence roster — separate Y.Map, never read by content sync.
+    this.roster = this.ydoc.getMap<RosterEntry>("roster");
 
     this.provider = new HocuspocusProvider({
       websocketProvider: socket,
@@ -239,6 +306,9 @@ export class ManifestSync {
         log.info("sync", `stamped manifest protocolVersion=${PROTOCOL_VERSION}`);
       }
       void this.runReconcile();
+      // Presence roster housekeeping (Collaborators panel) — bound its
+      // growth on every sync. Roster map only; never touches content.
+      this.purgeOldRoster();
       // FIX B — a (re)sync is the best moment to retry stranded blobs:
       // the peer's PUT very likely completed while we were disconnected.
       void this.sweepPendingDownloads("synced");
@@ -302,6 +372,7 @@ export class ManifestSync {
     this.map = null;
     this.trash = null;
     this.meta = null;
+    this.roster = null;
   }
 
   // ── classification ─────────────────────────────────────────────────

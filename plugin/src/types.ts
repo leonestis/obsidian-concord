@@ -52,6 +52,22 @@ export interface TrashEntry {
   hash?: string;
 }
 
+// ── presence roster (Collaborators panel) ───────────────────────────
+//
+// A NEW Y.Map in the manifest doc, keyed by a stable per-user
+// `presenceId` → RosterEntry. Used ONLY by the Collaborators presence
+// sidebar to render offline peers with a "last seen" time. Completely
+// independent of the files/trash/meta content maps — adding it cannot
+// perturb content sync. Live presence (who's online + their active
+// file + cursor) rides the manifest provider's AWARENESS, not this map;
+// the roster only persists identity + lastSeen so an offline peer still
+// shows up after they disconnect.
+export interface RosterEntry {
+  name: string;
+  color: string;
+  lastSeen: number;
+}
+
 // Kinds that map to a per-file Y.Doc room.
 export type SessionKind = "file" | "canvas" | "text";
 
@@ -121,4 +137,4 @@ export type AnySession = BaseSession & Record<string, any>;
 // introduces v2 (UUID-keyed rooms, HTTP-stored binaries).
 export const PROTOCOL_VERSION = 2;
 
-export const PLUGIN_VERSION = "2.3.2";
+export const PLUGIN_VERSION = "2.4.0";

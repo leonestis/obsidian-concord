@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.4.0 — 2026-06-07
+
+### Added
+- **Collaborators presence panel.** A new right-sidebar view (ribbon icon "users", command "Show collaborators") shows who's collaborating in real time: an **Online** section listing each peer with their avatar, name, device glyph(s) (desktop/mobile), and the file they're currently in — **click a row to jump straight to that file** — plus an **Offline** section (a roster with a relative "last seen" time) so you can see who's part of the vault even when they're away. Peers connected from two devices collapse into one row (platforms unioned).
+- The panel rides the always-on `vault:manifest` room's **awareness** for live presence and a new `roster` Y.Map (manifest doc) for offline last-seen. A stable per-user `presenceId` (uuid, persisted in `data.json`) keeps a renamed user from showing as a duplicate. Name/color changes in settings republish immediately — no reconnect needed.
+
+### Notes
+- **Fully isolated, additive feature.** The presence layer is read-mostly and touches ONLY the manifest awareness + the new roster map — it never reads or writes the content-sync machinery (files/trash/meta maps, sessions, ytext, canvas). Content sync from 2.3.2 is byte-for-byte unchanged.
+- Client-only, no protocol bump. The roster map is a new key in the existing manifest doc; older clients simply ignore it.
+
 ## 2.3.2 — 2026-05-28
 
 ### Fixed (critical data corruption)
