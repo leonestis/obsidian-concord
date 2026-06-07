@@ -1,8 +1,8 @@
 {
-  "name": "@obsidian-collab/server",
-  "version": "1.0.0",
+  "name": "concord-server",
+  "version": "2.5.0",
   "private": true,
-  "description": "Hocuspocus-based Yjs collaboration server for obsidian-collab",
+  "description": "Hocuspocus-based Yjs collaboration server for Concord",
   "license": "AGPL-3.0-only",
   "type": "module",
   "main": "src/index.ts",

@@ -1,4 +1,4 @@
-# Self-hosting the obsidian-collab server
+# Self-hosting the concord server
 
 The server is a small Node.js (Hocuspocus + SQLite) process. The fastest
 way to stand it up is the one-command installer for **Debian/Ubuntu**.
@@ -8,7 +8,7 @@ way to stand it up is the one-command installer for **Debian/Ubuntu**.
 On a fresh VPS, as root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-collab/main/server/scripts/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-concord/main/server/scripts/install.sh)
 ```
 
 It will ask for:
@@ -28,41 +28,41 @@ Non-interactive (e.g. in your own provisioning):
 
 ```bash
 DOMAIN=collab.example.com PORT=1234 \
-  bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-collab/main/server/scripts/install.sh)
+  bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-concord/main/server/scripts/install.sh)
 ```
 
 ### What it sets up
 
 | Thing | Location |
 |---|---|
-| Code | `/opt/obsidian-collab` |
-| Config + JWT secret | `/etc/obsidian-collab/env` (root-only) |
-| Data (SQLite + blobs) | `/var/lib/obsidian-collab` |
-| Service | systemd unit `obsidian-collab` (auto-start, auto-restart) |
-| Runs as | dedicated `obsidian-collab` system user |
+| Code | `/opt/concord` |
+| Config + JWT secret | `/etc/concord/env` (root-only) |
+| Data (SQLite + blobs) | `/var/lib/concord` |
+| Service | systemd unit `concord` (auto-start, auto-restart) |
+| Runs as | dedicated `concord` system user |
 | HTTPS | Caddy (if a domain was given) |
 
 ## Managing the server
 
-The installer adds an `obsidian-collab` command. Run it with no arguments
+The installer adds an `concord` command. Run it with no arguments
 for a menu, or use subcommands (most need `sudo`):
 
 ```bash
-sudo obsidian-collab               # interactive menu
-sudo obsidian-collab status
-sudo obsidian-collab restart
-sudo obsidian-collab logs          # live logs (Ctrl-C to exit)
-sudo obsidian-collab token alex    # mint a token for a friend (365d)
-sudo obsidian-collab token bob 90d # custom expiry
-sudo obsidian-collab url           # show the Server URL to paste
-sudo obsidian-collab update        # pull latest + restart
-sudo obsidian-collab uninstall     # remove (asks whether to keep data)
+sudo concord               # interactive menu
+sudo concord status
+sudo concord restart
+sudo concord logs          # live logs (Ctrl-C to exit)
+sudo concord token alex    # mint a token for a friend (365d)
+sudo concord token bob 90d # custom expiry
+sudo concord url           # show the Server URL to paste
+sudo concord update        # pull latest + restart
+sudo concord uninstall     # remove (asks whether to keep data)
 ```
 
 ### Adding a friend
 
 ```bash
-sudo obsidian-collab token theirname
+sudo concord token theirname
 ```
 
 Send them that token plus the Server URL. They paste both into their
@@ -71,7 +71,7 @@ Collab plugin settings. That's it — same vault, realtime.
 ## Notes
 
 - **Authentication is on by default.** A random `JWT_SECRET` is generated
-  at install and stored in `/etc/obsidian-collab/env` (never committed,
+  at install and stored in `/etc/concord/env` (never committed,
   never printed). Only tokens signed with it can connect. Re-running the
   installer keeps the existing secret so old tokens stay valid.
 - **Updating** keeps your data and secret; it only refreshes code and

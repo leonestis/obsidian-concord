@@ -1,4 +1,4 @@
-# Installing obsidian-collab in your vault
+# Installing concord in your vault
 
 You have two choices. **BRAT** is the painless one — set up once and your plugin auto-updates whenever a new release ships. The manual route is for one-off testing.
 
@@ -12,7 +12,7 @@ You have two choices. **BRAT** is the painless one — set up once and your plug
 4. Paste the repository URL:
 
    ```
-   https://github.com/leonestis/obsidian-collab
+   https://github.com/leonestis/obsidian-concord
    ```
 
 5. Tick *"Enable after installing"* and click **Add Plugin**. BRAT downloads the latest release and turns the plugin on.
@@ -34,11 +34,11 @@ BRAT checks for updates when Obsidian starts, and on demand via the command pale
 
 If you don't want another plugin, install once by hand:
 
-1. Open the latest release: [Releases page](https://github.com/leonestis/obsidian-collab/releases/latest).
+1. Open the latest release: [Releases page](https://github.com/leonestis/obsidian-concord/releases/latest).
 2. Download `main.js`, `manifest.json`, and `styles.css`.
 3. Open your vault folder in Finder / Files / Explorer. You may need to enable hidden files.
 4. Navigate into `.obsidian/plugins/` (create the `plugins` folder if it's missing).
-5. Create a new folder named exactly **`obsidian-collab`** and drop the three downloaded files inside it.
+5. Create a new folder named exactly **`concord`** and drop the three downloaded files inside it.
 6. In Obsidian, **Settings → Community plugins**, hit the refresh icon, find *Collab (self-hosted realtime)*, enable it.
 7. Configure **Server URL** and **Display name** as in Option A step 6.
 

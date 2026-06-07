@@ -1,4 +1,4 @@
-# obsidian-collab
+# concord
 
 > ⚠️ **АЛЬФА-ТЕСТИРОВАНИЕ — НЕ УСТАНАВЛИВАЙТЕ.**
 > Плагин активно разрабатывается, ломается, переписывается и иногда повреждает данные. Подходит только разработчикам, готовым отлаживать чужой код в DevTools и держать резервные копии вольта. Стабильная установка для обычных пользователей появится позже.
@@ -36,7 +36,7 @@ Obsidian + плагин  <--WebSocket-->  Hocuspocus сервер  <-->  SQLite
 ### Структура репозитория
 
 ```
-obsidian-collab/
+concord/
 ├── plugin/    # Obsidian-плагин (TypeScript)
 ├── server/    # Hocuspocus-сервер (TypeScript / Node.js)
 ├── docs/      # Документация для self-host и контрибьюторов
@@ -48,7 +48,7 @@ obsidian-collab/
 Самый удобный путь — через [BRAT](https://github.com/TfTHacker/obsidian42-brat):
 
 1. Установить **BRAT** из Community plugins в Obsidian.
-2. *Add Beta plugin* → вставить `https://github.com/leonestis/obsidian-collab`.
+2. *Add Beta plugin* → вставить `https://github.com/leonestis/obsidian-concord`.
 3. Задать **Server URL** в настройках Collab.
 
 Авто-обновления при каждом новом теге. Подробности: [docs/install-for-users.md](docs/install-for-users.md).
@@ -96,7 +96,7 @@ Obsidian + plugin  <--WebSocket-->  Hocuspocus server  <-->  SQLite
 ### Repository layout
 
 ```
-obsidian-collab/
+concord/
 ├── plugin/    # Obsidian plugin (TypeScript)
 ├── server/    # Hocuspocus server (TypeScript / Node.js)
 ├── docs/      # Self-hosting and contributor docs
@@ -108,7 +108,7 @@ obsidian-collab/
 The friendliest route is via [BRAT](https://github.com/TfTHacker/obsidian42-brat):
 
 1. Install the **BRAT** community plugin in Obsidian.
-2. *Add Beta plugin* → paste `https://github.com/leonestis/obsidian-collab`.
+2. *Add Beta plugin* → paste `https://github.com/leonestis/obsidian-concord`.
 3. Set **Server URL** in Collab's settings.
 
 Auto-updates whenever a new tag ships. Step-by-step + the manual fallback: [docs/install-for-users.md](docs/install-for-users.md).
@@ -118,13 +118,13 @@ Auto-updates whenever a new tag ships. Step-by-step + the manual fallback: [docs
 One command on a fresh Debian/Ubuntu VPS (as root):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-collab/main/server/scripts/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-concord/main/server/scripts/install.sh)
 ```
 
 It installs Node.js, the server, a systemd service and (if you give it a
 domain) automatic HTTPS via Caddy — then prints the **Server URL + a
 token** to paste into the plugin. Manage it afterwards with the
-`obsidian-collab` command (`status`, `logs`, `token <name>`, `update`,
+`concord` command (`status`, `logs`, `token <name>`, `update`,
 `uninstall`). Full guide: [docs/self-hosting.md](docs/self-hosting.md).
 
 ### License

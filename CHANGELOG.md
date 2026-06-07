@@ -2,6 +2,13 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.5.0 — 2026-06-07
+
+### Changed (rebrand)
+- **The project is now called Concord.** Plugin `id` `obsidian-collab` → `concord`, display name → **Concord**. Repository renamed to `obsidian-concord` (GitHub redirects the old URL). The server installer/manager command is now `concord` and installs under `/opt/concord`, `/etc/concord`, `/var/lib/concord`.
+- No functional changes. Internal storage namespaces (IndexedDB keys, room names, the `vault:manifest` channel) are deliberately unchanged, so existing local caches and server data carry over untouched.
+- Existing installs: because the plugin `id` changed, Obsidian sees a new plugin folder (`concord`). Move your `data.json` into the new folder to keep settings/token/identity (the dev symlink install is migrated automatically).
+
 ## 2.4.2 — 2026-06-07
 
 ### Fixed (canvas)

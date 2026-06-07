@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# obsidian-collab — management CLI. Installed to /usr/local/bin/obsidian-collab
+# concord — management CLI. Installed to /usr/local/bin/concord
 # by install.sh. Run with no arguments for an interactive menu, or pass a
 # subcommand directly:
 #
-#   obsidian-collab status | start | stop | restart | logs
-#   obsidian-collab token <name> [expiry]   # mint a client JWT (default 365d)
-#   obsidian-collab url                      # show the Server URL to paste
-#   obsidian-collab update                   # git pull + reinstall + restart
-#   obsidian-collab uninstall                # remove service, code, data
+#   concord status | start | stop | restart | logs
+#   concord token <name> [expiry]   # mint a client JWT (default 365d)
+#   concord url                      # show the Server URL to paste
+#   concord update                   # git pull + reinstall + restart
+#   concord uninstall                # remove service, code, data
 
 set -euo pipefail
 
-INSTALL_DIR="/opt/obsidian-collab"
+INSTALL_DIR="/opt/concord"
 SERVER_DIR="${INSTALL_DIR}/server"
-CONFIG_DIR="/etc/obsidian-collab"
+CONFIG_DIR="/etc/concord"
 ENV_FILE="${CONFIG_DIR}/env"
-SERVICE_NAME="obsidian-collab"
-SERVICE_USER="obsidian-collab"
-MANAGE_BIN="/usr/local/bin/obsidian-collab"
+SERVICE_NAME="concord"
+SERVICE_USER="concord"
+MANAGE_BIN="/usr/local/bin/concord"
 
 c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_cya=$'\033[36m'; c_rst=$'\033[0m'
 info() { echo "${c_cya}▸${c_rst} $*"; }
@@ -53,7 +53,7 @@ cmd_url() {
 cmd_token() {
   need_root
   local name="${1:-}"; local exp="${2:-365d}"
-  [ -n "${name}" ] || die "usage: obsidian-collab token <name> [expiry]"
+  [ -n "${name}" ] || die "usage: concord token <name> [expiry]"
   local secret; secret="$(get_env JWT_SECRET)"
   [ -n "${secret}" ] || die "JWT_SECRET not found in ${ENV_FILE}"
   local token
@@ -101,7 +101,7 @@ cmd_uninstall() {
 
 menu() {
   echo
-  echo "${c_grn}obsidian-collab${c_rst} — management"
+  echo "${c_grn}concord${c_rst} — management"
   systemctl is-active --quiet "${SERVICE_NAME}" \
     && echo "  status: ${c_grn}running${c_rst}" \
     || echo "  status: ${c_red}stopped${c_rst}"
@@ -141,5 +141,5 @@ case "${1:-menu}" in
   uninstall) cmd_uninstall ;;
   -h|--help|help)
     grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -20 ;;
-  *) die "unknown command '$1' (try: obsidian-collab help)" ;;
+  *) die "unknown command '$1' (try: concord help)" ;;
 esac

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// obsidian-collab server, v1.0.0.
+// concord server, v1.0.0.
 //
 // Responsibilities:
 //   1. Hocuspocus relay (Y.Doc rooms) — unchanged contract from 0.9.x:
@@ -332,7 +332,7 @@ const server = new Server({
         `✋ rejecting connection: clientVersion="${clientVersion || "(none)"}" < ${MIN_CLIENT_VERSION} (room "${documentName}")`,
       );
       throw new Error(
-        `obsidian-collab: client version ${clientVersion || "unknown"} is too old. ` +
+        `concord: client version ${clientVersion || "unknown"} is too old. ` +
           `Update the plugin to ${MIN_CLIENT_VERSION} or newer.`,
       );
     }
@@ -411,6 +411,6 @@ const server = new Server({
 }
 
 await server.listen();
-console.log(`obsidian-collab server v1.0.0 listening on ws://localhost:${PORT}`);
+console.log(`concord server v1.0.0 listening on ws://localhost:${PORT}`);
 console.log(`blob endpoints: http://localhost:${PORT}/blobs/<hash>`);
 console.log(`persistence: ${DB_PATH}`);

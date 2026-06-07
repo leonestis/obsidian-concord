@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# obsidian-collab — one-command server installer (Debian/Ubuntu).
+# concord — one-command server installer (Debian/Ubuntu).
 #
 # Usage (as root):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-collab/main/server/scripts/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-concord/main/server/scripts/install.sh)
 #
 # Non-interactive (env vars override the prompts):
 #   DOMAIN=collab.example.com PORT=1234 bash <(curl -fsSL .../install.sh)
 #
 # What it does:
 #   1. Installs Node.js 20 (NodeSource), git, ufw and build tools.
-#   2. Clones the repo to /opt/obsidian-collab and installs server deps.
-#   3. Generates a JWT secret → /etc/obsidian-collab/env.
-#   4. Creates a dedicated `obsidian-collab` system user + data dir.
+#   2. Clones the repo to /opt/concord and installs server deps.
+#   3. Generates a JWT secret → /etc/concord/env.
+#   4. Creates a dedicated `concord` system user + data dir.
 #   5. Installs and starts a systemd service (auto-restart, auto-boot).
 #   6. If a DOMAIN is given: installs Caddy → automatic HTTPS (wss://).
 #      Otherwise: opens the port in ufw and serves plain ws:// by IP.
 #   7. Mints a first client token and prints the exact Server URL + token
 #      to paste into the Collab plugin settings.
-#   8. Installs an `obsidian-collab` management command (menu + subcommands).
+#   8. Installs an `concord` management command (menu + subcommands).
 #
 # Re-running is safe: it updates an existing install in place.
 
 set -euo pipefail
 
 # ── constants ─────────────────────────────────────────────────────────
-REPO_URL="https://github.com/leonestis/obsidian-collab.git"
-INSTALL_DIR="/opt/obsidian-collab"
+REPO_URL="https://github.com/leonestis/obsidian-concord.git"
+INSTALL_DIR="/opt/concord"
 SERVER_DIR="${INSTALL_DIR}/server"
-CONFIG_DIR="/etc/obsidian-collab"
+CONFIG_DIR="/etc/concord"
 ENV_FILE="${CONFIG_DIR}/env"
-DATA_DIR_DEFAULT="/var/lib/obsidian-collab"
-SERVICE_USER="obsidian-collab"
-SERVICE_NAME="obsidian-collab"
-MANAGE_BIN="/usr/local/bin/obsidian-collab"
+DATA_DIR_DEFAULT="/var/lib/concord"
+SERVICE_USER="concord"
+SERVICE_NAME="concord"
+MANAGE_BIN="/usr/local/bin/concord"
 NODE_MAJOR="20"
 
 # ── pretty output ─────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ else
   SECRET="$(openssl rand -hex 48 2>/dev/null || head -c48 /dev/urandom | xxd -p | tr -d '\n')"
 fi
 cat > "${ENV_FILE}" <<EOF
-# obsidian-collab server configuration. Managed by the installer.
+# concord server configuration. Managed by the installer.
 PORT=${PORT}
 DATA_DIR=${DATA_DIR}
 JWT_SECRET=${SECRET}
@@ -129,7 +129,7 @@ ok "Config written to ${ENV_FILE} (JWT auth enabled)."
 # ── 5. systemd service ────────────────────────────────────────────────
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=obsidian-collab realtime server
+Description=concord realtime server
 After=network-online.target
 Wants=network-online.target
 
@@ -204,7 +204,7 @@ TOKEN="$( cd "${SERVER_DIR}" && JWT_SECRET="${SECRET}" node_modules/.bin/tsx src
 
 echo
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}"
-echo "${c_grn} obsidian-collab server is up.${c_rst}"
+echo "${c_grn} concord server is up.${c_rst}"
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}"
 echo
 echo "  In the Collab plugin settings, set:"
@@ -212,9 +212,9 @@ echo
 echo "    Server URL : ${c_cya}${SERVER_URL}${c_rst}"
 echo "    Auth token : ${c_cya}${TOKEN}${c_rst}"
 echo
-echo "  Make a token for a friend:   ${c_yel}obsidian-collab token <name>${c_rst}"
-echo "  Open the management menu:    ${c_yel}obsidian-collab${c_rst}"
-echo "  Logs:                        ${c_yel}obsidian-collab logs${c_rst}"
+echo "  Make a token for a friend:   ${c_yel}concord token <name>${c_rst}"
+echo "  Open the management menu:    ${c_yel}concord${c_rst}"
+echo "  Logs:                        ${c_yel}concord logs${c_rst}"
 echo
 if [ -n "${DOMAIN}" ]; then
   echo "  ${c_yel}DNS:${c_rst} ${DOMAIN} must already point (A/AAAA) to this server,"
