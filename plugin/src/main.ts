@@ -43,6 +43,7 @@ import {
 import {
   colorFromName,
   deriveBlobUrl,
+  jwtName,
   randomName,
   STORAGE_PREFIX,
   uuid,
@@ -206,7 +207,12 @@ export default class CollabPlugin extends Plugin {
     this.presenceController = new PresenceController({
       app: this.app,
       manifestSync: this.manifestSync,
-      presenceId: () => this.settings.presenceId,
+      // Identity = the JWT token's `name` claim, so the same person (same
+      // token) shows as ONE row across all their devices, with the device
+      // glyphs unioned. Falls back to the stored per-install id when there's
+      // no token (unauthenticated mode) or it can't be decoded.
+      presenceId: () =>
+        jwtName(this.settings.authToken) || this.settings.presenceId,
       user: () => ({
         name: this.settings.userName,
         color: this.settings.userColor,
@@ -262,6 +268,16 @@ export default class CollabPlugin extends Plugin {
       id: "collab-show-collaborators",
       name: "Show collaborators",
       callback: () => void this.revealCollaboratorsView(),
+    });
+    this.addCommand({
+      id: "collab-clear-offline-collaborators",
+      name: "Clear offline collaborators",
+      callback: () => {
+        const n = this.presenceController?.clearOffline() ?? 0;
+        new Notice(
+          `Concord: cleared ${n} offline collaborator${n === 1 ? "" : "s"}.`,
+        );
+      },
     });
 
     // v2.0.0: LiveViewManager subscribes to workspace 'file-open' /

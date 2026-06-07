@@ -22,6 +22,33 @@ export const MANIFEST_ROOM = "vault:manifest";
 // here so it never drifts across the session modules.
 export const STORAGE_PREFIX = "concord";
 
+// Decode the `name` claim from a JWT WITHOUT verifying it (verification is
+// the server's job). Used as the stable presence identity so the same
+// person — i.e. the same token — collapses into ONE Collaborators row
+// across all their devices, with the device glyphs unioned. Returns null
+// when there's no token, it's malformed, or it carries no `name`.
+export function jwtName(token: string | undefined | null): string | null {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
+  try {
+    let b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4 !== 0) b64 += "=";
+    const json = decodeURIComponent(
+      atob(b64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join(""),
+    );
+    const payload = JSON.parse(json) as { name?: unknown };
+    return typeof payload.name === "string" && payload.name.length > 0
+      ? payload.name
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 // Pleasant palette for auto-assigning a color when the user hasn't picked one.
 const PALETTE = [
   "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6",

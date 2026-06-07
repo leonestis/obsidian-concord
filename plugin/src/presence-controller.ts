@@ -242,6 +242,34 @@ export class PresenceController {
     return out;
   }
 
+  // Remove every roster entry that is NOT currently online (the "Offline"
+  // list). Online peers re-upsert themselves, so they're untouched. The
+  // roster is a synced Y.Map, so this clears the offline list for ALL
+  // peers. Returns how many were removed. Used by the "Clear offline
+  // collaborators" command/button to drop stale identities (e.g. an old
+  // random `user-XXXX` name from a previous rename).
+  clearOffline(): number {
+    const roster = this.boundRoster;
+    if (!roster) return 0;
+    const online = new Set<string>();
+    const awareness = this.boundAwareness;
+    if (awareness) {
+      awareness.getStates().forEach((raw) => {
+        const p = (raw as { presence?: PresenceState } | undefined)?.presence;
+        if (p && typeof p.presenceId === "string") online.add(p.presenceId);
+      });
+    }
+    let removed = 0;
+    for (const id of Array.from(roster.keys())) {
+      if (!online.has(id)) {
+        roster.delete(id);
+        removed++;
+      }
+    }
+    if (removed > 0) this.emitChange();
+    return removed;
+  }
+
   // Detach awareness/roster listeners. Does NOT clear the published
   // presence — call clearPresence() for that (on plugin unload).
   private unbind(): void {

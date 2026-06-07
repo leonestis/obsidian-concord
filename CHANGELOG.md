@@ -2,6 +2,14 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.5.3 — 2026-06-08
+
+### Changed (Collaborators panel)
+- **One row per person, not per device.** Presence identity is now the JWT token's `name` claim, so the same person — using the same token — shows as a **single** row across all their devices, with the device glyphs (🖥 / 📱) unioned (both shown when online from desktop and mobile at once). Your own row prefers the name/color you configured locally. Falls back to the per-install id when there's no token (unauthenticated mode). Use the **same token on all your devices** to get one merged entry.
+
+### Added
+- **Clear offline collaborators** — a `clear` link in the panel's *Offline* header and a command (*Concord: Clear offline collaborators*) that removes every offline roster entry (e.g. stale `user-XXXX` identities left over from a rename). Online peers are untouched; the change syncs to all peers.
+
 ## 2.5.2 — 2026-06-08
 
 ### Changed (rebrand)

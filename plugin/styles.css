@@ -247,6 +247,25 @@
   color: var(--text-muted);
 }
 
+.collab-collaborators-section-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.collab-collaborators-clear {
+  cursor: pointer;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
+}
+
+.collab-collaborators-clear:hover {
+  color: var(--text-accent);
+  text-decoration: underline;
+}
+
 .collab-collaborators-row {
   display: flex;
   align-items: center;

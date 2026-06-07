@@ -111,9 +111,18 @@ export class CollaboratorsView extends ItemView {
     for (const p of presence.getOnline()) {
       const existing = onlineById.get(p.presenceId);
       if (existing) {
+        // Same identity (same JWT) from another device → one row, union
+        // the device glyphs. Prefer the local device's own name/color/
+        // active-file for "your" row so it shows what you configured.
         existing.platforms.add(p.platform);
-        if (!existing.activeFile && p.activeFile) existing.activeFile = p.activeFile;
-        existing.isSelf = existing.isSelf || p.isSelf;
+        if (p.activeFile && (p.isSelf || !existing.activeFile)) {
+          existing.activeFile = p.activeFile;
+        }
+        if (p.isSelf) {
+          existing.name = p.name;
+          existing.color = p.color;
+          existing.isSelf = true;
+        }
       } else {
         onlineById.set(p.presenceId, {
           presenceId: p.presenceId,
@@ -149,7 +158,19 @@ export class CollaboratorsView extends ItemView {
 
     // ── Offline section ─────────────────────────────────────────────
     if (offline.length > 0) {
-      this.sectionHeader(root, "Offline");
+      const head = root.createDiv({
+        cls: "collab-collaborators-section collab-collaborators-section-row",
+      });
+      head.createSpan({ text: "Offline" });
+      const clear = head.createSpan({
+        cls: "collab-collaborators-clear",
+        text: "clear",
+      });
+      clear.setAttr("title", "Remove all offline collaborators");
+      clear.addEventListener("click", () => {
+        presence.clearOffline();
+        this.queueRender();
+      });
       for (const r of offline) this.renderOfflineRow(root, r);
     }
   }
