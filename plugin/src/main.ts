@@ -25,6 +25,7 @@ import {
   Setting,
   TAbstractFile,
   TFile,
+  WorkspaceLeaf,
 } from "obsidian";
 import { HocuspocusProviderWebsocket } from "@hocuspocus/provider";
 
@@ -401,12 +402,18 @@ export default class CollabPlugin extends Plugin {
   // existing leaf if one is already open.
   private async revealCollaboratorsView(): Promise<void> {
     const { workspace } = this.app;
-    let leaf = workspace.getLeavesOfType(COLLABORATORS_VIEW_TYPE)[0];
+    let leaf: WorkspaceLeaf | null =
+      workspace.getLeavesOfType(COLLABORATORS_VIEW_TYPE)[0] ?? null;
     if (!leaf) {
-      const right = workspace.getRightLeaf(false);
-      if (!right) return;
-      await right.setViewState({ type: COLLABORATORS_VIEW_TYPE, active: true });
-      leaf = right;
+      // Try to reuse an existing right-sidebar leaf; if the right sidebar
+      // is collapsed/empty getRightLeaf(false) can return null, so fall
+      // back to creating a fresh split. Either way we end with a leaf.
+      leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
+      if (!leaf) {
+        new Notice("Collab: couldn't open the Collaborators panel");
+        return;
+      }
+      await leaf.setViewState({ type: COLLABORATORS_VIEW_TYPE, active: true });
     }
     workspace.revealLeaf(leaf);
   }
