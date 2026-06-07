@@ -1,6 +1,6 @@
 {
   "name": "concord-plugin",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "private": true,
   "description": "Obsidian plugin: self-hosted realtime collaboration via Yjs",
   "license": "AGPL-3.0-only",

@@ -31,7 +31,7 @@ import * as Y from "yjs";
 import { Notice } from "obsidian";
 
 import { log } from "./logger";
-import { docIdToRoom, localBackupPath, onProviderSynced } from "./util";
+import { docIdToRoom, localBackupPath, onProviderSynced, STORAGE_PREFIX } from "./util";
 import { DiskBuffer } from "./disk-buffer";
 import { applyStringToYText, threeWayMerge } from "./yedit/y-sync";
 import type { BaseSession, SessionOrigin } from "./types";
@@ -153,7 +153,7 @@ export class TextSession implements BaseSession {
     // invisible' bug from v0.9.x onward".
 
     this.persistence = new IndexeddbPersistence(
-      `obsidian-collab::${opts.serverUrl}::${room}`,
+      `${STORAGE_PREFIX}::${opts.serverUrl}::${room}`,
       this.ydoc,
     );
   }

@@ -15,7 +15,7 @@ import { HocuspocusProvider } from "@hocuspocus/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
-import { docIdToRoom } from "./util";
+import { docIdToRoom, STORAGE_PREFIX } from "./util";
 import { attachCanvasCursors, type CanvasCursorHook } from "./canvas-cursors";
 import type { BaseSession } from "./types";
 
@@ -137,7 +137,7 @@ export class CanvasSession implements BaseSession {
     this.provider.attach();
 
     this.persistence = new IndexeddbPersistence(
-      `obsidian-collab::${opts.serverUrl}::${room}`,
+      `${STORAGE_PREFIX}::${opts.serverUrl}::${room}`,
       this.ydoc,
     );
 

@@ -32,7 +32,7 @@
 // command) doesn't take the merge bases with it unless we explicitly
 // want it to. Raw IndexedDB, no extra dependency, ~one object store.
 
-const DB_NAME = "obsidian-collab-diskbuffer";
+const DB_NAME = "concord-diskbuffer";
 const DB_VERSION = 1;
 const STORE = "buffers";
 

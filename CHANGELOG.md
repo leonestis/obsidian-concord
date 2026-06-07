@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.5.1 — 2026-06-07
+
+### Changed (internal)
+- Renamed the local IndexedDB storage namespace from `obsidian-collab::…` to `concord::…` (and the DiskBuffer DB to `concord-diskbuffer`), centralized in a single `STORAGE_PREFIX` constant so it can't drift. **Purely client-side** — server data, wire room names (`doc:<id>`, `vault:manifest`) and cross-client sync are unaffected. On first launch after upgrading, each client rebuilds its local cache from the server once (the server is the source of truth, so no data is lost); make sure you're online and synced before upgrading so any pending offline edits flush first. Old `obsidian-collab::…` databases are left as harmless orphans (clear them via "Wipe local cache" if you like).
+
 ## 2.5.0 — 2026-06-07
 
 ### Changed (rebrand)

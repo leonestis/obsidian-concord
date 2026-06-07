@@ -14,7 +14,7 @@ import { removeAwarenessStates } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { log } from "./logger";
-import { docIdToRoom } from "./util";
+import { docIdToRoom, STORAGE_PREFIX } from "./util";
 import type { BaseSession } from "./types";
 
 export interface AtomicTextSessionOptions {
@@ -64,7 +64,7 @@ export class AtomicTextSession implements BaseSession {
     this.provider.attach();
 
     this.persistence = new IndexeddbPersistence(
-      `obsidian-collab::${opts.serverUrl}::${room}`,
+      `${STORAGE_PREFIX}::${opts.serverUrl}::${room}`,
       this.ydoc,
     );
 

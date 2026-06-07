@@ -44,6 +44,7 @@ import {
   colorFromName,
   deriveBlobUrl,
   randomName,
+  STORAGE_PREFIX,
   uuid,
 } from "./util";
 import { CollaboratorsView, COLLABORATORS_VIEW_TYPE } from "./collaborators-view";
@@ -625,7 +626,7 @@ export default class CollabPlugin extends Plugin {
     this.liveViewManager?.queueRefresh("performWipeLocalCache");
     await new Promise<void>((r) => setTimeout(r, 200));
 
-    const prefix = `obsidian-collab::${this.settings.serverUrl}::`;
+    const prefix = `${STORAGE_PREFIX}::${this.settings.serverUrl}::`;
     const idb = indexedDB as unknown as {
       databases?: () => Promise<Array<{ name?: string }>>;
     };

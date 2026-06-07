@@ -16,6 +16,12 @@ export function docIdToRoom(docId: string): string {
 
 export const MANIFEST_ROOM = "vault:manifest";
 
+// Namespace prefix for client-side IndexedDB persistence DB names
+// (`<STORAGE_PREFIX>::<serverUrl>::<room>`). Purely local — does not
+// affect server data, wire room names, or cross-client sync. Centralized
+// here so it never drifts across the session modules.
+export const STORAGE_PREFIX = "concord";
+
 // Pleasant palette for auto-assigning a color when the user hasn't picked one.
 const PALETTE = [
   "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6",

@@ -36,7 +36,7 @@ import type { Awareness } from "y-protocols/awareness";
 
 import { log } from "./logger";
 import { DiskBuffer } from "./disk-buffer";
-import { MANIFEST_ROOM, isLocalBackupPath, mimeFromExtension, sha256Hex, uuid } from "./util";
+import { MANIFEST_ROOM, STORAGE_PREFIX, isLocalBackupPath, mimeFromExtension, sha256Hex, uuid } from "./util";
 import {
   PROTOCOL_VERSION,
   type EntryKind,
@@ -283,7 +283,7 @@ export class ManifestSync {
     this.provider.attach();
 
     this.persistence = new IndexeddbPersistence(
-      `obsidian-collab::${this.deps.serverUrl()}::${MANIFEST_ROOM}`,
+      `${STORAGE_PREFIX}::${this.deps.serverUrl()}::${MANIFEST_ROOM}`,
       this.ydoc,
     );
 
