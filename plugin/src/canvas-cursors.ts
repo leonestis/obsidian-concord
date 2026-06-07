@@ -237,13 +237,24 @@ function attachToLeafIfCanvas(
   const onLeave = () => {
     publishCursor(null);
   };
-  // Pointer events (not mouse) so this fires for touch on mobile too —
-  // mouse* events don't fire for touch input, which is why canvas
-  // presence (cursors / selection / drag preview) was dead or misp
-  // -positioned on mobile. PointerEvent extends MouseEvent, so the
-  // handlers and posFromEvt calls are unchanged.
-  wrapper.addEventListener("pointermove", onMove);
-  wrapper.addEventListener("pointerleave", onLeave);
+  // Desktop: keep the hardware-rate mouse* events. These fire more often
+  // than pointermove (which Chromium coalesces to ~frame rate), so the
+  // cursor stays low-latency for mouse users.
+  wrapper.addEventListener("mousemove", onMove);
+  wrapper.addEventListener("mouseleave", onLeave);
+  // Mobile: pointer events fire for touch/pen where mouse* never does.
+  // Gate on pointerType so a desktop mouse (which ALSO emits pointer
+  // events) is handled only once, via the mouse listeners above — no
+  // double-publish, no added latency. PointerEvent extends MouseEvent so
+  // posFromEvt / eventToCanvasPos are unchanged.
+  const onMoveP = (e: PointerEvent) => {
+    if (e.pointerType !== "mouse") onMove(e);
+  };
+  const onLeaveP = (e: PointerEvent) => {
+    if (e.pointerType !== "mouse") onLeave();
+  };
+  wrapper.addEventListener("pointermove", onMoveP);
+  wrapper.addEventListener("pointerleave", onLeaveP);
 
   // ─── Mouse button state ───────────────────────────────────────
   let pendingMarqueeEnd: { x: number; y: number } | null = null;
@@ -279,12 +290,20 @@ function attachToLeafIfCanvas(
     lastDragSnapshot = {};
     setAction(overNode ? "hover" : "idle");
   };
-  wrapper.addEventListener("pointerdown", onDown);
-  // Listen on window for pointerup — pointer often releases outside
-  // the wrapper after a drag flick. pointercancel covers touch being
-  // interrupted (e.g. the OS steals the gesture).
-  window.addEventListener("pointerup", onUp);
-  window.addEventListener("pointercancel", onUp);
+  wrapper.addEventListener("mousedown", onDown);
+  // Listen on window for mouseup — pointer often releases outside the
+  // wrapper after a drag flick.
+  window.addEventListener("mouseup", onUp);
+  // Touch/pen equivalents (mouse pointers handled by the mouse listeners).
+  const onDownP = (e: PointerEvent) => {
+    if (e.pointerType !== "mouse") onDown(e);
+  };
+  const onUpP = (e: PointerEvent) => {
+    if (e.pointerType !== "mouse") onUp();
+  };
+  wrapper.addEventListener("pointerdown", onDownP);
+  window.addEventListener("pointerup", onUpP);
+  window.addEventListener("pointercancel", onUpP);
 
   // ─── Marquee publish loop ─────────────────────────────────────
   const marqueePoll = window.setInterval(() => {
@@ -371,11 +390,15 @@ function attachToLeafIfCanvas(
   const teardown = () => {
     if (torn) return;
     torn = true;
-    wrapper.removeEventListener("pointermove", onMove);
-    wrapper.removeEventListener("pointerleave", onLeave);
-    wrapper.removeEventListener("pointerdown", onDown);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
+    wrapper.removeEventListener("mousemove", onMove);
+    wrapper.removeEventListener("mouseleave", onLeave);
+    wrapper.removeEventListener("mousedown", onDown);
+    window.removeEventListener("mouseup", onUp);
+    wrapper.removeEventListener("pointermove", onMoveP);
+    wrapper.removeEventListener("pointerleave", onLeaveP);
+    wrapper.removeEventListener("pointerdown", onDownP);
+    window.removeEventListener("pointerup", onUpP);
+    window.removeEventListener("pointercancel", onUpP);
     window.clearInterval(cursorFlush);
     window.clearInterval(selectionPoll);
     window.clearInterval(dragPoll);

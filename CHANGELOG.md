@@ -2,6 +2,11 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.4.2 — 2026-06-07
+
+### Fixed (canvas)
+- **Cursor latency regression from 2.4.1.** 2.4.1 switched canvas presence input from `mouse*` to Pointer Events to support touch — but on desktop Chromium coalesces `pointermove` to ~frame rate, which is sparser than hardware-rate `mousemove`, so mouse cursors felt ~2× laggier. Now desktop keeps the original `mouse*` listeners (full speed) and Pointer Events are handled **only for touch/pen** (`pointerType !== "mouse"`), so mobile still works and a desktop mouse is never handled twice. Mobile touch support from 2.4.1 is retained.
+
 ## 2.4.1 — 2026-06-07
 
 ### Fixed (canvas)

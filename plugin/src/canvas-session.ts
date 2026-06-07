@@ -523,18 +523,30 @@ export class CanvasSession implements BaseSession {
   private static installMouseTracker(): void {
     if (CanvasSession.mouseTrackerInstalled) return;
     CanvasSession.mouseTrackerInstalled = true;
-    // Pointer events fire for BOTH mouse and touch, so the interaction
-    // guard + drag-capture poll work on desktop and mobile alike.
-    window.addEventListener(
-      "pointerdown",
-      (e) => {
-        if ((e as PointerEvent).button === 0) CanvasSession.mouseDown = true;
-      },
-      true,
-    );
     const clear = () => {
       CanvasSession.mouseDown = false;
     };
+    // Desktop: mouse buttons.
+    window.addEventListener(
+      "mousedown",
+      (e) => {
+        if ((e as MouseEvent).button === 0) CanvasSession.mouseDown = true;
+      },
+      true,
+    );
+    window.addEventListener("mouseup", clear, true);
+    // Mobile: touch/pen via pointer events (mouse pointers already covered
+    // above, so ignore pointerType "mouse" to avoid redundant work).
+    window.addEventListener(
+      "pointerdown",
+      (e) => {
+        const pe = e as PointerEvent;
+        if (pe.pointerType !== "mouse" && pe.button === 0) {
+          CanvasSession.mouseDown = true;
+        }
+      },
+      true,
+    );
     window.addEventListener("pointerup", clear, true);
     window.addEventListener("pointercancel", clear, true);
   }
