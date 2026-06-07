@@ -115,7 +115,17 @@ Auto-updates whenever a new tag ships. Step-by-step + the manual fallback: [docs
 
 ### Self-hosting
 
-Documentation will live in [docs/](docs/) once a stable version ships.
+One command on a fresh Debian/Ubuntu VPS (as root):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/leonestis/obsidian-collab/main/server/scripts/install.sh)
+```
+
+It installs Node.js, the server, a systemd service and (if you give it a
+domain) automatic HTTPS via Caddy — then prints the **Server URL + a
+token** to paste into the plugin. Manage it afterwards with the
+`obsidian-collab` command (`status`, `logs`, `token <name>`, `update`,
+`uninstall`). Full guide: [docs/self-hosting.md](docs/self-hosting.md).
 
 ### License
 
