@@ -2,6 +2,14 @@
 
 All notable changes are recorded here. The project loosely follows [Semantic Versioning](https://semver.org/) — patch bumps for fixes, minor for features, major for breaking changes.
 
+## 2.6.0 — 2026-06-08
+
+### Added (data safety) — mass-delete guard
+- **A bulk deletion can no longer silently wipe everyone's vault.** Local file deletions are now buffered briefly and judged as a batch. If a single batch exceeds **10 files** (the signature of an accident — e.g. a vault folder moved or renamed in the OS file manager, which makes Obsidian report every file inside as deleted), the plugin **does NOT propagate the deletions**. Instead it shows one dialog: *“N files were deleted at once … Keep files (recommended) / Delete N files for everyone.”*
+  - **Keep** (also the default if you close the dialog, press Esc, or click away): the deletions are discarded and the local copies are **restored from the server** — the accidental move is fully undone, and collaborators never saw it.
+  - **Delete for everyone**: propagates the deletions as normal.
+- Normal small deletions (a few files) propagate as before — the soft-delete trash still backs them up. A delete that races a re-create at the same path is detected by manifest id and skipped, so it can't delete the freshly-created file.
+
 ## 2.5.3 — 2026-06-08
 
 ### Changed (Collaborators panel)

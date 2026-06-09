@@ -179,6 +179,8 @@ export default class CollabPlugin extends Plugin {
         this.liveViewManager
           ? this.liveViewManager.hasEditorFor(path)
           : true,
+      onMassDelete: (paths, confirmDelete, keep) =>
+        new MassDeleteModal(this.app, paths, confirmDelete, keep).open(),
       debug: (...a) => this.debug(...a),
     });
 
@@ -879,6 +881,74 @@ class WipeCacheModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
+  }
+}
+
+// Data-safety guard UI. Shown when the plugin buffers an unusually large
+// batch of local deletions (e.g. a moved vault folder). Default action on
+// close (X / Esc / click-away) is KEEP — we never propagate a suspicious
+// bulk delete unless the user explicitly confirms.
+class MassDeleteModal extends Modal {
+  private decided = false;
+  constructor(
+    app: App,
+    private readonly paths: string[],
+    private readonly onDelete: () => void,
+    private readonly onKeep: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "⚠ Concord — bulk deletion detected" });
+    contentEl.createEl("p", {
+      text:
+        `${this.paths.length} files were deleted at once. This usually means a ` +
+        `folder was moved or the vault path changed in your file manager — ` +
+        `not an intentional delete.`,
+    });
+    contentEl.createEl("p", {
+      text:
+        "These deletions have NOT been sent to your collaborators yet. " +
+        "If you keep the files, the local copies are restored from the server.",
+    });
+
+    const list = contentEl.createEl("ul");
+    for (const p of this.paths.slice(0, 8)) list.createEl("li", { text: p });
+    if (this.paths.length > 8) {
+      list.createEl("li", { text: `…and ${this.paths.length - 8} more` });
+    }
+
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const keepBtn = buttons.createEl("button", {
+      text: "Keep files (recommended)",
+      cls: "mod-cta",
+    });
+    keepBtn.addEventListener("click", () => {
+      this.decided = true;
+      this.onKeep();
+      this.close();
+    });
+    const delBtn = buttons.createEl("button", {
+      text: `Delete ${this.paths.length} files for everyone`,
+      cls: "mod-warning",
+    });
+    delBtn.addEventListener("click", () => {
+      this.decided = true;
+      this.onDelete();
+      this.close();
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    // Closed without an explicit choice → safe default: keep (never delete).
+    if (!this.decided) {
+      this.decided = true;
+      this.onKeep();
+    }
   }
 }
 

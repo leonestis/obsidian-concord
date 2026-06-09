@@ -80,6 +80,17 @@ const DOWNLOAD_RETRY_MAX_MS = 8000;
 // sweep also runs on every `synced` (reconnect) event.
 const PENDING_SWEEP_MS = 30_000;
 
+// ── Mass-delete circuit breaker ──────────────────────────────────────
+// Local deletes are buffered for this window so a burst (e.g. a folder
+// moved in the OS file manager, which makes Obsidian report every file
+// inside it as deleted) can be characterized as a single batch instead
+// of propagating file-by-file.
+const DELETE_HOLD_MS = 1200;
+// If one buffered batch deletes more than this many files, DON'T
+// propagate — ask the user first (default = keep). This is the guard
+// against a moved/renamed vault folder nuking everyone's data.
+const MASS_DELETE_THRESHOLD = 10;
+
 export interface ManifestSyncDeps {
   app: App;
   serverUrl: () => string;
@@ -111,6 +122,18 @@ export interface ManifestSyncDeps {
   // safe branch, since fighting an open editor's disk↔Y binding is the
   // worse failure. In practice main.ts wires it before any modify fires.
   hasEditorFor?: (path: string) => boolean;
+  // Data-safety guard. Fired when an unusually large batch of LOCAL file
+  // deletions arrives at once (the classic "moved the vault folder in
+  // Finder → Obsidian reports every file deleted" accident). The plugin
+  // has already BUFFERED the batch and will NOT propagate it on its own;
+  // this asks the UI what to do. `confirmDelete` propagates the deletions
+  // to all peers; `keep` discards them and restores the local copies from
+  // the server. If this dep is absent, the plugin defaults to `keep`.
+  onMassDelete?: (
+    paths: string[],
+    confirmDelete: () => void,
+    keep: () => void,
+  ) => void;
   debug: (...args: unknown[]) => void;
 }
 
@@ -147,6 +170,15 @@ export class ManifestSync {
   // Single-flight guard so overlapping triggers (interval fires while a
   // `synced`-driven sweep is still running) don't double-download.
   private pendingSweepInFlight = false;
+
+  // Mass-delete circuit breaker state. Local deletes accumulate here and
+  // are decided as a batch when the hold timer fires (see onLocalDelete /
+  // flushDeletes).
+  // path → { the file, the manifest id at buffer time }. The id lets us
+  // skip a delete if the path was re-created with a NEW identity between
+  // buffering and flushing (delete + recreate at the same path).
+  private deleteBuffer = new Map<string, { file: TAbstractFile; id: string }>();
+  private deleteFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   // v2.0.0 event emitter: fires `sessionReady(path)` whenever a session
   // transitions into the bound state. LiveViewManager subscribes via
@@ -347,6 +379,13 @@ export class ManifestSync {
       clearInterval(this.pendingSweepTimer);
       this.pendingSweepTimer = null;
     }
+    // Drop any buffered (un-decided) deletes — they reference a doc we're
+    // about to tear down, and a fresh start() re-derives state.
+    if (this.deleteFlushTimer) {
+      clearTimeout(this.deleteFlushTimer);
+      this.deleteFlushTimer = null;
+    }
+    this.deleteBuffer.clear();
     // Drop parked retries — a fresh start()/reconcile re-derives what's
     // missing, and the entries reference a doc we're about to destroy.
     this.pendingDownloads.clear();
@@ -1150,12 +1189,98 @@ export class ManifestSync {
     log.info("sync", `vault.rename: ${oldPath} → ${file.path}`);
   }
 
+  // Entry point from the vault `delete` event. Instead of propagating
+  // immediately we BUFFER, so a burst of deletes (a moved folder, a vault
+  // path change) is judged as a batch by flushDeletes — and a suspiciously
+  // large batch is held for user confirmation rather than nuking everyone.
   async onLocalDelete(file: TAbstractFile): Promise<void> {
     if (!this.map || !this.trash || !this.ydoc) return;
     if (this.deps.sessionManager.isReadOnly()) return;
     if (this.deps.remoteApplyPaths.has(file.path)) return;
+    const tracked = this.map.get(file.path);
+    if (!tracked) return; // not tracked → nothing to do
+    this.deleteBuffer.set(file.path, { file, id: tracked.id });
+    if (this.deleteFlushTimer) clearTimeout(this.deleteFlushTimer);
+    this.deleteFlushTimer = setTimeout(() => {
+      void this.flushDeletes();
+    }, DELETE_HOLD_MS);
+  }
+
+  // Decide a buffered batch of deletes. Under the threshold → propagate
+  // normally. Over it → hand off to the UI guard (default: keep).
+  private async flushDeletes(): Promise<void> {
+    this.deleteFlushTimer = null;
+    const batch = Array.from(this.deleteBuffer.values());
+    this.deleteBuffer.clear();
+    if (batch.length === 0) return;
+
+    if (batch.length > MASS_DELETE_THRESHOLD) {
+      const paths = batch.map((b) => b.file.path);
+      log.warn(
+        "sync",
+        `mass-delete guard tripped: ${paths.length} files deleted at once — holding for confirmation (NOT propagated)`,
+      );
+      const doDelete = () => {
+        for (const b of batch) void this.applyDeleteNow(b.file, b.id);
+      };
+      const keep = () => {
+        void this.keepDeleted(batch);
+      };
+      if (this.deps.onMassDelete) {
+        this.deps.onMassDelete(paths, doDelete, keep);
+      } else {
+        // No UI wired — never auto-propagate a suspicious bulk delete.
+        keep();
+      }
+      return;
+    }
+
+    for (const b of batch) await this.applyDeleteNow(b.file, b.id);
+  }
+
+  // "Keep" branch of the guard: we never touched the manifest, so the
+  // entries + server content are intact. Re-create the local files that
+  // Obsidian reported as deleted, so the accidental move is fully undone.
+  private async keepDeleted(
+    batch: Array<{ file: TAbstractFile; id: string }>,
+  ): Promise<void> {
+    if (!this.map) return;
+    let restored = 0;
+    for (const { file, id } of batch) {
+      const entry = this.map.get(file.path);
+      if (!entry || entry.id !== id) continue; // gone or recreated → skip
+      try {
+        await this.materialise(file.path, entry);
+        restored++;
+      } catch (err) {
+        log.warn("sync", `restore-after-keep failed for ${file.path}`, err);
+      }
+    }
+    log.info(
+      "sync",
+      `mass-delete guard: kept + restored ${restored}/${batch.length} files`,
+    );
+    new Notice(
+      `Concord: kept ${restored} file(s) — the bulk deletion was NOT sent to collaborators.`,
+      8000,
+    );
+  }
+
+  // Actually apply a single deletion: wipe the room, tombstone in trash,
+  // drop the manifest entry. (Formerly the body of onLocalDelete.)
+  private async applyDeleteNow(
+    file: TAbstractFile,
+    expectedId: string,
+  ): Promise<void> {
+    if (!this.map || !this.trash || !this.ydoc) return;
     const entry = this.map.get(file.path);
     if (!entry) return;
+    // The path was re-created with a fresh identity between buffering and
+    // now → this is not the file we were asked to delete. Don't touch it.
+    if (entry.id !== expectedId) {
+      log.info("sync", `delete skipped (path recreated): ${file.path}`);
+      return;
+    }
     log.info("sync", `vault.delete: ${file.path} (${entry.kind}, id=${entry.id})`);
 
     // Wipe + tear down the session if it has content.
